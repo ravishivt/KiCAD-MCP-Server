@@ -88,3 +88,6 @@ Desktop.ini
 
 # Personal notes / local contributions (not for upstream)
 myContribution/
+
+# Claude Code local settings
+.claude/settings.local.json
