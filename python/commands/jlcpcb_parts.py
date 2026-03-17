@@ -90,24 +90,24 @@ class JLCPCBPartsManager:
 
     def import_parts(self, parts: List[Dict], progress_callback=None):
         """
-        Import parts into database from JLCPCB API response
+        Import parts from JLCPCB Open API response.
+
+        The official JLCPCB Open API returns only three fields per component:
+          - componentCode  (LCSC number, e.g. "C25804")
+          - componentModel (manufacturer part number)
+          - componentSpecification (package / footprint)
 
         Args:
-            parts: List of part dicts from JLCPCB API
+            parts: List of part dicts from JLCPCB Open API
             progress_callback: Optional callback(current, total, message)
         """
         cursor = self.conn.cursor()
         imported = 0
         skipped = 0
+        now = int(datetime.now().timestamp())
 
         for i, part in enumerate(parts):
             try:
-                # Extract price breaks
-                price_json = json.dumps(part.get('prices', []))
-
-                # Determine library type
-                library_type = self._determine_library_type(part)
-
                 cursor.execute('''
                     INSERT OR REPLACE INTO components (
                         lcsc, category, subcategory, mfr_part, package,
@@ -115,19 +115,19 @@ class JLCPCBPartsManager:
                         datasheet, stock, price_json, last_updated
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    part.get('componentCode'),  # lcsc
-                    part.get('firstSortName'),  # category
-                    part.get('secondSortName'),  # subcategory
-                    part.get('componentModelEn'),  # mfr_part
-                    part.get('componentSpecificationEn'),  # package
-                    part.get('soldPoint'),  # solder_joints
-                    part.get('componentBrandEn'),  # manufacturer
-                    library_type,  # library_type
-                    part.get('describe'),  # description
-                    part.get('dataManualUrl'),  # datasheet
-                    part.get('stockCount', 0),  # stock
-                    price_json,  # price_json
-                    int(datetime.now().timestamp())  # last_updated
+                    part.get('componentCode'),          # lcsc
+                    '',                                  # category (not in open API)
+                    '',                                  # subcategory
+                    part.get('componentModel', ''),      # mfr_part
+                    part.get('componentSpecification', ''),  # package
+                    0,                                   # solder_joints
+                    '',                                  # manufacturer
+                    'Extended',                          # library_type (unknown, default Extended)
+                    part.get('componentModel', ''),      # description (use model as description)
+                    '',                                  # datasheet
+                    0,                                   # stock (not in open API)
+                    '[]',                                # price_json
+                    now
                 ))
 
                 imported += 1
@@ -139,11 +139,8 @@ class JLCPCBPartsManager:
                 logger.error(f"Error importing part {part.get('componentCode')}: {e}")
                 skipped += 1
 
-        # Update FTS index
-        cursor.execute('''
-            INSERT INTO components_fts(components_fts, rowid, lcsc, description, mfr_part, manufacturer)
-            SELECT 'rebuild', rowid, lcsc, description, mfr_part, manufacturer FROM components
-        ''')
+        # Rebuild FTS index
+        cursor.execute("INSERT INTO components_fts(components_fts) VALUES('rebuild')")
 
         self.conn.commit()
         logger.info(f"Import complete: {imported} parts imported, {skipped} skipped")

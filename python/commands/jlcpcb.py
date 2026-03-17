@@ -23,13 +23,13 @@ logger = logging.getLogger('kicad_interface')
 
 class JLCPCBClient:
     """
-    Client for JLCPCB API
+    Client for JLCPCB Open API (open.jlcpcb.com)
 
     Handles HMAC-SHA256 signature-based authentication and fetching
-    the complete parts library from JLCPCB's external API.
+    the complete parts library from JLCPCB's official open API.
     """
 
-    BASE_URL = "https://jlcpcb.com/external"
+    BASE_URL = "https://open.jlcpcb.com"
 
     def __init__(self, app_id: Optional[str] = None, access_key: Optional[str] = None, secret_key: Optional[str] = None):
         """
@@ -120,27 +120,22 @@ class JLCPCBClient:
 
         return f'JOP appid="{self.app_id}",accesskey="{self.access_key}",nonce="{nonce}",timestamp="{timestamp}",signature="{signature}"'
 
-    def fetch_parts_page(self, last_key: Optional[str] = None) -> Dict:
+    def fetch_parts_page(self, page: int = 1, page_size: int = 1000) -> List[Dict]:
         """
-        Fetch one page of parts from JLCPCB API
+        Fetch one page of parts from JLCPCB Open API
 
         Args:
-            last_key: Pagination key from previous response (None for first page)
+            page: Page number (1-based)
+            page_size: Number of parts per page (max 1000)
 
         Returns:
-            Response dict with parts data and pagination info
+            List of component dicts with keys: componentCode, componentModel, componentSpecification
         """
-        path = "/component/getComponentInfos"
+        path = "/overseas/openapi/component/getComponentLibraryList"
 
-        payload = {}
-        if last_key:
-            payload["lastKey"] = last_key
+        payload = {"currentPage": page, "pageSize": page_size}
+        body_str = json.dumps(payload)
 
-        # Convert payload to JSON string for signing
-        # For POST requests, we always send JSON, even if empty dict
-        body_str = json.dumps(payload, separators=(',', ':'))
-
-        # Generate authorization header
         auth_header = self._get_auth_header("POST", path, body_str)
 
         headers = {
@@ -152,21 +147,18 @@ class JLCPCBClient:
             response = requests.post(
                 f"{self.BASE_URL}{path}",
                 headers=headers,
-                json=payload,
+                data=body_str,
                 timeout=60
             )
 
             logger.debug(f"Response status: {response.status_code}")
-            logger.debug(f"Response headers: {response.headers}")
-            logger.debug(f"Response text: {response.text}")
-
             response.raise_for_status()
             data = response.json()
 
             if data.get('code') != 200:
-                raise Exception(f"API request failed (code {data.get('code')}): {data.get('msg', 'Unknown error')} - Full response: {data}")
+                raise Exception(f"API request failed (code {data.get('code')}): {data.get('message', 'Unknown error')}")
 
-            return data['data']
+            return data.get('data', [])
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to fetch parts page: {e}")
@@ -174,45 +166,46 @@ class JLCPCBClient:
 
     def download_full_database(
         self,
-        callback: Optional[Callable[[int, int, str], None]] = None
+        callback: Optional[Callable[[int, int, str], None]] = None,
+        page_size: int = 1000
     ) -> List[Dict]:
         """
-        Download entire parts library from JLCPCB
+        Download entire parts library from JLCPCB Open API
 
         Args:
             callback: Optional progress callback function(current_page, total_parts, status_msg)
+            page_size: Number of parts per page (max 1000)
 
         Returns:
-            List of all parts
+            List of all parts (each with componentCode, componentModel, componentSpecification)
         """
         all_parts = []
-        last_key = None
         page = 0
 
-        logger.info("Starting full JLCPCB parts database download...")
+        logger.info("Starting full JLCPCB parts database download via open.jlcpcb.com...")
 
         while True:
             page += 1
 
             try:
-                data = self.fetch_parts_page(last_key)
+                parts = self.fetch_parts_page(page, page_size)
 
-                parts = data.get('componentInfos', [])
+                if not parts:
+                    break
+
                 all_parts.extend(parts)
-
-                last_key = data.get('lastKey')
 
                 if callback:
                     callback(page, len(all_parts), f"Downloaded {len(all_parts)} parts...")
                 else:
                     logger.info(f"Page {page}: Downloaded {len(all_parts)} parts so far...")
 
-                # Check if there are more pages
-                if not last_key or len(parts) == 0:
+                # Stop if we got fewer than page_size (last page)
+                if len(parts) < page_size:
                     break
 
-                # Rate limiting - be nice to the API
-                time.sleep(0.5)
+                # Rate limiting
+                time.sleep(0.2)
 
             except Exception as e:
                 logger.error(f"Error downloading parts at page {page}: {e}")
@@ -227,41 +220,24 @@ class JLCPCBClient:
 
     def get_part_by_lcsc(self, lcsc_number: str) -> Optional[Dict]:
         """
-        Get detailed information for a specific LCSC part number
-
-        Note: This uses the same endpoint as fetching parts, as JLCPCB doesn't
-        have a dedicated single-part endpoint. In practice, you should use
-        the local database after initial download.
-
-        Args:
-            lcsc_number: LCSC part number (e.g., "C25804")
-
-        Returns:
-            Part info dict or None if not found
+        The JLCPCB Open API does not have a single-part lookup endpoint.
+        Use JLCSearchClient.get_part_by_lcsc() for live per-part lookups.
         """
-        # For now, this would require searching through pages
-        # In practice, you'd use the local database
-        logger.warning("get_part_by_lcsc should use local database, not API")
+        logger.warning("get_part_by_lcsc is not supported by JLCPCB Open API; use JLCSearchClient instead")
         return None
 
 
 def test_jlcpcb_connection(app_id: Optional[str] = None, access_key: Optional[str] = None, secret_key: Optional[str] = None) -> bool:
     """
-    Test JLCPCB API connection
-
-    Args:
-        app_id: Optional App ID (uses env var if not provided)
-        access_key: Optional Access Key (uses env var if not provided)
-        secret_key: Optional Secret Key (uses env var if not provided)
+    Test JLCPCB Open API connection
 
     Returns:
         True if connection successful, False otherwise
     """
     try:
         client = JLCPCBClient(app_id, access_key, secret_key)
-        # Test by fetching first page
-        data = client.fetch_parts_page()
-        logger.info("JLCPCB API connection test successful")
+        parts = client.fetch_parts_page(page=1, page_size=5)
+        logger.info(f"JLCPCB API connection test successful - got {len(parts)} parts")
         return True
     except Exception as e:
         logger.error(f"JLCPCB API connection test failed: {e}")
@@ -269,26 +245,22 @@ def test_jlcpcb_connection(app_id: Optional[str] = None, access_key: Optional[st
 
 
 if __name__ == '__main__':
-    # Test the JLCPCB client
     logging.basicConfig(level=logging.INFO)
 
-    print("Testing JLCPCB API connection...")
+    print("Testing JLCPCB Open API connection (open.jlcpcb.com)...")
     if test_jlcpcb_connection():
         print("✓ Connection successful!")
 
         client = JLCPCBClient()
         print("\nFetching first page of parts...")
-        data = client.fetch_parts_page()
-        parts = data.get('componentInfos', [])
+        parts = client.fetch_parts_page(page=1, page_size=5)
         print(f"✓ Retrieved {len(parts)} parts in first page")
 
         if parts:
             print(f"\nExample part:")
             part = parts[0]
             print(f"  LCSC: {part.get('componentCode')}")
-            print(f"  MFR Part: {part.get('componentModelEn')}")
-            print(f"  Category: {part.get('firstSortName')} / {part.get('secondSortName')}")
-            print(f"  Package: {part.get('componentSpecificationEn')}")
-            print(f"  Stock: {part.get('stockCount')}")
+            print(f"  Model: {part.get('componentModel')}")
+            print(f"  Spec: {part.get('componentSpecification')}")
     else:
-        print("✗ Connection failed. Check your API credentials.")
+        print("✗ Connection failed. Check JLCPCB_APP_ID, JLCPCB_API_KEY, JLCPCB_API_SECRET.")
