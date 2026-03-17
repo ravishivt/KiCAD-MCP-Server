@@ -159,6 +159,113 @@ class JLCPCBPartsManager:
         else:
             return 'Extended'  # Default to Extended
 
+    # -------------------------------------------------------------------------
+    # /demo/component/info import
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_component_info_price(price_str: str) -> str:
+        """
+        Convert /demo/component/info price string to JSON price_breaks format.
+
+        Input:  "1-9:0.804724,10-29:0.585826,30-99:0.544881,100-:0.505511"
+        Output: [{"qty": 1, "price": 0.804724}, {"qty": 10, "price": 0.585826}, ...]
+        """
+        if not price_str:
+            return "[]"
+        breaks = []
+        try:
+            for tier in price_str.split(","):
+                tier = tier.strip()
+                if not tier:
+                    continue
+                range_part, price_part = tier.split(":")
+                start_str = range_part.split("-")[0]
+                breaks.append({"qty": int(start_str), "price": float(price_part)})
+        except Exception:
+            return "[]"
+        return json.dumps(breaks)
+
+    @staticmethod
+    def _parse_component_info_library_type(library_type: str) -> str:
+        """Map /demo/component/info libraryType values to canonical form."""
+        mapping = {"base": "Basic", "expand": "Extended", "preferred": "Preferred"}
+        return mapping.get((library_type or "").lower(), "Extended")
+
+    def import_component_info_parts(self, parts: List[Dict], progress_callback=None) -> int:
+        """
+        Import parts from /demo/component/info API response.
+
+        Expected fields per item: lcscPart, firstCategory, secondCategory, mfrPart,
+        packageInfo, solderJoint, manufacturer, libraryType, description, datasheet,
+        price (range string "start-end:price,..."), stock.
+
+        Does NOT rebuild the FTS index — call rebuild_fts_index() after all pages
+        have been imported.
+
+        Args:
+            parts: List of component dicts from /demo/component/info
+            progress_callback: Optional callback(current, total, message)
+
+        Returns:
+            Number of rows successfully imported
+        """
+        cursor = self.conn.cursor()
+        imported = 0
+        skipped = 0
+        now = int(datetime.now().timestamp())
+
+        for i, part in enumerate(parts):
+            try:
+                lcsc = part.get("lcscPart", "")
+                if not lcsc:
+                    skipped += 1
+                    continue
+
+                price_json = self._parse_component_info_price(part.get("price", ""))
+                library_type = self._parse_component_info_library_type(part.get("libraryType", ""))
+
+                cursor.execute('''
+                    INSERT OR REPLACE INTO components (
+                        lcsc, category, subcategory, mfr_part, package,
+                        solder_joints, manufacturer, library_type, description,
+                        datasheet, stock, price_json, last_updated
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    lcsc,
+                    part.get("firstCategory", ""),
+                    part.get("secondCategory", ""),
+                    part.get("mfrPart", ""),
+                    part.get("packageInfo") or "",
+                    int(part.get("solderJoint") or 0),
+                    part.get("manufacturer", ""),
+                    library_type,
+                    part.get("description", ""),
+                    part.get("datasheet", ""),
+                    int(part.get("stock") or 0),
+                    price_json,
+                    now,
+                ))
+                imported += 1
+
+                if progress_callback and (i + 1) % 1000 == 0:
+                    progress_callback(i + 1, len(parts), f"Imported {imported:,} parts...")
+
+            except Exception as e:
+                logger.error(f"Error importing part {part.get('lcscPart')}: {e}")
+                skipped += 1
+
+        self.conn.commit()
+        logger.debug(f"Batch import: {imported} imported, {skipped} skipped")
+        return imported
+
+    def rebuild_fts_index(self):
+        """Rebuild the full-text search index. Call after bulk imports."""
+        cursor = self.conn.cursor()
+        cursor.execute("INSERT INTO components_fts(components_fts) VALUES('rebuild')")
+        self.conn.commit()
+        logger.info("FTS index rebuilt")
+
     def import_jlcsearch_parts(self, parts: List[Dict], progress_callback=None):
         """
         Import parts into database from JLCSearch API response
@@ -248,6 +355,7 @@ class JLCPCBPartsManager:
         self,
         query: Optional[str] = None,
         category: Optional[str] = None,
+        subcategory: Optional[str] = None,
         package: Optional[str] = None,
         library_type: Optional[str] = None,
         manufacturer: Optional[str] = None,
@@ -259,7 +367,8 @@ class JLCPCBPartsManager:
 
         Args:
             query: Free-text search (searches description, mfr part, LCSC)
-            category: Filter by category name
+            category: Filter by top-level category (e.g. "Resistors")
+            subcategory: Filter by sub-category (e.g. "Chip Resistor - Surface Mount")
             package: Filter by package type
             library_type: Filter by "Basic", "Extended", or "Preferred"
             manufacturer: Filter by manufacturer name
@@ -288,6 +397,10 @@ class JLCPCBPartsManager:
         if category:
             sql_parts.append("AND category LIKE ?")
             params.append(f"%{category}%")
+
+        if subcategory:
+            sql_parts.append("AND subcategory LIKE ?")
+            params.append(f"%{subcategory}%")
 
         if package:
             sql_parts.append("AND package LIKE ?")

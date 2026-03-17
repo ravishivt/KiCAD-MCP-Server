@@ -297,9 +297,6 @@ class KiCADInterface:
 
         # Initialize JLCPCB API integration
         self.jlcpcb_client = JLCPCBClient()  # Official API (requires auth)
-        from commands.jlcsearch import JLCSearchClient
-
-        self.jlcsearch_client = JLCSearchClient()  # Public API (no auth required)
         self.jlcpcb_parts = JLCPCBPartsManager()
 
         # Schematic-related classes don't need board reference
@@ -3575,7 +3572,7 @@ print("ok")
     # JLCPCB API handlers
 
     def _handle_download_jlcpcb_database(self, params):
-        """Download JLCPCB parts database using the official JLCPCB Open API"""
+        """Download JLCPCB parts database via /demo/component/info (cursor pagination, full data)"""
         try:
             force = params.get("force", False)
 
@@ -3587,23 +3584,27 @@ print("ok")
                     "stats": stats,
                 }
 
-            # Verify credentials are present
             if not (self.jlcpcb_client.app_id and self.jlcpcb_client.access_key and self.jlcpcb_client.secret_key):
                 return {
                     "success": False,
                     "message": "JLCPCB API credentials not configured. Set JLCPCB_APP_ID, JLCPCB_API_KEY, and JLCPCB_API_SECRET in .env or environment.",
                 }
 
-            logger.info("Downloading JLCPCB parts database via open.jlcpcb.com (official API)...")
+            logger.info("Downloading JLCPCB catalog via /demo/component/info (cursor pagination)...")
 
-            parts = self.jlcpcb_client.download_full_database(
-                callback=lambda page, total, msg: logger.info(msg)
+            total_imported = [0]
+
+            def on_page(items):
+                count = self.jlcpcb_parts.import_component_info_parts(items)
+                total_imported[0] += count
+
+            self.jlcpcb_client.download_full_database(
+                on_page=on_page,
+                callback=lambda total, msg: logger.info(msg),
             )
 
-            logger.info(f"Importing {len(parts)} parts into database...")
-            self.jlcpcb_parts.import_parts(
-                parts, progress_callback=lambda curr, total, msg: logger.info(msg)
-            )
+            logger.info("Rebuilding full-text search index...")
+            self.jlcpcb_parts.rebuild_fts_index()
 
             stats = self.jlcpcb_parts.get_database_stats()
             db_size_mb = os.path.getsize(self.jlcpcb_parts.db_path) / (1024 * 1024)
@@ -3625,93 +3626,100 @@ print("ok")
             }
 
     def _handle_search_jlcpcb_parts(self, params):
-        """Search JLCPCB parts via live JLCSearch API (no local DB)"""
+        """Search JLCPCB parts using the local database (FTS + parametric filters)"""
         try:
-            query = params.get("query", "")
+            query = params.get("query") or None
             package = params.get("package")
-            library_type = params.get("library_type", "All")
+            library_type = params.get("library_type")
             in_stock = params.get("in_stock", True)
             limit = params.get("limit", 20)
+            category = params.get("category")
+            manufacturer = params.get("manufacturer")
 
-            # Build search query incorporating category/manufacturer if provided
-            search_q = query or ""
-            if params.get("category"):
-                search_q = f"{search_q} {params['category']}".strip()
-            if params.get("manufacturer"):
-                search_q = f"{search_q} {params['manufacturer']}".strip()
+            # Normalise library_type: treat "All" or missing as no filter
+            lt_filter = library_type if library_type and library_type != "All" else None
 
-            if not search_q:
-                search_q = "component"  # fallback to get any results
-
-            is_basic = None
-            if library_type == "Basic":
-                is_basic = True
-
-            raw_parts = self.jlcsearch_client.search_text(
-                query=search_q,
+            rows = self.jlcpcb_parts.search_parts(
+                query=query,
+                category=category,
                 package=package,
-                is_basic=is_basic,
+                library_type=lt_filter,
+                manufacturer=manufacturer,
+                in_stock=in_stock,
                 limit=limit,
             )
 
-            # Normalise into the format the TS tool expects
             parts = []
-            for r in raw_parts:
-                lcsc_int = r.get("lcsc")
-                lcsc = f"C{lcsc_int}" if isinstance(lcsc_int, int) else str(lcsc_int or "")
-                price = r.get("price") or r.get("price1")
-                price_breaks = [{"qty": 1, "price": price}] if price else []
-                stock = r.get("stock", 0)
-                if in_stock and stock == 0:
-                    continue
-                lib_type = "Basic" if r.get("is_basic") else ("Preferred" if r.get("is_preferred") else "Extended")
+            for row in rows:
+                try:
+                    price_breaks = json.loads(row.get("price_json") or "[]")
+                except Exception:
+                    price_breaks = []
                 parts.append({
-                    "lcsc": lcsc,
-                    "mfr_part": r.get("mfr", ""),
-                    "manufacturer": r.get("manufacturer", ""),
-                    "description": r.get("description", ""),
-                    "package": r.get("package", ""),
-                    "library_type": lib_type,
-                    "stock": stock,
+                    "lcsc": row["lcsc"],
+                    "mfr_part": row.get("mfr_part", ""),
+                    "manufacturer": row.get("manufacturer", ""),
+                    "description": row.get("description", ""),
+                    "package": row.get("package", ""),
+                    "library_type": row.get("library_type", ""),
+                    "stock": row.get("stock", 0),
                     "price_breaks": price_breaks,
-                    "source": "live",
+                    "source": "local_db",
                 })
 
             return {"success": True, "parts": parts, "count": len(parts)}
 
         except Exception as e:
-            logger.error(f"Error searching JLCPCB parts (live): {e}", exc_info=True)
+            logger.error(f"Error searching JLCPCB parts: {e}", exc_info=True)
             return {"success": False, "message": f"Search failed: {str(e)}"}
 
     def _handle_get_jlcpcb_part(self, params):
-        """Get detailed information for a specific JLCPCB part via live JLCSearch API"""
+        """Get detailed information for a specific JLCPCB part via live JLCPCB API (getComponentDetailByCode)"""
         try:
             lcsc_number = params.get("lcsc_number")
             if not lcsc_number:
                 return {"success": False, "message": "Missing lcsc_number parameter"}
 
-            r = self.jlcsearch_client.get_part_by_lcsc(lcsc_number)
+            r = self.jlcpcb_client.get_part_by_lcsc(lcsc_number)
             if not r:
                 return {"success": False, "message": f"Part not found: {lcsc_number}"}
 
-            lcsc_int = r.get("lcsc")
-            lcsc = f"C{lcsc_int}" if isinstance(lcsc_int, int) else str(lcsc_int or lcsc_number)
-            price = r.get("price") or r.get("price1")
-            price_breaks = [{"qty": 1, "price": price}] if price else []
-            lib_type = "Basic" if r.get("is_basic") else ("Preferred" if r.get("is_preferred") else "Extended")
+            lib_map = {"base": "Basic", "expand": "Extended", "preferred": "Preferred"}
+            lib_type = lib_map.get((r.get("libraryType") or "").lower(), r.get("libraryType", "Extended"))
+
+            price_breaks = [
+                {"qty": pb["startQuantity"], "price": pb["unitPrice"]}
+                for pb in (r.get("priceRanges") or [])
+            ]
+
+            # Flatten parameters list into a dict
+            parameters = {}
+            for p in (r.get("parameters") or []):
+                name = p.get("parameterName", "")
+                val = p.get("parameterValue", "")
+                if name:
+                    # Append multiple values for the same parameter name
+                    if name in parameters:
+                        existing = parameters[name]
+                        parameters[name] = f"{existing}, {val}" if isinstance(existing, str) else val
+                    else:
+                        parameters[name] = val
 
             part = {
-                "lcsc": lcsc,
-                "mfr_part": r.get("mfr", ""),
-                "manufacturer": r.get("manufacturer", ""),
-                "category": r.get("category", ""),
-                "subcategory": r.get("subcategory", ""),
-                "package": r.get("package", ""),
+                "lcsc": r.get("componentCode", lcsc_number),
+                "mfr_part": r.get("componentModel", ""),
+                "package": r.get("componentSpecification", ""),
+                "category": r.get("firstTypeName", ""),
+                "subcategory": r.get("secondTypeName", ""),
                 "description": r.get("description", ""),
                 "library_type": lib_type,
-                "stock": r.get("stock", 0),
-                "datasheet": r.get("datasheet", ""),
+                "stock": r.get("stockCount", 0),
+                "datasheet": r.get("dataManualUrl") or r.get("datasheetUrl", ""),
                 "price_breaks": price_breaks,
+                "parameters": parameters,
+                "rohs": r.get("rohsFlag", False),
+                "eccn": r.get("eccnCode", ""),
+                "assembly_component": r.get("assemblyComponentFlag", False),
                 "source": "live",
             }
 
@@ -3720,7 +3728,7 @@ print("ok")
             return {"success": True, "part": part, "footprints": footprints}
 
         except Exception as e:
-            logger.error(f"Error getting JLCPCB part (live): {e}", exc_info=True)
+            logger.error(f"Error getting JLCPCB part: {e}", exc_info=True)
             return {"success": False, "message": f"Failed to get part info: {str(e)}"}
 
     def _handle_get_jlcpcb_database_stats(self, params):
@@ -3734,7 +3742,7 @@ print("ok")
             return {"success": False, "message": f"Failed to get stats: {str(e)}"}
 
     def _handle_suggest_jlcpcb_alternatives(self, params):
-        """Suggest alternative JLCPCB parts via live JLCSearch API"""
+        """Suggest alternative JLCPCB parts (live reference via JLCPCB API, alternatives from local DB)"""
         try:
             lcsc_number = params.get("lcsc_number")
             limit = params.get("limit", 5)
@@ -3742,54 +3750,71 @@ print("ok")
             if not lcsc_number:
                 return {"success": False, "message": "Missing lcsc_number parameter"}
 
-            # Get the reference part via live API
-            ref_raw = self.jlcsearch_client.get_part_by_lcsc(lcsc_number)
+            # Fetch reference part live for accurate stock/price
+            ref_raw = self.jlcpcb_client.get_part_by_lcsc(lcsc_number)
             if not ref_raw:
                 return {"success": False, "message": f"Reference part not found: {lcsc_number}"}
 
-            ref_price = ref_raw.get("price") or ref_raw.get("price1")
-            reference_price = float(ref_price) if ref_price else None
+            lib_map = {"base": "Basic", "expand": "Extended", "preferred": "Preferred"}
+            ref_lib_type = lib_map.get((ref_raw.get("libraryType") or "").lower(), "Extended")
+            ref_price_breaks = [
+                {"qty": pb["startQuantity"], "price": pb["unitPrice"]}
+                for pb in (ref_raw.get("priceRanges") or [])
+            ]
+            reference_price = ref_price_breaks[0]["price"] if ref_price_breaks else None
 
-            # Search for alternatives using package + description keywords
-            search_q = f"{ref_raw.get('package', '')} {ref_raw.get('description', '')}".strip()
-            if not search_q:
-                search_q = ref_raw.get("mfr", "component")
+            # Search local DB for alternatives by category + package
+            # firstTypeName → DB's category column; secondTypeName → DB's subcategory column
+            package = ref_raw.get("componentSpecification", "")
+            category = ref_raw.get("firstTypeName", "")
+            subcategory = ref_raw.get("secondTypeName", "")
+            original_lcsc = ref_raw.get("componentCode", lcsc_number)
 
-            raw_alts = self.jlcsearch_client.search_text(search_q, limit=limit * 3)
-
-            # Filter out the original part and normalise
-            lcsc_int = ref_raw.get("lcsc")
-            original_lcsc = str(lcsc_int) if isinstance(lcsc_int, int) else str(lcsc_number).lstrip("Cc")
+            alt_rows = self.jlcpcb_parts.search_parts(
+                category=category,
+                subcategory=subcategory,
+                package=package,
+                in_stock=True,
+                limit=limit * 3,
+            )
 
             alternatives = []
-            for r in raw_alts:
-                r_lcsc = str(r.get("lcsc", ""))
-                if r_lcsc == original_lcsc:
+            for row in alt_rows:
+                if row["lcsc"] == original_lcsc:
                     continue
-                price = r.get("price") or r.get("price1")
-                price_breaks = [{"qty": 1, "price": price}] if price else []
-                lib_type = "Basic" if r.get("is_basic") else ("Preferred" if r.get("is_preferred") else "Extended")
+                try:
+                    price_breaks = json.loads(row.get("price_json") or "[]")
+                except Exception:
+                    price_breaks = []
                 alternatives.append({
-                    "lcsc": f"C{r_lcsc}",
-                    "mfr_part": r.get("mfr", ""),
-                    "description": r.get("description", ""),
-                    "package": r.get("package", ""),
-                    "library_type": lib_type,
-                    "stock": r.get("stock", 0),
+                    "lcsc": row["lcsc"],
+                    "mfr_part": row.get("mfr_part", ""),
+                    "description": row.get("description", ""),
+                    "package": row.get("package", ""),
+                    "library_type": row.get("library_type", ""),
+                    "stock": row.get("stock", 0),
                     "price_breaks": price_breaks,
-                    "source": "live",
+                    "source": "local_db",
                 })
                 if len(alternatives) >= limit:
                     break
 
             return {
                 "success": True,
-                "alternatives": alternatives,
+                "reference": {
+                    "lcsc": original_lcsc,
+                    "mfr_part": ref_raw.get("componentModel", ""),
+                    "package": package,
+                    "library_type": ref_lib_type,
+                    "stock": ref_raw.get("stockCount", 0),
+                    "price_breaks": ref_price_breaks,
+                },
                 "reference_price": reference_price,
+                "alternatives": alternatives,
             }
 
         except Exception as e:
-            logger.error(f"Error suggesting alternatives (live): {e}", exc_info=True)
+            logger.error(f"Error suggesting alternatives: {e}", exc_info=True)
             return {
                 "success": False,
                 "message": f"Failed to suggest alternatives: {str(e)}",
