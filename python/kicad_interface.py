@@ -3664,6 +3664,7 @@ print("ok")
                     "library_type": row.get("library_type", ""),
                     "stock": row.get("stock", 0),
                     "price_breaks": price_breaks,
+                    "price_approximate": True,
                     "source": "local_db",
                 })
 
@@ -3794,6 +3795,7 @@ print("ok")
                     "library_type": row.get("library_type", ""),
                     "stock": row.get("stock", 0),
                     "price_breaks": price_breaks,
+                    "price_approximate": True,
                     "source": "local_db",
                 })
                 if len(alternatives) >= limit:

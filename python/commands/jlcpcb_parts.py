@@ -452,6 +452,7 @@ class JLCPCBPartsManager:
                     part['price_breaks'] = json.loads(part['price_json'])
                 except:
                     part['price_breaks'] = []
+            part['price_approximate'] = True
             return part
         return None
 
