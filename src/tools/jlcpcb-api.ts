@@ -7,70 +7,37 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 export function registerJLCPCBApiTools(server: McpServer, callKicadScript: Function) {
-  // Download JLCPCB parts database
-  server.tool(
-    "download_jlcpcb_database",
-    `Download the complete JLCPCB parts catalog to local database.
-
-One-time setup (~5-10 min) that pages through the JLCPCB Open API
-(/demo/component/info) and stores all parts in a local SQLite database.
-
-Requires environment variables: JLCPCB_APP_ID, JLCPCB_API_KEY, JLCPCB_API_SECRET.
-Once downloaded, search_jlcpcb_parts queries the local DB (fast, offline).`,
-    {
-      force: z.boolean().optional().default(false)
-        .describe("Force re-download even if database exists")
-    },
-    async (args: { force?: boolean }) => {
-      const result = await callKicadScript("download_jlcpcb_database", args);
-      if (result.success) {
-        return {
-          content: [{
-            type: "text",
-            text: `✓ Successfully downloaded JLCPCB parts database\n\n` +
-                  `Total parts: ${result.total_parts}\n` +
-                  `Basic parts: ${result.basic_parts}\n` +
-                  `Extended parts: ${result.extended_parts}\n` +
-                  `Database size: ${result.db_size_mb} MB\n` +
-                  `Database path: ${result.db_path}`
-          }]
-        };
-      }
-      return {
-        content: [{
-          type: "text",
-          text: `✗ Failed to download JLCPCB database: ${result.message || 'Unknown error'}\n\n` +
-                `Make sure JLCPCB_API_KEY and JLCPCB_API_SECRET environment variables are set.`
-        }]
-      };
-    }
-  );
-
   // Search JLCPCB parts
   server.tool(
     "search_jlcpcb_parts",
     `Search JLCPCB parts catalog by specifications.
 
-Searches the local JLCPCB database (must be downloaded first with download_jlcpcb_database).
-Provides real pricing, stock info, and library type (Basic parts = free assembly).
+Searches the local JLCPCB database (populate it first with the /download-jlcpcb-db skill).
+Provides pricing, stock info, and library type (Basic parts = free assembly).
 
-IMPORTANT: Most parts in the DB have empty descriptions. Parametric filters
-(category, subcategory) are far more reliable than free-text query. Use
-get_jlcpcb_categories first to discover exact category/subcategory names, then
-filter with those. Reserve query for manufacturer part number searches (e.g., 'AP63203').
+The database has two complementary search approaches — use either or both:
 
-All filters combine with AND — adding more filters narrows results, never broadens them.
-Avoid mixing query= with category= unless you know both apply to the same part;
-use one or the other.
+1. FREE-TEXT QUERY (query=): FTS across LCSC code, manufacturer part number, manufacturer
+   name, and derived attribute descriptions. ~65% of parts have attribute text like
+   "450mΩ ±25% 600Ω@100MHz 0603 Ferrite Beads ROHS", making parametric FTS effective.
+   Good for: MPN lookups, component type + specs ("ferrite bead 600 ohm"), value searches.
 
-Examples of effective parametric searches:
-  - Ferrite beads: category="Filters", subcategory="Ferrite Beads"
-  - USB connectors: category="Connectors", subcategory="USB Connectors"
-  - Buck converters: category="Power Management (PMIC)", subcategory="DC-DC Converters"
-  - Resettable fuses: category="Circuit Protection", subcategory="Resettable Fuses"`,
+2. CATEGORY FILTERS (category= / subcategory=): Exact structural filters that work for
+   all 611K parts regardless of description coverage. Use get_jlcpcb_categories to
+   discover exact names. Good for: browsing a component type, guaranteeing coverage.
+
+Both approaches can be combined — all filters apply with AND (narrowing results).
+
+Examples:
+  - MPN lookup:        query="AP63203"
+  - Ferrite bead spec: query="600Ω@100MHz 200mA 0603"
+  - Category browse:   category="Filters", subcategory="Ferrite Beads"
+  - Combined:          query="600 ohm", category="Filters", subcategory="Ferrite Beads"
+  - Buck converter:    category="Power Management (PMIC)", subcategory="DC-DC Converters"
+  - Resettable fuse:   category="Circuit Protection", subcategory="Resettable Fuses"`,
     {
       query: z.string().optional()
-        .describe("Free-text search — best for manufacturer part numbers (e.g. 'AP63203'). Most parts have empty descriptions so category/subcategory filters are more effective for component types."),
+        .describe("Free-text search across LCSC code, MPN, manufacturer, and part attributes. Works for MPN lookups ('AP63203'), component types ('ferrite bead'), and parametric specs ('600Ω@100MHz 200mA')."),
       category: z.string().optional()
         .describe("Filter by top-level category — use get_jlcpcb_categories to see all valid values (e.g., 'Resistors', 'Capacitors', 'Connectors', 'Filters', 'Circuit Protection', 'Power Management (PMIC)')"),
       subcategory: z.string().optional()
@@ -119,7 +86,7 @@ Examples of effective parametric searches:
         content: [{
           type: "text",
           text: `Failed to search JLCPCB parts: ${result.message || 'Unknown error'}\n\n` +
-                `Make sure you've downloaded the database first using download_jlcpcb_database.`
+                `Make sure you've populated the database first using the /download-jlcpcb-db skill.`
         }]
       };
     }
@@ -174,7 +141,7 @@ Use this to confirm a part after finding candidates via search_jlcpcb_parts.`,
         content: [{
           type: "text",
           text: `Part not found: ${args.lcsc_number}\n\n` +
-                `Make sure you've downloaded the JLCPCB database first.`
+                `Make sure you've populated the database first using the /download-jlcpcb-db skill.`
         }]
       };
     }
@@ -205,7 +172,7 @@ Use this to confirm a part after finding candidates via search_jlcpcb_parts.`,
         content: [{
           type: "text",
           text: `JLCPCB database not found or empty.\n\n` +
-                `Run download_jlcpcb_database first to populate the database.`
+                `Populate it using the /download-jlcpcb-db skill.`
         }]
       };
     }
@@ -216,13 +183,16 @@ Use this to confirm a part after finding candidates via search_jlcpcb_parts.`,
     "get_jlcpcb_categories",
     `List component categories or subcategories from the local JLCPCB database.
 
-Two-step workflow to keep context usage low:
-  1. get_jlcpcb_categories()               → top-level categories only (~750 tokens)
+Use this when you want to browse by category or need to find the exact spelling
+of a category/subcategory name before passing it to search_jlcpcb_parts.
+
+Two-step drill-down to keep context usage low:
+  1. get_jlcpcb_categories()                   → top-level categories only (~750 tokens)
   2. get_jlcpcb_categories(category="Filters") → subcategories for that category (~50 tokens)
   3. search_jlcpcb_parts(category="Filters", subcategory="Ferrite Beads")
 
-Parametric filters are far more reliable than free-text query because 90%+ of
-parts have empty descriptions.`,
+Note: free-text query= in search_jlcpcb_parts also works well for component type searches
+since ~65% of parts have attribute descriptions — use whichever approach fits the task.`,
     {
       category: z.string().optional()
         .describe("If provided, returns subcategories for this category instead of top-level categories")
@@ -260,7 +230,7 @@ parts have empty descriptions.`,
       return {
         content: [{
           type: "text",
-          text: `Failed to load categories. Run download_jlcpcb_database first.`
+          text: `Failed to load categories. Populate the database using the /download-jlcpcb-db skill.`
         }]
       };
     }

@@ -273,11 +273,13 @@ The server provides 64 tools organized into functional categories. With the new 
 - `get_footprint_info` - Get footprint details
 
 ### JLCPCB Integration (5 tools)
-- `download_jlcpcb_database` - Download complete JLCPCB parts catalog (one-time setup)
-- `search_jlcpcb_parts` - Search 2.5M+ parts with parametric filters
-- `get_jlcpcb_part` - Get detailed part info with pricing and footprints
+- `search_jlcpcb_parts` - Search 611K+ parts with FTS and parametric filters
+- `get_jlcpcb_part` - Get detailed part info with live pricing and stock (via JLCPCB API)
+- `get_jlcpcb_categories` - Browse category/subcategory tree for filter discovery
 - `get_jlcpcb_database_stats` - View database statistics and coverage
 - `suggest_jlcpcb_alternatives` - Find cheaper or more available alternatives
+
+> **Setup:** Populate the local DB with the `/download-jlcpcb-db` skill (runs `scripts/download_jlcpcb_db.py`, downloads the community mirror — no API credentials needed).
 
 ### Design Rules (4 tools)
 - `set_design_rules` - Configure DRC parameters

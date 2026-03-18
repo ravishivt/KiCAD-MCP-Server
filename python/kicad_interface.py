@@ -371,8 +371,7 @@ class KiCADInterface:
             "search_symbols": self.symbol_library_commands.search_symbols,
             "list_library_symbols": self.symbol_library_commands.list_library_symbols,
             "get_symbol_info": self.symbol_library_commands.get_symbol_info,
-            # JLCPCB API commands (complete parts catalog via API)
-            "download_jlcpcb_database": self._handle_download_jlcpcb_database,
+            # JLCPCB commands
             "search_jlcpcb_parts": self._handle_search_jlcpcb_parts,
             "get_jlcpcb_part": self._handle_get_jlcpcb_part,
             "get_jlcpcb_database_stats": self._handle_get_jlcpcb_database_stats,
@@ -3572,60 +3571,6 @@ print("ok")
 
     # JLCPCB API handlers
 
-    def _handle_download_jlcpcb_database(self, params):
-        """Download JLCPCB parts database via /demo/component/info (cursor pagination, full data)"""
-        try:
-            force = params.get("force", False)
-
-            stats = self.jlcpcb_parts.get_database_stats()
-            if stats["total_parts"] > 0 and not force:
-                return {
-                    "success": False,
-                    "message": "Database already exists. Use force=true to re-download.",
-                    "stats": stats,
-                }
-
-            if not (self.jlcpcb_client.app_id and self.jlcpcb_client.access_key and self.jlcpcb_client.secret_key):
-                return {
-                    "success": False,
-                    "message": "JLCPCB API credentials not configured. Set JLCPCB_APP_ID, JLCPCB_API_KEY, and JLCPCB_API_SECRET in .env or environment.",
-                }
-
-            logger.info("Downloading JLCPCB catalog via /demo/component/info (cursor pagination)...")
-
-            total_imported = [0]
-
-            def on_page(items):
-                count = self.jlcpcb_parts.import_component_info_parts(items)
-                total_imported[0] += count
-
-            self.jlcpcb_client.download_full_database(
-                on_page=on_page,
-                callback=lambda total, msg: logger.info(msg),
-            )
-
-            logger.info("Rebuilding full-text search index...")
-            self.jlcpcb_parts.rebuild_fts_index()
-
-            stats = self.jlcpcb_parts.get_database_stats()
-            db_size_mb = os.path.getsize(self.jlcpcb_parts.db_path) / (1024 * 1024)
-
-            return {
-                "success": True,
-                "total_parts": stats["total_parts"],
-                "basic_parts": stats["basic_parts"],
-                "extended_parts": stats["extended_parts"],
-                "db_size_mb": round(db_size_mb, 2),
-                "db_path": stats["db_path"],
-            }
-
-        except Exception as e:
-            logger.error(f"Error downloading JLCPCB database: {e}", exc_info=True)
-            return {
-                "success": False,
-                "message": f"Failed to download database: {str(e)}",
-            }
-
     def _handle_search_jlcpcb_parts(self, params):
         """Search JLCPCB parts using the local database (FTS + parametric filters)"""
         try:
@@ -3662,7 +3607,7 @@ print("ok")
                     "lcsc": row["lcsc"],
                     "mfr_part": row.get("mfr_part", ""),
                     "manufacturer": row.get("manufacturer", ""),
-                    "description": row.get("description", ""),
+                    "description": row.get("description") or row.get("derived_description", ""),
                     "package": row.get("package", ""),
                     "library_type": row.get("library_type", ""),
                     "stock": row.get("stock", 0),

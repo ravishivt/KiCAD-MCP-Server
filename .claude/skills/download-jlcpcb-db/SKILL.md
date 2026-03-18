@@ -38,4 +38,3 @@ python3 scripts/download_jlcpcb_db.py $ARGUMENTS
 - The cached source file is saved at `data/jlcpcb-components.sqlite3`
 - The output database is saved at `data/jlcpcb_parts.db` (default)
 - Download is ~1GB; conversion takes a minute or two after download completes
-- Do NOT use the MCP `download_jlcpcb_database` tool — it times out due to paginated API calls

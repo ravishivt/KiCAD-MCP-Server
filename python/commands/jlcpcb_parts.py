@@ -79,12 +79,21 @@ class JLCPCBPartsManager:
                 manufacturer TEXT,
                 library_type TEXT,
                 description TEXT,
+                derived_description TEXT,
                 datasheet TEXT,
                 stock INTEGER,
                 price_json TEXT,
                 last_updated INTEGER
             )
         ''')
+
+        # Migrate: add derived_description if it doesn't exist yet
+        try:
+            cursor.execute("ALTER TABLE components ADD COLUMN derived_description TEXT DEFAULT ''")
+            self.conn.commit()
+            logger.info("Migrated: added derived_description column")
+        except Exception:
+            pass  # Column already exists
 
         # Create indexes for fast searching
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_category ON components(category, subcategory)')
@@ -93,11 +102,21 @@ class JLCPCBPartsManager:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_library_type ON components(library_type)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_mfr_part ON components(mfr_part)')
 
-        # Full-text search index for descriptions
+        # Full-text search index — includes derived_description for attribute-based search
+        # If FTS table exists but is missing derived_description, drop and recreate it
+        # (it will be empty until rebuild_fts_index() is called)
+        fts_row = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='components_fts'"
+        ).fetchone()
+        if fts_row and 'derived_description' not in (fts_row[0] or ''):
+            cursor.execute("DROP TABLE IF EXISTS components_fts")
+            logger.info("Dropped outdated FTS table (missing derived_description); run rebuild_fts_index() to repopulate")
+
         cursor.execute('''
             CREATE VIRTUAL TABLE IF NOT EXISTS components_fts USING fts5(
                 lcsc,
                 description,
+                derived_description,
                 mfr_part,
                 manufacturer,
                 content=components
@@ -248,8 +267,8 @@ class JLCPCBPartsManager:
                     INSERT OR REPLACE INTO components (
                         lcsc, category, subcategory, mfr_part, package,
                         solder_joints, manufacturer, library_type, description,
-                        datasheet, stock, price_json, last_updated
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        derived_description, datasheet, stock, price_json, last_updated
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     lcsc,
                     part.get("firstCategory", ""),
@@ -260,6 +279,7 @@ class JLCPCBPartsManager:
                     part.get("manufacturer", ""),
                     library_type,
                     part.get("description", ""),
+                    "",  # derived_description: not available from /demo/component/info
                     part.get("datasheet", ""),
                     int(part.get("stock") or 0),
                     price_json,
@@ -439,9 +459,9 @@ class JLCPCBPartsManager:
                 sql_parts.append(f"AND ({' OR '.join(sub_conditions)})")
                 params.extend(sub_params)
             elif not fts_query:
-                # All tokens were too short — fall back to description LIKE
-                sql_parts.append("AND description LIKE ?")
-                params.append(f"%{query}%")
+                # All tokens were too short — fall back to LIKE on both description fields
+                sql_parts.append("AND (description LIKE ? OR derived_description LIKE ?)")
+                params.extend([f"%{query}%", f"%{query}%"])
 
         if category:
             sql_parts.append("AND category LIKE ?")

@@ -145,25 +145,56 @@ def _library_type(basic: int, preferred: int) -> str:
     return "Extended"
 
 
+def _derive_description(extra_json_str: str) -> str:
+    """
+    Derive a searchable description from the extra JSON field in jlcparts source DB.
+
+    Priority:
+      1. extra.description  — JLCPCB's pre-built attribute concatenation (65% coverage)
+      2. Concatenated values from extra.attributes — excluding "-" placeholders (~53% coverage)
+
+    Returns empty string when neither is available.
+    """
+    if not extra_json_str:
+        return ""
+    try:
+        extra = json.loads(extra_json_str)
+    except Exception:
+        return ""
+
+    desc = extra.get("description", "")
+    if desc:
+        return desc
+
+    attrs = extra.get("attributes") or {}
+    if attrs:
+        values = [str(v) for v in attrs.values() if v and v != "-"]
+        if values:
+            return " ".join(values)
+
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Schema creation (target DB)
 # ---------------------------------------------------------------------------
 
 TARGET_DDL = """
 CREATE TABLE IF NOT EXISTS components (
-    lcsc          TEXT PRIMARY KEY,
-    category      TEXT,
-    subcategory   TEXT,
-    mfr_part      TEXT,
-    package       TEXT,
-    solder_joints INTEGER,
-    manufacturer  TEXT,
-    library_type  TEXT,
-    description   TEXT,
-    datasheet     TEXT,
-    stock         INTEGER,
-    price_json    TEXT,
-    last_updated  INTEGER
+    lcsc                TEXT PRIMARY KEY,
+    category            TEXT,
+    subcategory         TEXT,
+    mfr_part            TEXT,
+    package             TEXT,
+    solder_joints       INTEGER,
+    manufacturer        TEXT,
+    library_type        TEXT,
+    description         TEXT,
+    derived_description TEXT,
+    datasheet           TEXT,
+    stock               INTEGER,
+    price_json          TEXT,
+    last_updated        INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_category     ON components(category, subcategory);
 CREATE INDEX IF NOT EXISTS idx_package      ON components(package);
@@ -173,6 +204,7 @@ CREATE INDEX IF NOT EXISTS idx_mfr_part     ON components(mfr_part);
 CREATE VIRTUAL TABLE IF NOT EXISTS components_fts USING fts5(
     lcsc,
     description,
+    derived_description,
     mfr_part,
     manufacturer,
     content=components
@@ -219,9 +251,10 @@ def convert(source_db: str, target_db: str) -> None:
     now_ts = int(time.time())
 
     # Use the view when available (it already joins manufacturers + categories)
+    # Always fetch the extra column for derived_description, even when using the view
     if has_view:
         log.info("Using v_components view for conversion …")
-        query = "SELECT * FROM v_components"
+        query = "SELECT v.*, c.extra FROM v_components v JOIN components c ON c.lcsc = v.lcsc"
     else:
         log.info("v_components view not found — falling back to manual JOIN …")
         query = """
@@ -236,6 +269,7 @@ def convert(source_db: str, target_db: str) -> None:
                 c.basic       AS basic,
                 c.preferred   AS preferred,
                 c.description AS description,
+                c.extra       AS extra,
                 c.datasheet   AS datasheet,
                 c.stock       AS stock,
                 c.price       AS price,
@@ -249,8 +283,8 @@ def convert(source_db: str, target_db: str) -> None:
         INSERT OR REPLACE INTO components (
             lcsc, category, subcategory, mfr_part, package,
             solder_joints, manufacturer, library_type, description,
-            datasheet, stock, price_json, last_updated
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            derived_description, datasheet, stock, price_json, last_updated
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     batch = []
@@ -295,6 +329,7 @@ def convert(source_db: str, target_db: str) -> None:
                     r.get("manufacturer", ""),
                     lib_type,
                     r.get("description", ""),
+                    _derive_description(r.get("extra", "")),
                     r.get("datasheet", ""),
                     int(r.get("stock", 0) or 0),
                     price_json,
