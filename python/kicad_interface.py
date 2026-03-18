@@ -376,6 +376,7 @@ class KiCADInterface:
             "search_jlcpcb_parts": self._handle_search_jlcpcb_parts,
             "get_jlcpcb_part": self._handle_get_jlcpcb_part,
             "get_jlcpcb_database_stats": self._handle_get_jlcpcb_database_stats,
+            "get_jlcpcb_categories": self._handle_get_jlcpcb_categories,
             "suggest_jlcpcb_alternatives": self._handle_suggest_jlcpcb_alternatives,
             # Datasheet commands
             "enrich_datasheets": self._handle_enrich_datasheets,
@@ -3634,6 +3635,7 @@ print("ok")
             in_stock = params.get("in_stock", True)
             limit = params.get("limit", 20)
             category = params.get("category")
+            subcategory = params.get("subcategory")
             manufacturer = params.get("manufacturer")
 
             # Normalise library_type: treat "All" or missing as no filter
@@ -3642,6 +3644,7 @@ print("ok")
             rows = self.jlcpcb_parts.search_parts(
                 query=query,
                 category=category,
+                subcategory=subcategory,
                 package=package,
                 library_type=lt_filter,
                 manufacturer=manufacturer,
@@ -3741,6 +3744,16 @@ print("ok")
         except Exception as e:
             logger.error(f"Error getting database stats: {e}", exc_info=True)
             return {"success": False, "message": f"Failed to get stats: {str(e)}"}
+
+    def _handle_get_jlcpcb_categories(self, params):
+        """Return category or subcategory list from the local DB"""
+        try:
+            category = params.get("category") or None
+            data = self.jlcpcb_parts.get_categories(category=category)
+            return {"success": True, **data}
+        except Exception as e:
+            logger.error(f"Error getting JLCPCB categories: {e}", exc_info=True)
+            return {"success": False, "message": str(e)}
 
     def _handle_suggest_jlcpcb_alternatives(self, params):
         """Suggest alternative JLCPCB parts (live reference via JLCPCB API, alternatives from local DB)"""

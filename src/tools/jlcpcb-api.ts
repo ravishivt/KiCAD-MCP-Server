@@ -12,11 +12,11 @@ export function registerJLCPCBApiTools(server: McpServer, callKicadScript: Funct
     "download_jlcpcb_database",
     `Download the complete JLCPCB parts catalog to local database.
 
-This is a one-time setup that downloads ~2.5M+ parts from JLCSearch API.
-No API credentials required - uses public JLCSearch API.
+One-time setup (~5-10 min) that pages through the JLCPCB Open API
+(/demo/component/info) and stores all parts in a local SQLite database.
 
-The download takes 5-10 minutes and creates a local SQLite database
-for fast offline searching.`,
+Requires environment variables: JLCPCB_APP_ID, JLCPCB_API_KEY, JLCPCB_API_SECRET.
+Once downloaded, search_jlcpcb_parts queries the local DB (fast, offline).`,
     {
       force: z.boolean().optional().default(false)
         .describe("Force re-download even if database exists")
@@ -54,14 +54,29 @@ for fast offline searching.`,
 Searches the local JLCPCB database (must be downloaded first with download_jlcpcb_database).
 Provides real pricing, stock info, and library type (Basic parts = free assembly).
 
-Use this to find components with exact specifications and cost optimization.`,
+IMPORTANT: Most parts in the DB have empty descriptions. Parametric filters
+(category, subcategory) are far more reliable than free-text query. Use
+get_jlcpcb_categories first to discover exact category/subcategory names, then
+filter with those. Reserve query for manufacturer part number searches (e.g., 'AP63203').
+
+All filters combine with AND — adding more filters narrows results, never broadens them.
+Avoid mixing query= with category= unless you know both apply to the same part;
+use one or the other.
+
+Examples of effective parametric searches:
+  - Ferrite beads: category="Filters", subcategory="Ferrite Beads"
+  - USB connectors: category="Connectors", subcategory="USB Connectors"
+  - Buck converters: category="Power Management (PMIC)", subcategory="DC-DC Converters"
+  - Resettable fuses: category="Circuit Protection", subcategory="Resettable Fuses"`,
     {
       query: z.string().optional()
-        .describe("Free-text search (e.g., '10k resistor 0603', 'ESP32', 'STM32F103')"),
+        .describe("Free-text search — best for manufacturer part numbers (e.g. 'AP63203'). Most parts have empty descriptions so category/subcategory filters are more effective for component types."),
       category: z.string().optional()
-        .describe("Filter by category (e.g., 'Resistors', 'Capacitors', 'Microcontrollers')"),
+        .describe("Filter by top-level category — use get_jlcpcb_categories to see all valid values (e.g., 'Resistors', 'Capacitors', 'Connectors', 'Filters', 'Circuit Protection', 'Power Management (PMIC)')"),
+      subcategory: z.string().optional()
+        .describe("Filter by subcategory — use get_jlcpcb_categories to see all valid values (e.g., 'Ferrite Beads', 'USB Connectors', 'DC-DC Converters', 'Resettable Fuses')"),
       package: z.string().optional()
-        .describe("Filter by package type (e.g., '0603', 'SOT-23', 'QFN-32')"),
+        .describe("Filter by package type (e.g., '0603', 'SOT-23', 'QFN-32') — note: package data is sparse in the DB"),
       library_type: z.enum(["Basic", "Extended", "Preferred", "All"]).optional().default("All")
         .describe("Filter by library type (Basic = free assembly at JLCPCB)"),
       manufacturer: z.string().optional()
@@ -113,7 +128,11 @@ Use this to find components with exact specifications and cost optimization.`,
   // Get JLCPCB part details
   server.tool(
     "get_jlcpcb_part",
-    "Get detailed information about a specific JLCPCB part by LCSC number",
+    `Get detailed information about a specific JLCPCB part by LCSC number.
+
+Calls the live JLCPCB API — always returns current stock, pricing, and datasheet,
+unlike search_jlcpcb_parts which uses a local DB snapshot that may be months old.
+Use this to confirm a part after finding candidates via search_jlcpcb_parts.`,
     {
       lcsc_number: z.string()
         .describe("LCSC part number (e.g., 'C25804', 'C2286')")
@@ -187,6 +206,61 @@ Use this to find components with exact specifications and cost optimization.`,
           type: "text",
           text: `JLCPCB database not found or empty.\n\n` +
                 `Run download_jlcpcb_database first to populate the database.`
+        }]
+      };
+    }
+  );
+
+  // List categories (top-level) or subcategories (drill-down)
+  server.tool(
+    "get_jlcpcb_categories",
+    `List component categories or subcategories from the local JLCPCB database.
+
+Two-step workflow to keep context usage low:
+  1. get_jlcpcb_categories()               → top-level categories only (~750 tokens)
+  2. get_jlcpcb_categories(category="Filters") → subcategories for that category (~50 tokens)
+  3. search_jlcpcb_parts(category="Filters", subcategory="Ferrite Beads")
+
+Parametric filters are far more reliable than free-text query because 90%+ of
+parts have empty descriptions.`,
+    {
+      category: z.string().optional()
+        .describe("If provided, returns subcategories for this category instead of top-level categories")
+    },
+    async (args: { category?: string }) => {
+      const result = await callKicadScript("get_jlcpcb_categories", args);
+      if (result.success) {
+        if (result.subcategories) {
+          // Drill-down: subcategories for a specific category
+          const lines = result.subcategories.map((s: any) =>
+            `  • ${s.subcategory} (${s.count.toLocaleString()})`
+          );
+          return {
+            content: [{
+              type: "text",
+              text: `Subcategories for "${result.category}":\n` + lines.join('\n') +
+                    `\n\nUse subcategory= in search_jlcpcb_parts to filter.`
+            }]
+          };
+        }
+        if (result.categories) {
+          // Top-level categories
+          const lines = result.categories.map((c: any) =>
+            `  ${c.category} (${c.count.toLocaleString()})`
+          );
+          return {
+            content: [{
+              type: "text",
+              text: `JLCPCB top-level categories:\n` + lines.join('\n') +
+                    `\n\nCall get_jlcpcb_categories(category="<name>") to see subcategories.`
+            }]
+          };
+        }
+      }
+      return {
+        content: [{
+          type: "text",
+          text: `Failed to load categories. Run download_jlcpcb_database first.`
         }]
       };
     }

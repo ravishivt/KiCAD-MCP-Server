@@ -6,6 +6,7 @@ and component selection.
 """
 
 import os
+import re
 import sqlite3
 import json
 import logging
@@ -14,6 +15,24 @@ from typing import List, Dict, Optional
 from datetime import datetime
 
 logger = logging.getLogger('kicad_interface')
+
+
+def _build_fts_query(query: str) -> str:
+    """
+    Convert a free-text user query into a safe FTS5 MATCH expression.
+
+    - Splits on whitespace and punctuation that FTS5 treats as operators
+      (-, +, *, (, ), [, ], ^, ", ', /, :, =, <, >, !, comma, semicolon).
+    - Drops single-character tokens (too broad to be useful).
+    - Wraps each remaining token in double-quotes and appends * for prefix
+      matching, so "ferrite bead" → `"ferrite"* "bead"*`.
+
+    Returns an empty string if no usable tokens remain (caller should fall
+    back to a LIKE query).
+    """
+    tokens = re.split(r'[\s\-+*()\[\]{}^"\'/:=<>!,;|\\]+', query.strip())
+    safe = [f'"{t}"*' for t in tokens if len(t) >= 2]
+    return ' '.join(safe)
 
 
 class JLCPCBPartsManager:
@@ -385,14 +404,44 @@ class JLCPCBPartsManager:
         params = []
 
         if query:
-            # Use FTS for text search
-            sql_parts.append('''
-                AND lcsc IN (
-                    SELECT lcsc FROM components_fts
-                    WHERE components_fts MATCH ?
+            # Split into significant tokens (>= 3 chars) for LIKE-based fallback.
+            tokens = [
+                t for t in re.split(r'[\s\-+*()\[\]{}^"\'/:=<>!,;|\\]+', query.strip())
+                if len(t) >= 3
+            ]
+
+            # Build sub-conditions combined with OR so that a part matches if it
+            # satisfies ANY of: FTS on description/mfr_part/manufacturer, OR a
+            # category/subcategory LIKE for any query token.
+            #
+            # Why OR instead of AND:
+            # - 90%+ of parts have empty descriptions; category/subcategory are the
+            #   only searchable text for most parts.
+            # - AND is too strict for multi-word queries ("ferrite bead 600 ohm 0805"
+            #   requires all 5 terms in a single field, finding far fewer results).
+            sub_conditions = []
+            sub_params = []
+
+            fts_query = _build_fts_query(query)
+            if fts_query:
+                sub_conditions.append(
+                    "lcsc IN (SELECT lcsc FROM components_fts WHERE components_fts MATCH ?)"
                 )
-            ''')
-            params.append(query)
+                sub_params.append(fts_query)
+
+            # Category/subcategory LIKE per token — catches "USB Connectors",
+            # "Ferrite Beads", "DC-DC Converters", etc. for parts with no description.
+            for token in tokens[:5]:
+                sub_conditions.append("(category LIKE ? OR subcategory LIKE ?)")
+                sub_params.extend([f"%{token}%", f"%{token}%"])
+
+            if sub_conditions:
+                sql_parts.append(f"AND ({' OR '.join(sub_conditions)})")
+                params.extend(sub_params)
+            elif not fts_query:
+                # All tokens were too short — fall back to description LIKE
+                sql_parts.append("AND description LIKE ?")
+                params.append(f"%{query}%")
 
         if category:
             sql_parts.append("AND category LIKE ?")
@@ -455,6 +504,48 @@ class JLCPCBPartsManager:
             part['price_approximate'] = True
             return part
         return None
+
+    def get_categories(self, category: Optional[str] = None) -> Dict:
+        """
+        Return category/subcategory data from the local DB.
+
+        If category is None: returns top-level categories with part counts only.
+        If category is provided: returns subcategories for that category.
+        Rows with empty category are omitted.
+        """
+        cursor = self.conn.cursor()
+
+        if category:
+            cursor.execute("""
+                SELECT subcategory, COUNT(*) as cnt
+                FROM components
+                WHERE category = ? AND subcategory != '' AND subcategory IS NOT NULL
+                GROUP BY subcategory
+                ORDER BY cnt DESC
+            """, (category,))
+            rows = cursor.fetchall()
+            return {
+                'category': category,
+                'subcategories': [
+                    {'subcategory': row['subcategory'], 'count': row['cnt']}
+                    for row in rows
+                ]
+            }
+        else:
+            cursor.execute("""
+                SELECT category, COUNT(*) as cnt
+                FROM components
+                WHERE category != '' AND category IS NOT NULL
+                GROUP BY category
+                ORDER BY category
+            """)
+            rows = cursor.fetchall()
+            return {
+                'categories': [
+                    {'category': row['category'], 'count': row['cnt']}
+                    for row in rows
+                ]
+            }
 
     def get_database_stats(self) -> Dict:
         """Get statistics about the database"""
