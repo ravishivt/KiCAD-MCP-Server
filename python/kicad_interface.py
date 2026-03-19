@@ -2381,7 +2381,11 @@ class KiCADInterface:
                 violations = []
                 severity_counts = {"error": 0, "warning": 0, "info": 0}
 
-                for v in erc_data.get("violations", []):
+                all_violations = []
+                for sheet in erc_data.get("sheets", []):
+                    all_violations.extend(sheet.get("violations", []))
+
+                for v in all_violations:
                     vseverity = v.get("severity", "error")
                     items = v.get("items", [])
                     loc = {}
