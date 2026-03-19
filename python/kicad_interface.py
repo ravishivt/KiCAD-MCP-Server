@@ -395,6 +395,9 @@ class KiCADInterface:
             "get_schematic_pin_locations": self._handle_get_schematic_pin_locations,
             "get_net_connections": self._handle_get_net_connections,
             "run_erc": self._handle_run_erc,
+            "place_net_label_at_pin": self._handle_place_net_label_at_pin,
+            "list_unconnected_pins": self._handle_list_unconnected_pins,
+            "search_schematic_symbols": self._handle_search_schematic_symbols,
             "generate_netlist": self._handle_generate_netlist,
             "sync_schematic_to_board": self._handle_sync_schematic_to_board,
             "list_schematic_libraries": self._handle_list_schematic_libraries,
@@ -1494,12 +1497,12 @@ class KiCADInterface:
             from pathlib import Path
 
             schematic_path = params.get("schematicPath")
-            component_ref = params.get("componentRef")
-            pin_name = params.get("pinName")
+            component_ref = params.get("reference") or params.get("componentRef")
+            pin_name = params.get("pinNumber") or params.get("pinName")
             net_name = params.get("netName")
 
             if not all([schematic_path, component_ref, pin_name, net_name]):
-                return {"success": False, "message": "Missing required parameters"}
+                return {"success": False, "message": "Missing required parameters: schematicPath, reference, pinNumber, netName"}
 
             # Use ConnectionManager with new WireManager integration
             success = ConnectionManager.connect_to_net(
@@ -1560,6 +1563,186 @@ class KiCADInterface:
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
+
+    def _handle_place_net_label_at_pin(self, params):
+        """Place a net label at the exact endpoint of a component pin (no wire stub)"""
+        logger.info("Placing net label at pin")
+        try:
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+            from commands.wire_manager import WireManager
+
+            schematic_path = params.get("schematicPath")
+            reference = params.get("reference")
+            pin_number = params.get("pinNumber")
+            net_name = params.get("netName")
+
+            if not all([schematic_path, reference, pin_number, net_name]):
+                return {
+                    "success": False,
+                    "message": "Missing required parameters: schematicPath, reference, pinNumber, netName",
+                }
+
+            locator = PinLocator()
+            sch_path = Path(schematic_path)
+
+            position = locator.get_pin_location(sch_path, reference, str(pin_number))
+            if not position:
+                return {
+                    "success": False,
+                    "message": f"Could not find pin {pin_number} on {reference}",
+                }
+
+            raw_angle = locator.get_pin_angle(sch_path, reference, str(pin_number)) or 0
+            # Normalize to nearest cardinal angle
+            cardinal = round(raw_angle / 90) * 90 % 360
+            # Map pin angle to label orientation: label text should extend outward
+            angle_map = {0: 180, 90: 270, 180: 0, 270: 90}
+            orientation = angle_map.get(cardinal, 0)
+
+            success = WireManager.add_label(
+                sch_path, net_name, position, label_type="label", orientation=orientation
+            )
+
+            if success:
+                return {
+                    "success": True,
+                    "reference": reference,
+                    "pinNumber": pin_number,
+                    "netName": net_name,
+                    "position": {"x": position[0], "y": position[1]},
+                    "labelOrientation": orientation,
+                }
+            else:
+                return {"success": False, "message": "Failed to place net label"}
+
+        except Exception as e:
+            logger.error(f"Error placing net label at pin: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e), "errorDetails": traceback.format_exc()}
+
+    def _handle_list_unconnected_pins(self, params):
+        """List pins with no net connection and no no-connect marker"""
+        logger.info("Listing unconnected pins")
+        try:
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            sch_path = Path(schematic_path)
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            # Build set of connected (ref, pin_num) from netlist
+            netlist = ConnectionManager.generate_netlist(schematic, sch_path)
+            connected_pins = set()
+            for net in netlist.get("nets", []):
+                for conn in net.get("connections", []):
+                    connected_pins.add((conn.get("component"), str(conn.get("pin"))))
+
+            # Build set of no-connect positions
+            no_connect_positions = set()
+            if hasattr(schematic, "no_connect"):
+                for nc in schematic.no_connect:
+                    if hasattr(nc, "at") and hasattr(nc.at, "value"):
+                        pos = nc.at.value
+                        no_connect_positions.add((round(float(pos[0]), 2), round(float(pos[1]), 2)))
+
+            locator = PinLocator()
+            unconnected = []
+
+            for symbol in schematic.symbol:
+                if not hasattr(symbol.property, "Reference"):
+                    continue
+                ref = symbol.property.Reference.value
+                if ref.startswith("_TEMPLATE") or ref.startswith("#"):
+                    continue
+                lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
+                if lib_id.startswith("power:"):
+                    continue
+
+                all_pins = locator.get_all_symbol_pins(sch_path, ref) or {}
+                pins_def = locator.get_symbol_pins(sch_path, lib_id) or {}
+
+                for pin_num, coords in all_pins.items():
+                    if (ref, str(pin_num)) in connected_pins:
+                        continue
+                    pin_pos = (round(float(coords[0]), 2), round(float(coords[1]), 2))
+                    if pin_pos in no_connect_positions:
+                        continue
+                    pin_info = pins_def.get(str(pin_num), {})
+                    unconnected.append({
+                        "reference": ref,
+                        "pinNumber": str(pin_num),
+                        "pinName": pin_info.get("name", str(pin_num)),
+                        "pinType": pin_info.get("type", "unknown"),
+                        "position": {"x": coords[0], "y": coords[1]},
+                    })
+
+            return {"success": True, "unconnected": unconnected, "count": len(unconnected)}
+
+        except Exception as e:
+            logger.error(f"Error listing unconnected pins: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e), "errorDetails": traceback.format_exc()}
+
+    def _handle_search_schematic_symbols(self, params):
+        """Search for symbol names across KiCAD symbol libraries"""
+        logger.info("Searching schematic symbols")
+        try:
+            import re
+            from commands.dynamic_symbol_loader import DynamicSymbolLoader
+
+            query = params.get("query", "").strip()
+            max_results = min(int(params.get("maxResults", 20)), 100)
+
+            if not query:
+                return {"success": False, "message": "query is required"}
+
+            loader = DynamicSymbolLoader()
+            lib_dirs = loader.find_kicad_symbol_libraries()
+
+            results = []
+            query_lower = query.lower()
+            sub_symbol_re = re.compile(r'.+_\d+_\d+$')
+
+            for lib_dir in lib_dirs:
+                if len(results) >= max_results:
+                    break
+                for lib_file in sorted(lib_dir.glob("*.kicad_sym")):
+                    if len(results) >= max_results:
+                        break
+                    lib_name = lib_file.stem
+                    try:
+                        content = lib_file.read_text(encoding="utf-8", errors="ignore")
+                    except Exception:
+                        continue
+                    symbol_names = re.findall(r'\(symbol\s+"([^"]+)"', content)
+                    for sym_name in symbol_names:
+                        if sub_symbol_re.match(sym_name):
+                            continue
+                        if query_lower in sym_name.lower() or query_lower in lib_name.lower():
+                            results.append({
+                                "library": lib_name,
+                                "symbol": sym_name,
+                                "fullName": f"{lib_name}:{sym_name}",
+                            })
+                            if len(results) >= max_results:
+                                break
+
+            return {"success": True, "results": results, "count": len(results)}
+
+        except Exception as e:
+            logger.error(f"Error searching schematic symbols: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e), "errorDetails": traceback.format_exc()}
 
     def _handle_get_schematic_pin_locations(self, params):
         """Return exact pin endpoint coordinates for a schematic component"""
@@ -1809,6 +1992,10 @@ class KiCADInterface:
                                 )
                             pin_list.append(pin_info)
                         comp["pins"] = pin_list
+                        if pin_list:
+                            xs = [p["position"]["x"] for p in pin_list]
+                            ys = [p["position"]["y"] for p in pin_list]
+                            comp["bounds"] = {"minX": min(xs), "maxX": max(xs), "minY": min(ys), "maxY": max(ys)}
                 except Exception:
                     pass  # Pin lookup is best-effort
 

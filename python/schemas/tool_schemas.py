@@ -1388,7 +1388,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "add_schematic_component",
         "title": "Add Component to Schematic",
-        "description": "Places a symbol (resistor, capacitor, IC, etc.) on the schematic.",
+        "description": "Places a symbol (resistor, capacitor, IC, etc.) on the schematic. Coordinates are in mm. Use 2.54mm grid multiples. Y increases downward. Space components 15-20mm apart. Use search_schematic_symbols to find the correct library:symbol_name before calling this tool.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1419,23 +1419,30 @@ SCHEMATIC_TOOLS = [
     {
         "name": "add_schematic_wire",
         "title": "Connect Components",
-        "description": "Draws a wire connection between component pins on the schematic.",
+        "description": "Draws a wire connection between two points on the schematic. Coordinates are in mm; use multiples of 2.54mm for grid alignment.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "points": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                },
+                "startPoint": {
                     "type": "array",
-                    "description": "Array of [x, y] waypoints for the wire",
-                    "items": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 2,
-                        "maxItems": 2
-                    },
-                    "minItems": 2
+                    "description": "Start point [x, y] in mm",
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                    "maxItems": 2
+                },
+                "endPoint": {
+                    "type": "array",
+                    "description": "End point [x, y] in mm",
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                    "maxItems": 2
                 }
             },
-            "required": ["points"]
+            "required": ["schematicPath", "startPoint", "endPoint"]
         }
     },
     {
@@ -1464,7 +1471,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "add_schematic_net_label",
         "title": "Add Net Label",
-        "description": "Adds a net label at exact coordinates on a schematic wire or pin endpoint. WARNING: x/y must match an existing wire endpoint or pin endpoint exactly — placing the label even 0.01mm away from a pin will result in an unconnected pin ERC error. To connect a component pin to a net by reference and pin number (recommended), use connect_to_net instead.",
+        "description": "Adds a net label at exact coordinates on a schematic wire or pin endpoint. WARNING: x/y must match an existing wire endpoint or pin endpoint exactly — placing the label even 0.01mm away from a pin will result in an unconnected pin ERC error. To connect a component pin to a net by reference and pin number (recommended), use connect_to_net instead. To place at a pin by reference+pinNumber with automatic position lookup, use place_net_label_at_pin instead.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1496,7 +1503,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "connect_to_net",
         "title": "Connect Pin to Net",
-        "description": "Intelligently connects a component pin to a named net, automatically routing wires as needed.",
+        "description": "Intelligently connects a component pin to a named net, automatically routing wires as needed. PREFERRED connection method. Do NOT call get_schematic_pin_locations first — pin lookup is automatic. For no-wire-stub placement, use place_net_label_at_pin instead.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1605,6 +1612,69 @@ SCHEMATIC_TOOLS = [
         }
     },
     {
+        "name": "place_net_label_at_pin",
+        "title": "Place Net Label at Pin",
+        "description": "Places a net label at the exact pin endpoint of a component, with automatic position and orientation lookup. No wire stub is generated — avoids floating-endpoint ERC errors. PREFERRED over connect_to_net for clean schematics.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                },
+                "reference": {
+                    "type": "string",
+                    "description": "Component reference designator (e.g., R1, U3)"
+                },
+                "pinNumber": {
+                    "type": "string",
+                    "description": "Pin number on the component"
+                },
+                "netName": {
+                    "type": "string",
+                    "description": "Net label text (e.g., VCC, GND, SDA)"
+                }
+            },
+            "required": ["schematicPath", "reference", "pinNumber", "netName"]
+        }
+    },
+    {
+        "name": "list_unconnected_pins",
+        "title": "List Unconnected Pins",
+        "description": "Returns pins with no net connection and no no-connect flag. Use instead of ERC for connectivity checks — faster and returns structured data.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                }
+            },
+            "required": ["schematicPath"]
+        }
+    },
+    {
+        "name": "search_schematic_symbols",
+        "title": "Search Schematic Symbols",
+        "description": "Search symbol libraries by name to find the correct Library:SymbolName before calling add_schematic_component. Searches symbol names and library names. E.g. query='STM32F103' returns 'MCU_ST_STM32F1:STM32F103C8Tx'.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query (matched against symbol names and library names)"
+                },
+                "maxResults": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return (default: 20, max: 100)",
+                    "default": 20,
+                    "maximum": 100
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
         "name": "sync_schematic_to_board",
         "title": "Sync Schematic to PCB (F8)",
         "description": "Reads net connections from the schematic and assigns them to matching component pads in the PCB board file. Equivalent to KiCAD Pcbnew F8 'Update PCB from Schematic'. Must be called after placing components and before routing traces, so that pad-to-net assignments are correct.",
@@ -1625,7 +1695,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "generate_netlist",
         "title": "Generate Netlist",
-        "description": "Generates a netlist from the schematic showing all components and their net connections.",
+        "description": "Generates a full netlist from the schematic: nets + components. Use for complete connectivity analysis or PCB sync. For nets only, use list_schematic_nets.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1672,6 +1742,75 @@ SCHEMATIC_TOOLS = [
                 "schematicPath": {
                     "type": "string",
                     "description": "Path to the .kicad_sch schematic file"
+                }
+            },
+            "required": ["schematicPath"]
+        }
+    },
+    {
+        "name": "list_schematic_components",
+        "title": "List Schematic Components",
+        "description": "Returns structured data for all components in the schematic including reference, value, footprint, position, and pins with coordinates. Preferred over get_schematic_view for data access.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                },
+                "filter": {
+                    "type": "object",
+                    "description": "Optional filters",
+                    "properties": {
+                        "libId": {"type": "string", "description": "Filter by library ID substring"},
+                        "referencePrefix": {"type": "string", "description": "Filter by reference prefix (e.g. 'R', 'U')"}
+                    }
+                }
+            },
+            "required": ["schematicPath"]
+        }
+    },
+    {
+        "name": "list_schematic_nets",
+        "title": "List Schematic Nets",
+        "description": "Fast nets-only query returning all net names and their pin connections. For full connectivity + component data, use generate_netlist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                }
+            },
+            "required": ["schematicPath"]
+        }
+    },
+    {
+        "name": "get_schematic_view",
+        "title": "Get Schematic View",
+        "description": "Returns a rasterized image (PNG or SVG) of the schematic for spatial overview. For structured data, prefer list_schematic_components.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["png", "svg"],
+                    "description": "Output image format (default: png)",
+                    "default": "png"
+                },
+                "width": {
+                    "type": "integer",
+                    "description": "Output image width in pixels (default: 1200)",
+                    "default": 1200
+                },
+                "height": {
+                    "type": "integer",
+                    "description": "Output image height in pixels (default: 900)",
+                    "default": 900
                 }
             },
             "required": ["schematicPath"]

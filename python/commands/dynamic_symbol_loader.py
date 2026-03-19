@@ -16,6 +16,13 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("kicad_interface")
 
+_SCHEMATIC_GRID_MM = 1.27  # 50mil — KiCAD standard schematic grid
+
+
+def _snap(val: float) -> float:
+    """Round a coordinate to the nearest KiCAD schematic grid point (50mil = 1.27mm)."""
+    return round(round(val / _SCHEMATIC_GRID_MM) * _SCHEMATIC_GRID_MM, 4)
+
 
 class DynamicSymbolLoader:
     """
@@ -417,6 +424,10 @@ class DynamicSymbolLoader:
         """
         full_lib_id = f"{library_name}:{symbol_name}"
         new_uuid = str(uuid.uuid4())
+
+        # Snap placement to 50mil grid so pins land on-grid in the schematic editor
+        x = _snap(x)
+        y = _snap(y)
 
         instance_block = f"""  (symbol (lib_id "{full_lib_id}") (at {x} {y} 0) (unit 1)
     (in_bom yes) (on_board yes) (dnp no)

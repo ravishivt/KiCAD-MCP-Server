@@ -17,6 +17,13 @@ from sexpdata import Symbol
 
 logger = logging.getLogger("kicad_interface")
 
+_SCHEMATIC_GRID_MM = 1.27  # 50mil — KiCAD standard schematic grid
+
+
+def _snap(val: float) -> float:
+    """Round a coordinate to the nearest KiCAD schematic grid point (50mil = 1.27mm)."""
+    return round(round(val / _SCHEMATIC_GRID_MM) * _SCHEMATIC_GRID_MM, 4)
+
 
 class WireManager:
     """Manage wires in KiCad schematics using S-expression manipulation"""
@@ -43,6 +50,10 @@ class WireManager:
             True if successful, False otherwise
         """
         try:
+            # Snap to 50mil grid before writing
+            start_point = [_snap(start_point[0]), _snap(start_point[1])]
+            end_point = [_snap(end_point[0]), _snap(end_point[1])]
+
             # Read schematic
             with open(schematic_path, "r", encoding="utf-8") as f:
                 sch_content = f.read()
@@ -124,6 +135,9 @@ class WireManager:
                 logger.error("Polyline requires at least 2 points")
                 return False
 
+            # Snap all points to 50mil grid before writing
+            points = [[_snap(p[0]), _snap(p[1])] for p in points]
+
             # Read schematic
             with open(schematic_path, "r", encoding="utf-8") as f:
                 sch_content = f.read()
@@ -203,6 +217,9 @@ class WireManager:
             True if successful, False otherwise
         """
         try:
+            # Snap to 50mil grid before writing
+            position = [_snap(position[0]), _snap(position[1])]
+
             # Read schematic
             with open(schematic_path, "r", encoding="utf-8") as f:
                 sch_content = f.read()
