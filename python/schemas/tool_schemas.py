@@ -1542,7 +1542,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "get_schematic_pin_locations",
         "title": "Get Schematic Pin Locations",
-        "description": "Returns the exact absolute coordinates of all pins on a schematic component. Use this BEFORE placing net labels with add_schematic_net_label to get the correct x/y position for each pin endpoint.",
+        "description": "Returns the exact absolute coordinates of all pins on a schematic component. Use this BEFORE placing net labels with add_schematic_net_label to get the correct x/y position for each pin endpoint. If the reference is not found, the error message lists all available references in the schematic. Note: unannotated components have '?' references (e.g. R?) — run annotate_schematic first or use the exact reference including '?'.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1592,7 +1592,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "run_erc",
         "title": "Run Electrical Rules Check (ERC)",
-        "description": "Runs the KiCAD Electrical Rules Check (ERC) on a schematic via kicad-cli and returns all violations with type, severity, and location. Use this to verify the schematic is electrically correct before generating a netlist or exporting.",
+        "description": "Runs the KiCAD Electrical Rules Check (ERC) on a schematic via kicad-cli and returns all violations. Each violation includes type, severity, message, location (x/y coordinates), and an 'items' array where each item has a 'description' field identifying the specific component/pin (e.g. 'Pin 1 [Passive] of R1') and its position. Annotate the schematic first (annotate_schematic) for best results.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1660,6 +1660,21 @@ SCHEMATIC_TOOLS = [
                     "items": {"type": "string"}
                 }
             }
+        }
+    },
+    {
+        "name": "annotate_schematic",
+        "title": "Annotate Schematic Components",
+        "description": "Assigns reference designators to all unannotated components (e.g. R? → R1, U? → U1). Run this before get_schematic_pin_locations or run_erc to ensure all components have proper references. Returns a list of old→new reference mappings.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                }
+            },
+            "required": ["schematicPath"]
         }
     },
     {

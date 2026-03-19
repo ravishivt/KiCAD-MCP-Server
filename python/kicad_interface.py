@@ -1581,9 +1581,25 @@ class KiCADInterface:
             all_pins = locator.get_all_symbol_pins(Path(schematic_path), reference)
 
             if not all_pins:
+                # Collect all available references for a helpful error message
+                available_refs = []
+                try:
+                    from skip import Schematic as SkipSchematic
+                    sch = SkipSchematic(schematic_path)
+                    available_refs = [
+                        s.property.Reference.value
+                        for s in sch.symbol
+                        if hasattr(s.property, "Reference")
+                        and not s.property.Reference.value.startswith("_TEMPLATE")
+                    ]
+                except Exception:
+                    pass
+                msg = f"No pins found for {reference} — check reference and schematic path"
+                if available_refs:
+                    msg += f". Available references: {', '.join(sorted(set(available_refs)))}"
                 return {
                     "success": False,
-                    "message": f"No pins found for {reference} — check reference and schematic path",
+                    "message": msg,
                 }
 
             # Enrich with pin names and angles from the symbol definition
@@ -2389,16 +2405,27 @@ class KiCADInterface:
                     vseverity = v.get("severity", "error")
                     items = v.get("items", [])
                     loc = {}
-                    if items and "pos" in items[0]:
-                        loc = {
-                            "x": items[0]["pos"].get("x", 0),
-                            "y": items[0]["pos"].get("y", 0),
-                        }
+                    items_detail = []
+                    for item in items:
+                        item_info = {}
+                        if "pos" in item:
+                            item_info["pos"] = {
+                                "x": item["pos"].get("x", 0),
+                                "y": item["pos"].get("y", 0),
+                            }
+                        if "description" in item:
+                            item_info["description"] = item["description"]
+                        if "uuid" in item:
+                            item_info["uuid"] = item["uuid"]
+                        items_detail.append(item_info)
+                    if items_detail and "pos" in items_detail[0]:
+                        loc = items_detail[0]["pos"]
                     violations.append(
                         {
                             "type": v.get("type", "unknown"),
                             "severity": vseverity,
                             "message": v.get("description", ""),
+                            "items": items_detail,
                             "location": loc,
                         }
                     )
