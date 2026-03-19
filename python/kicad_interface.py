@@ -1601,7 +1601,6 @@ class KiCADInterface:
                     "success": True,
                     "message": f"Connected {component_ref}/{pin_name} to net '{net_name}'",
                     "label_position": label_pos,
-                    "note": "If ERC still shows 'Pin not connected' for this pin, the label_position above may not match the pin endpoint exactly. In that case, use get_schematic_pin_locations to get the exact pin coordinates and add_schematic_net_label to place the label manually."
                 }
             else:
                 return {"success": False, "message": "Failed to connect to net"}
@@ -2684,8 +2683,13 @@ class KiCADInterface:
                     "footprint library",
                     "footprint not found",
                 ]
+                # Violation types that are always benign (cached symbol version mismatch
+                # is normal when a schematic embeds lib_symbols at creation time)
+                BENIGN_TYPES = {"lib_symbol_mismatch"}
 
                 def _is_benign_violation(v):
+                    if v.get("type", "") in BENIGN_TYPES:
+                        return True
                     desc = v.get("message", "").lower()
                     return any(pat in desc for pat in BENIGN_PATTERNS)
 

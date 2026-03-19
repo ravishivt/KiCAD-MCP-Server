@@ -193,53 +193,41 @@ class PinLocator:
             pass
         return None
 
+    def _find_symbol(self, sch_key: str, symbol_reference: str):
+        """Helper: load schematic (cached) and find a symbol by reference."""
+        if sch_key not in self._schematic_cache:
+            self._schematic_cache[sch_key] = Schematic(sch_key)
+        sch = self._schematic_cache[sch_key]
+        for symbol in sch.symbol:
+            if symbol.property.Reference.value == symbol_reference:
+                return symbol
+        return None
+
+    def _find_skip_pin(self, symbol, pin_id: str):
+        """
+        Find a SymbolPin on a skip Symbol by pin number or name.
+        Returns the SymbolPin or None.
+        """
+        for pin in symbol.pin:
+            if str(pin.number) == str(pin_id) or pin.name == str(pin_id):
+                return pin
+        return None
+
     def get_pin_angle(
         self, schematic_path: Path, symbol_reference: str, pin_number: str
     ) -> Optional[float]:
         """
         Get the outward angle of a pin endpoint in degrees (0=right, 90=up, 180=left, 270=down).
-        This is the direction a wire stub must extend to stay connected to the pin.
-
-        Returns angle in degrees, or None if pin not found.
+        Uses skip's SymbolPin.location which correctly handles symbol rotation and Y-axis flip.
         """
         try:
-            sch_key = str(schematic_path)
-            if sch_key not in self._schematic_cache:
-                self._schematic_cache[sch_key] = Schematic(sch_key)
-            sch = self._schematic_cache[sch_key]
-
-            target_symbol = None
-            for symbol in sch.symbol:
-                if symbol.property.Reference.value == symbol_reference:
-                    target_symbol = symbol
-                    break
-
-            if not target_symbol:
+            symbol = self._find_symbol(str(schematic_path), symbol_reference)
+            if not symbol:
                 return None
-
-            symbol_at = target_symbol.at.value
-            symbol_rotation = float(symbol_at[2]) if len(symbol_at) > 2 else 0.0
-
-            lib_id = target_symbol.lib_id.value if hasattr(target_symbol, "lib_id") else None
-            if not lib_id:
+            pin = self._find_skip_pin(symbol, pin_number)
+            if not pin:
                 return None
-
-            pins = self.get_symbol_pins(schematic_path, lib_id)
-            if pin_number not in pins:
-                matched_num = next(
-                    (num for num, data in pins.items() if data.get("name") == pin_number),
-                    None,
-                )
-                if matched_num:
-                    pin_number = matched_num
-                else:
-                    return None
-
-            # Pin definition angle + symbol rotation = absolute outward direction
-            pin_def_angle = pins[pin_number].get("angle", 0)
-            absolute_angle = (pin_def_angle + symbol_rotation) % 360
-            return absolute_angle
-
+            return float(pin.location.rotation)
         except Exception:
             return None
 
@@ -247,109 +235,39 @@ class PinLocator:
         self, schematic_path: Path, symbol_reference: str, pin_number: str
     ) -> Optional[List[float]]:
         """
-        Get the absolute location of a pin on a symbol instance
+        Get the absolute location of a pin on a symbol instance.
+
+        Uses skip's SymbolPin.location which correctly handles symbol rotation,
+        mirroring, and KiCad's Y-axis convention (lib editor uses Y-up;
+        schematic uses Y-down — skip applies the negation automatically).
 
         Args:
             schematic_path: Path to .kicad_sch file
             symbol_reference: Symbol reference designator (e.g., "R1", "U1")
-            pin_number: Pin number/identifier (e.g., "1", "2", "GND", "VCC")
+            pin_number: Pin number or name (e.g., "1", "GND", "SDA")
 
         Returns:
-            [x, y] absolute coordinates of the pin, or None if not found
+            [x, y] absolute coordinates of the pin endpoint, or None if not found
         """
         try:
-            # Load schematic with kicad-skip to get symbol instance
-            # Use cache to avoid reloading the file for every pin lookup
-            sch_key = str(schematic_path)
-            if sch_key not in self._schematic_cache:
-                self._schematic_cache[sch_key] = Schematic(sch_key)
-            sch = self._schematic_cache[sch_key]
-
-            # Find the symbol instance
-            target_symbol = None
-            for symbol in sch.symbol:
-                ref = symbol.property.Reference.value
-                if ref == symbol_reference:
-                    target_symbol = symbol
-                    break
-
-            if not target_symbol:
+            symbol = self._find_symbol(str(schematic_path), symbol_reference)
+            if not symbol:
                 logger.error(f"Symbol {symbol_reference} not found in schematic")
                 return None
-
-            # Get symbol position and rotation
-            symbol_at = target_symbol.at.value
-            symbol_x = float(symbol_at[0])
-            symbol_y = float(symbol_at[1])
-            symbol_rotation = float(symbol_at[2]) if len(symbol_at) > 2 else 0.0
-
-            # Get symbol lib_id
-            lib_id = (
-                target_symbol.lib_id.value if hasattr(target_symbol, "lib_id") else None
-            )
-            if not lib_id:
-                logger.error(f"Symbol {symbol_reference} has no lib_id")
+            pin = self._find_skip_pin(symbol, pin_number)
+            if not pin:
+                available = [(str(p.number), p.name) for p in symbol.pin]
+                logger.error(
+                    f"Pin {pin_number} not found on {symbol_reference}. "
+                    f"Available: {available}"
+                )
                 return None
-
-            logger.debug(
-                f"Symbol {symbol_reference}: pos=({symbol_x}, {symbol_y}), rot={symbol_rotation}, lib_id={lib_id}"
-            )
-
-            # Get pin definitions for this symbol
-            pins = self.get_symbol_pins(schematic_path, lib_id)
-            if not pins:
-                logger.error(f"No pin definitions found for {lib_id}")
-                return None
-
-            # Find the requested pin — match by number first, then by name
-            if pin_number not in pins:
-                # Try matching by pin name (e.g. "VCC1", "SDA", "GND")
-                matched_num = next(
-                    (num for num, data in pins.items() if data.get("name") == pin_number),
-                    None,
-                )
-                if matched_num:
-                    logger.debug(f"Resolved pin name '{pin_number}' to pin number '{matched_num}' on {symbol_reference}")
-                    pin_number = matched_num
-                else:
-                    logger.error(
-                        f"Pin {pin_number} not found on {symbol_reference}. Available pins: {list(pins.keys())} "
-                        f"(names: {[d.get('name','') for d in pins.values()]})"
-                    )
-                    return None
-
-            pin_data = pins[pin_number]
-
-            # Get pin position relative to symbol origin
-            pin_rel_x = pin_data["x"]
-            pin_rel_y = pin_data["y"]
-
-            logger.debug(
-                f"Pin {pin_number} relative position: ({pin_rel_x}, {pin_rel_y})"
-            )
-
-            # Apply symbol rotation to pin position
-            if symbol_rotation != 0:
-                pin_rel_x, pin_rel_y = self.rotate_point(
-                    pin_rel_x, pin_rel_y, symbol_rotation
-                )
-                logger.debug(
-                    f"After rotation {symbol_rotation}°: ({pin_rel_x}, {pin_rel_y})"
-                )
-
-            # Calculate absolute position
-            abs_x = symbol_x + pin_rel_x
-            abs_y = symbol_y + pin_rel_y
-
-            logger.info(
-                f"Pin {symbol_reference}/{pin_number} located at ({abs_x}, {abs_y})"
-            )
-            return [abs_x, abs_y]
-
+            loc = pin.location
+            logger.info(f"Pin {symbol_reference}/{pin_number} located at ({loc.x}, {loc.y})")
+            return [loc.x, loc.y]
         except Exception as e:
             logger.error(f"Error getting pin location: {e}")
             import traceback
-
             logger.error(traceback.format_exc())
             return None
 
@@ -357,58 +275,22 @@ class PinLocator:
         self, schematic_path: Path, symbol_reference: str
     ) -> Dict[str, List[float]]:
         """
-        Get locations of all pins on a symbol instance
-
-        Args:
-            schematic_path: Path to .kicad_sch file
-            symbol_reference: Symbol reference designator (e.g., "R1", "U1")
+        Get locations of all pins on a symbol instance.
 
         Returns:
             Dictionary mapping pin number -> [x, y] coordinates
         """
         try:
-            # Load schematic (use cache)
-            sch_key = str(schematic_path)
-            if sch_key not in self._schematic_cache:
-                self._schematic_cache[sch_key] = Schematic(sch_key)
-            sch = self._schematic_cache[sch_key]
-
-            # Find symbol
-            target_symbol = None
-            for symbol in sch.symbol:
-                if symbol.property.Reference.value == symbol_reference:
-                    target_symbol = symbol
-                    break
-
-            if not target_symbol:
+            symbol = self._find_symbol(str(schematic_path), symbol_reference)
+            if not symbol:
                 logger.error(f"Symbol {symbol_reference} not found")
                 return {}
-
-            # Get lib_id
-            lib_id = (
-                target_symbol.lib_id.value if hasattr(target_symbol, "lib_id") else None
-            )
-            if not lib_id:
-                logger.error(f"Symbol {symbol_reference} has no lib_id")
-                return {}
-
-            # Get pin definitions
-            pins = self.get_symbol_pins(schematic_path, lib_id)
-            if not pins:
-                return {}
-
-            # Calculate location for each pin
             result = {}
-            for pin_num in pins.keys():
-                location = self.get_pin_location(
-                    schematic_path, symbol_reference, pin_num
-                )
-                if location:
-                    result[pin_num] = location
-
+            for pin in symbol.pin:
+                loc = pin.location
+                result[str(pin.number)] = [loc.x, loc.y]
             logger.info(f"Located {len(result)} pins on {symbol_reference}")
             return result
-
         except Exception as e:
             logger.error(f"Error getting all symbol pins: {e}")
             return {}
