@@ -534,7 +534,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Get pin locations for one or more schematic components
   server.tool(
     "get_schematic_pin_locations",
-    "Returns the exact x/y coordinates of every pin on one or more schematic components. Pass a single 'reference' or a list of 'references' to batch multiple components in one call — strongly prefer the batch form to avoid many round-trips.",
+    "Returns the exact x/y coordinates of every pin on one or more schematic components. Pass a single 'reference' or a list of 'references' to batch multiple components in one call — strongly prefer the batch form to avoid many round-trips.\n\nCoordinate convention: returned x/y are absolute schematic coordinates (Y-axis points DOWN). The Y-axis flip between symbol library space (Y-up) and schematic space (Y-down) is applied automatically by the underlying library — do NOT manually compute pin_schematic_y = component_y ± pin_symbol_y.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       reference: z.string().optional().describe("Single component reference (e.g. U1). Use 'references' for batch."),
@@ -1226,6 +1226,33 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
           ],
         };
       }
+    },
+  );
+
+  // Confirm schematic is saved (all schematic tools write immediately; this verifies the file exists)
+  server.tool(
+    "save_schematic",
+    "Confirm the schematic file is saved to disk. Schematic tools write changes immediately — this tool verifies the file exists and returns its size. Equivalent to save_project but for .kicad_sch files.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+    },
+    async (args: { schematicPath: string }) => {
+      const result = await callKicadScript("save_schematic", args);
+      if (result.success) {
+        return {
+          content: [{
+            type: "text",
+            text: result.message || `Schematic saved: ${args.schematicPath}`,
+          }],
+        };
+      }
+      return {
+        content: [{
+          type: "text",
+          text: `Failed: ${result.message || "Unknown error"}`,
+        }],
+        isError: true,
+      };
     },
   );
 

@@ -482,8 +482,41 @@ class SymbolLibraryCommands:
         self.library_manager = library_manager or SymbolLibraryManager()
 
     def list_symbol_libraries(self, params: Dict) -> Dict:
-        """List all available symbol libraries"""
+        """List available symbol libraries.
+
+        If projectOnly=True and schematicPath or projectPath is provided,
+        only libraries from the project's sym-lib-table are returned.
+        """
         try:
+            project_only = params.get("projectOnly", False)
+            schematic_path = params.get("schematicPath") or params.get("projectPath")
+
+            if project_only and schematic_path:
+                # Derive project directory from schematic or project path
+                project_dir = Path(schematic_path)
+                if project_dir.is_file():
+                    project_dir = project_dir.parent
+                project_table = project_dir / "sym-lib-table"
+                if not project_table.exists():
+                    return {
+                        "success": True,
+                        "libraries": [],
+                        "count": 0,
+                        "note": f"No sym-lib-table found in {project_dir}"
+                    }
+                # Parse only the project sym-lib-table
+                mgr = SymbolLibraryManager(project_path=project_dir)
+                # Reset and reload only project table
+                mgr.libraries = {}
+                mgr._parse_sym_lib_table(project_table)
+                libraries = list(mgr.libraries.keys())
+                return {
+                    "success": True,
+                    "libraries": libraries,
+                    "count": len(libraries),
+                    "source": str(project_table)
+                }
+
             libraries = self.library_manager.list_libraries()
             return {
                 "success": True,

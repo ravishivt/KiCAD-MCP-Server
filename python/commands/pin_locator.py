@@ -7,6 +7,7 @@ Uses S-expression parsing to extract pin data from symbol definitions.
 
 import logging
 import math
+import re
 import tempfile
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
@@ -111,6 +112,10 @@ class PinLocator:
             # Read schematic
             with open(schematic_path, "r", encoding="utf-8") as f:
                 sch_content = f.read()
+
+            # Strip ; comment lines — some .kicad_sym files contain them and they
+            # get injected into lib_symbols, causing sexpdata to choke.
+            sch_content = re.sub(r'^\s*;.*$', '', sch_content, flags=re.MULTILINE)
 
             sch_data = sexpdata.loads(sch_content)
 
@@ -247,7 +252,17 @@ class PinLocator:
             pin_number: Pin number or name (e.g., "1", "GND", "SDA")
 
         Returns:
-            [x, y] absolute coordinates of the pin endpoint, or None if not found
+            [x, y] absolute schematic coordinates of the pin endpoint (Y-axis DOWN),
+            or None if not found.
+
+        Coordinate convention:
+            KiCad symbol library files use Y-UP (positive Y goes up).
+            KiCad schematics use Y-DOWN (positive Y goes down).
+            The correct manual formula would be:
+                schematic_y = component_y - pin_symbol_y
+            skip's pin.location applies this flip automatically, so callers
+            receive ready-to-use schematic coordinates and must NOT apply any
+            additional Y transformation.
         """
         try:
             symbol = self._find_symbol(str(schematic_path), symbol_reference)

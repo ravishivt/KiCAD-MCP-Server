@@ -309,6 +309,10 @@ class DynamicSymbolLoader:
         with open(lib_path, "r", encoding="utf-8") as f:
             lib_content = f.read()
 
+        # Strip ; comment lines before processing — they are valid in .kicad_sym
+        # files but sexpdata and skip cannot parse them when embedded in a schematic.
+        lib_content = re.sub(r'^\s*;.*$', '', lib_content, flags=re.MULTILINE)
+
         block = self._extract_symbol_block(lib_content, symbol_name)
         if block is None:
             logger.warning(

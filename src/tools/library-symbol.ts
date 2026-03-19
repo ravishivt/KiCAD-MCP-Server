@@ -10,16 +10,25 @@ export function registerSymbolLibraryTools(server: McpServer, callKicadScript: F
   // List available symbol libraries
   server.tool(
     "list_symbol_libraries",
-    "List all available KiCAD symbol libraries from global sym-lib-table",
-    {},
-    async () => {
-      const result = await callKicadScript("list_symbol_libraries", {});
+    "List KiCAD symbol libraries. Use projectOnly=true with schematicPath to see only libraries registered in the project's sym-lib-table (avoids noise from 200+ global libraries).",
+    {
+      schematicPath: z.string().optional()
+        .describe("Path to the .kicad_sch file (or project directory) — required when projectOnly=true"),
+      projectOnly: z.boolean().optional().default(false)
+        .describe("When true, return only libraries from the project's sym-lib-table"),
+    },
+    async (args: { schematicPath?: string; projectOnly?: boolean }) => {
+      const result = await callKicadScript("list_symbol_libraries", {
+        schematicPath: args.schematicPath,
+        projectOnly: args.projectOnly ?? false,
+      });
       if (result.success && result.libraries) {
+        const note = result.source ? ` (from ${result.source})` : '';
         return {
           content: [
             {
               type: "text",
-              text: `Found ${result.count} symbol libraries:\n${result.libraries.join('\n')}`
+              text: `Found ${result.count} symbol libraries${note}:\n${result.libraries.join('\n')}`
             }
           ]
         };
