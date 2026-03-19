@@ -442,15 +442,17 @@ class ConnectionManager:
                         for pt in wire_points:
                             connected_wire_points.add((pt[0], pt[1]))
 
-            if not connected_wire_points:
-                logger.debug(f"No wires connected to net '{net_name}' labels")
-                return connections
+            # Also include label positions themselves — labels placed directly at pin
+            # endpoints (no wire stub) connect to the pin without a wire.
+            all_reachable_points = set(connected_wire_points)
+            for lp in net_label_positions:
+                all_reachable_points.add((lp[0], lp[1]))
 
             logger.debug(
-                f"Found {len(connected_wire_points)} wire connection points for net '{net_name}'"
+                f"Found {len(connected_wire_points)} wire point(s) + {len(net_label_positions)} label position(s) for net '{net_name}'"
             )
 
-            # 3. Find component pins at wire endpoints
+            # 3. Find component pins at wire endpoints or label positions
             if not hasattr(schematic, "symbol"):
                 logger.warning("Schematic has no symbols")
                 return connections
@@ -491,13 +493,13 @@ class ConnectionManager:
                             if not pin_loc:
                                 continue
 
-                            # Check if pin coincides with any wire point
-                            for wire_pt in connected_wire_points:
-                                if points_coincide(pin_loc, list(wire_pt)):
+                            # Check if pin coincides with any wire point or label position
+                            for pt in all_reachable_points:
+                                if points_coincide(pin_loc, list(pt)):
                                     connections.append(
                                         {"component": ref, "pin": pin_num}
                                     )
-                                    break  # Pin found, no need to check more wire points
+                                    break  # Pin found, no need to check more points
 
                     except Exception as e:
                         logger.warning(f"Error matching pins for {ref}: {e}")
@@ -513,8 +515,8 @@ class ConnectionManager:
                     symbol_x = float(symbol_pos[0])
                     symbol_y = float(symbol_pos[1])
 
-                    # Check if symbol is near any wire point (within 10mm)
-                    for wire_pt in connected_wire_points:
+                    # Check if symbol is near any wire point or label position (within 10mm)
+                    for wire_pt in all_reachable_points:
                         dist = (
                             (symbol_x - wire_pt[0]) ** 2 + (symbol_y - wire_pt[1]) ** 2
                         ) ** 0.5

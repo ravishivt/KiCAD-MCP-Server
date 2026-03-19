@@ -1506,16 +1506,38 @@ class KiCADInterface:
 
             schematic_path = params.get("schematicPath")
             position = params.get("position")
+            component_ref = params.get("componentRef")
+            pin_name = params.get("pinName")
 
-            if not all([schematic_path, position]):
-                return {"success": False, "message": "Missing required parameters: schematicPath, position"}
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            # If componentRef+pinName provided, auto-resolve position via PinLocator
+            if component_ref and pin_name and not position:
+                try:
+                    from commands.pin_locator import PinLocator
+                    locator = PinLocator()
+                    pin_loc = locator.get_pin_location(Path(schematic_path), component_ref, str(pin_name))
+                    if not pin_loc:
+                        return {
+                            "success": False,
+                            "message": f"Could not find pin {pin_name} on {component_ref}",
+                        }
+                    position = pin_loc
+                except Exception as e:
+                    return {"success": False, "message": f"Pin lookup failed: {e}"}
+
+            if not position:
+                return {"success": False, "message": "Provide either 'position' [x, y] or 'componentRef' + 'pinName'"}
 
             success = WireManager.add_no_connect(Path(schematic_path), position)
 
             if success:
+                pin_desc = f"{component_ref}/{pin_name}" if component_ref else f"({position[0]}, {position[1]})"
                 return {
                     "success": True,
-                    "message": f"Added no-connect flag at {position}",
+                    "message": f"Added no-connect marker for {pin_desc}",
+                    "position": {"x": position[0], "y": position[1]},
                 }
             else:
                 return {"success": False, "message": "Failed to add no-connect flag"}
@@ -1812,68 +1834,73 @@ class KiCADInterface:
             return {"success": False, "message": str(e), "errorDetails": traceback.format_exc()}
 
     def _handle_get_schematic_pin_locations(self, params):
-        """Return exact pin endpoint coordinates for a schematic component"""
+        """Return exact pin endpoint coordinates for one or more schematic components"""
         logger.info("Getting schematic pin locations")
         try:
             from pathlib import Path
             from commands.pin_locator import PinLocator
 
             schematic_path = params.get("schematicPath")
-            reference = params.get("reference")
-
-            if not all([schematic_path, reference]):
+            # Support both single 'reference' and batch 'references' list
+            references_param = params.get("references")
+            single_ref = params.get("reference")
+            if references_param:
+                references = list(references_param)
+            elif single_ref:
+                references = [single_ref]
+            else:
                 return {
                     "success": False,
-                    "message": "Missing required parameters: schematicPath, reference",
+                    "message": "Missing required parameters: schematicPath and reference or references",
                 }
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
 
             locator = PinLocator()
-            all_pins = locator.get_all_symbol_pins(Path(schematic_path), reference)
+            sch_path = Path(schematic_path)
+            components_result = {}
 
-            if not all_pins:
-                # Collect all available references for a helpful error message
-                available_refs = []
-                try:
-                    from skip import Schematic as SkipSchematic
-                    sch = SkipSchematic(schematic_path)
-                    available_refs = [
-                        s.property.Reference.value
-                        for s in sch.symbol
-                        if hasattr(s.property, "Reference")
-                        and not s.property.Reference.value.startswith("_TEMPLATE")
-                    ]
-                except Exception:
-                    pass
-                msg = f"No pins found for {reference} — check reference and schematic path"
-                if available_refs:
-                    msg += f". Available references: {', '.join(sorted(set(available_refs)))}"
-                return {
-                    "success": False,
-                    "message": msg,
-                }
+            for reference in references:
+                all_pins = locator.get_all_symbol_pins(sch_path, reference)
+                if not all_pins:
+                    components_result[reference] = {}
+                    continue
 
-            # Enrich with pin names and angles from the symbol definition
-            pins_def = (
-                locator.get_symbol_pins(
-                    Path(schematic_path),
-                    locator._get_lib_id(Path(schematic_path), reference),
-                )
-                if hasattr(locator, "_get_lib_id")
-                else {}
-            )
+                lib_id = locator._get_lib_id(sch_path, reference) if hasattr(locator, "_get_lib_id") else None
+                pins_def = locator.get_symbol_pins(sch_path, lib_id) if lib_id else {}
 
-            result = {}
-            for pin_num, coords in all_pins.items():
-                entry = {"x": coords[0], "y": coords[1]}
-                if pin_num in pins_def:
-                    entry["name"] = pins_def[pin_num].get("name", pin_num)
-                    entry["angle"] = (
-                        locator.get_pin_angle(Path(schematic_path), reference, pin_num)
-                        or 0
-                    )
-                result[pin_num] = entry
+                pins_out = {}
+                for pin_num, coords in all_pins.items():
+                    entry = {"x": coords[0], "y": coords[1]}
+                    if pin_num in pins_def:
+                        entry["name"] = pins_def[pin_num].get("name", pin_num)
+                    pins_out[pin_num] = entry
+                components_result[reference] = pins_out
 
-            return {"success": True, "reference": reference, "pins": result}
+            # For backwards compatibility: if single ref was requested, also populate 'pins'
+            if single_ref and not references_param:
+                pins = components_result.get(single_ref, {})
+                if not pins:
+                    available_refs = []
+                    try:
+                        from skip import Schematic as SkipSchematic
+                        sch = SkipSchematic(schematic_path)
+                        available_refs = [
+                            s.property.Reference.value
+                            for s in sch.symbol
+                            if hasattr(s.property, "Reference")
+                            and not s.property.Reference.value.startswith("_TEMPLATE")
+                        ]
+                    except Exception:
+                        pass
+                    msg = f"No pins found for {single_ref} — check reference and schematic path"
+                    if available_refs:
+                        msg += f". Available references: {', '.join(sorted(set(available_refs)))}"
+                    return {"success": False, "message": msg}
+                return {"success": True, "reference": single_ref, "pins": pins, "components": components_result}
+
+            return {"success": True, "components": components_result}
 
         except Exception as e:
             logger.error(f"Error getting pin locations: {e}")

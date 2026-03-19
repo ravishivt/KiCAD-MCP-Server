@@ -238,6 +238,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     "add_wire",
     "Add a wire connection in the schematic",
     {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
       start: z
         .object({
           x: z.number(),
@@ -251,16 +252,16 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
         })
         .describe("End position"),
     },
-    async (args: any) => {
-      const result = await callKicadScript("add_wire", args);
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
+    async (args: { schematicPath: string; start: { x: number; y: number }; end: { x: number; y: number } }) => {
+      const result = await callKicadScript("add_wire", {
+        schematicPath: args.schematicPath,
+        startPoint: args.start,
+        endPoint: args.end,
+      });
+      if (result.success) {
+        return { content: [{ type: "text", text: "Wire added successfully" }] };
+      }
+      return { content: [{ type: "text", text: `Failed to add wire: ${result.message || "Unknown error"}` }] };
     },
   );
 
@@ -351,15 +352,15 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     },
   );
 
-  // Connect pin to net
+  // Connect pin to net — places label directly at pin endpoint (no wire stub needed)
   server.tool(
     "connect_to_net",
-    "Connect a component pin to a named net",
+    "Place a net label at a component pin endpoint to connect it to a named net. The label is placed exactly at the pin coordinate so KiCAD recognises the connection. No wire stub is needed. PREFERRED method for assigning nets to pins.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       componentRef: z.string().describe("Component reference (e.g., U1, R1)"),
-      pinName: z.string().describe("Pin name/number to connect"),
-      netName: z.string().describe("Name of the net to connect to"),
+      pinName: z.string().describe("Pin name or number to connect (e.g., '1', 'GND', 'SDA')"),
+      netName: z.string().describe("Name of the net to connect to (e.g., VCC, GND, SDA)"),
     },
     async (args: {
       schematicPath: string;
@@ -367,13 +368,19 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
       pinName: string;
       netName: string;
     }) => {
-      const result = await callKicadScript("connect_to_net", args);
+      // Use place_net_label_at_pin which places the label directly at the pin endpoint
+      const result = await callKicadScript("place_net_label_at_pin", {
+        schematicPath: args.schematicPath,
+        reference: args.componentRef,
+        pinNumber: args.pinName,
+        netName: args.netName,
+      });
       if (result.success) {
         return {
           content: [
             {
               type: "text",
-              text: `Successfully connected ${args.componentRef}/${args.pinName} to net '${args.netName}'`,
+              text: `Connected ${args.componentRef}/${args.pinName} to net '${args.netName}' at (${result.position?.x}, ${result.position?.y})`,
             },
           ],
         };
@@ -387,6 +394,105 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
           ],
         };
       }
+    },
+  );
+
+  // Place net label directly at a pin endpoint
+  server.tool(
+    "place_net_label_at_pin",
+    "Place a net label at the exact endpoint of a component pin. The label position and orientation are computed automatically from the pin's location and angle. This is the low-level version of connect_to_net — use connect_to_net for most cases.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      reference: z.string().describe("Component reference designator (e.g. J1, U1)"),
+      pinNumber: z.string().describe("Pin number or name (e.g. '1', 'GND', 'SDA')"),
+      netName: z.string().describe("Net name to assign (e.g. VCC, GND, SIGNAL_1)"),
+    },
+    async (args: { schematicPath: string; reference: string; pinNumber: string; netName: string }) => {
+      const result = await callKicadScript("place_net_label_at_pin", args);
+      if (result.success) {
+        return {
+          content: [{
+            type: "text",
+            text: `Placed label '${args.netName}' on ${args.reference}/${args.pinNumber} at (${result.position?.x}, ${result.position?.y})`,
+          }],
+        };
+      }
+      return {
+        content: [{
+          type: "text",
+          text: `Failed to place label: ${result.message || "Unknown error"}`,
+        }],
+      };
+    },
+  );
+
+  // Add no-connect marker to a pin
+  server.tool(
+    "add_no_connect",
+    "Mark a pin as intentionally unconnected (adds an X marker). This suppresses ERC 'Pin not connected' errors for pins that are deliberately left unconnected (e.g., NC/DNP pins, unused GPIO, SBU pins on USB-C). Use get_schematic_pin_locations to get pin coordinates first, or provide componentRef+pinName for automatic lookup.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      componentRef: z.string().optional().describe("Component reference (e.g. J1, U1) — provide with pinName for auto lookup"),
+      pinName: z.string().optional().describe("Pin name or number (e.g. '1', 'SBU1') — provide with componentRef for auto lookup"),
+      position: z.object({ x: z.number(), y: z.number() }).optional().describe("Explicit pin position — use if you already know the coordinates"),
+    },
+    async (args: {
+      schematicPath: string;
+      componentRef?: string;
+      pinName?: string;
+      position?: { x: number; y: number };
+    }) => {
+      const result = await callKicadScript("add_no_connect", {
+        schematicPath: args.schematicPath,
+        componentRef: args.componentRef,
+        pinName: args.pinName,
+        position: args.position ? [args.position.x, args.position.y] : undefined,
+      });
+      if (result.success) {
+        return {
+          content: [{
+            type: "text",
+            text: result.message || `Added no-connect marker`,
+          }],
+        };
+      }
+      return {
+        content: [{
+          type: "text",
+          text: `Failed to add no-connect: ${result.message || "Unknown error"}`,
+        }],
+      };
+    },
+  );
+
+  // List all unconnected pins
+  server.tool(
+    "list_unconnected_pins",
+    "List all pins that have no net connection and no no-connect marker. Use this after wiring to identify which pins still need to be connected or marked NC. Returns component ref, pin number, pin name, pin type, and position for each unconnected pin.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+    },
+    async (args: { schematicPath: string }) => {
+      const result = await callKicadScript("list_unconnected_pins", args);
+      if (result.success) {
+        const pins: any[] = result.unconnected || [];
+        if (pins.length === 0) {
+          return { content: [{ type: "text", text: "All pins are connected or marked no-connect." }] };
+        }
+        const lines = pins.map(
+          (p: any) => `  ${p.reference}/${p.pinName || p.pinNumber} (pin ${p.pinNumber}, type=${p.pinType}) @ (${p.position.x}, ${p.position.y})`
+        );
+        return {
+          content: [{
+            type: "text",
+            text: `Unconnected pins (${pins.length}):\n${lines.join("\n")}`,
+          }],
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Failed to list unconnected pins: ${result.message || "Unknown error"}` }],
+        isError: true,
+      };
     },
   );
 
@@ -425,25 +531,45 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     },
   );
 
-  // Get pin locations for a schematic component
+  // Get pin locations for one or more schematic components
   server.tool(
     "get_schematic_pin_locations",
-    "Returns the exact x/y coordinates of every pin on a schematic component. Use this before add_schematic_net_label to place labels correctly on pin endpoints.",
+    "Returns the exact x/y coordinates of every pin on one or more schematic components. Pass a single 'reference' or a list of 'references' to batch multiple components in one call — strongly prefer the batch form to avoid many round-trips.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
-      reference: z.string().describe("Component reference designator (e.g. U1, R1, J2)"),
+      reference: z.string().optional().describe("Single component reference (e.g. U1). Use 'references' for batch."),
+      references: z.array(z.string()).optional().describe("List of component references to look up in one call (e.g. ['J1','U6','D1'])"),
     },
-    async (args: { schematicPath: string; reference: string }) => {
-      const result = await callKicadScript("get_schematic_pin_locations", args);
-      if (result.success && result.pins) {
-        const lines = Object.entries(result.pins as Record<string, any>).map(
-          ([pinNum, data]: [string, any]) =>
-            `  Pin ${pinNum} (${data.name || pinNum}): x=${data.x}, y=${data.y}, angle=${data.angle ?? 0}°`
-        );
+    async (args: { schematicPath: string; reference?: string; references?: string[] }) => {
+      const refs = args.references ?? (args.reference ? [args.reference] : []);
+      if (refs.length === 0) {
+        return { content: [{ type: "text", text: "Provide 'reference' or 'references'." }] };
+      }
+
+      const result = await callKicadScript("get_schematic_pin_locations", {
+        schematicPath: args.schematicPath,
+        references: refs,
+      });
+
+      if (result.success) {
+        // Batch result: result.components is a map of ref → pins
+        const components: Record<string, any> = result.components || {};
+        // Fallback for single-ref old format
+        if (Object.keys(components).length === 0 && result.pins && refs.length === 1) {
+          components[refs[0]] = result.pins;
+        }
+        const sections: string[] = [];
+        for (const [ref, pins] of Object.entries(components)) {
+          const lines = Object.entries(pins as Record<string, any>).map(
+            ([pinNum, data]: [string, any]) =>
+              `    Pin ${pinNum} (${data.name || pinNum}): x=${data.x}, y=${data.y}`
+          );
+          sections.push(`${ref}:\n${lines.join("\n")}`);
+        }
         return {
           content: [{
             type: "text",
-            text: `Pin locations for ${args.reference}:\n${lines.join("\n")}`,
+            text: sections.join("\n\n"),
           }],
         };
       } else {
@@ -997,27 +1123,53 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Run Electrical Rules Check (ERC)
   server.tool(
     "run_erc",
-    "Runs the KiCAD Electrical Rules Check (ERC) on a schematic and returns all violations. Use after wiring to verify the schematic before generating a netlist.",
+    "Runs the KiCAD Electrical Rules Check (ERC) on a schematic. Returns violations grouped by type with counts. Use errorsOnly=false to also see warnings. All coordinates are in mm.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
+      errorsOnly: z.boolean().optional().describe("If true (default), only show error-severity violations. Set false to also show warnings and info."),
     },
-    async (args: { schematicPath: string }) => {
+    async (args: { schematicPath: string; errorsOnly?: boolean }) => {
       const result = await callKicadScript("run_erc", args);
       if (result.success) {
-        const violations: any[] = result.violations || [];
-        const lines: string[] = [`ERC result: ${violations.length} violation(s)`];
-        if (result.summary?.by_severity) {
-          const s = result.summary.by_severity;
-          lines.push(`  Errors: ${s.error ?? 0}  Warnings: ${s.warning ?? 0}  Info: ${s.info ?? 0}`);
+        const errorsOnly = args.errorsOnly !== false; // default true
+        let violations: any[] = result.violations || [];
+        if (errorsOnly) {
+          violations = violations.filter((v: any) => v.severity === "error");
         }
-        if (violations.length > 0) {
+        // Filter benign violations
+        const actionable = violations.filter((v: any) => !v.benign);
+        const benignCount = violations.length - actionable.length;
+
+        const lines: string[] = [];
+        const s = result.summary?.by_severity ?? {};
+        lines.push(`ERC: ${s.error ?? 0} error(s), ${s.warning ?? 0} warning(s)${errorsOnly ? " [showing errors only]" : ""}`);
+        if (benignCount > 0) lines.push(`  (${benignCount} benign library warnings hidden)`);
+
+        if (actionable.length === 0) {
+          lines.push(errorsOnly ? "No errors found." : "No violations found.");
+        } else {
+          // Group by type
+          const byType: Record<string, any[]> = {};
+          for (const v of actionable) {
+            const key = v.type || "unknown";
+            if (!byType[key]) byType[key] = [];
+            byType[key].push(v);
+          }
           lines.push("");
-          violations.slice(0, 30).forEach((v: any, i: number) => {
-            const loc = v.location && (v.location.x !== undefined) ? ` @ (${v.location.x}, ${v.location.y})` : "";
-            lines.push(`${i + 1}. [${v.severity}] ${v.message}${loc}`);
-          });
-          if (violations.length > 30) {
-            lines.push(`... and ${violations.length - 30} more`);
+          for (const [type, group] of Object.entries(byType)) {
+            lines.push(`[${type}] — ${group.length} violation(s):`);
+            group.slice(0, 20).forEach((v: any) => {
+              // Extract component reference from item descriptions
+              const itemDescs = (v.items || [])
+                .map((it: any) => it.description)
+                .filter(Boolean)
+                .join("; ");
+              const loc = v.location?.x !== undefined ? ` @ (${v.location.x}, ${v.location.y}) mm` : "";
+              const detail = itemDescs ? `  ${itemDescs}${loc}` : `  ${v.message}${loc}`;
+              lines.push(detail);
+            });
+            if (group.length > 20) lines.push(`  ... and ${group.length - 20} more`);
+            lines.push("");
           }
         }
         return { content: [{ type: "text", text: lines.join("\n") }] };
