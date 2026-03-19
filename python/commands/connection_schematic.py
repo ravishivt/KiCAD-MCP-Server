@@ -237,23 +237,23 @@ class ConnectionManager:
             net_name: Name of the net to connect to (e.g., "VCC", "GND", "SIGNAL_1")
 
         Returns:
-            True if successful, False otherwise
+            stub_end ([x, y] label position) if successful, None otherwise
         """
         try:
             if not WIRE_MANAGER_AVAILABLE:
                 logger.error("WireManager/PinLocator not available")
-                return False
+                return None
 
             locator = ConnectionManager.get_pin_locator()
             if not locator:
                 logger.error("Pin locator unavailable")
-                return False
+                return None
 
             # Get pin location using PinLocator
             pin_loc = locator.get_pin_location(schematic_path, component_ref, pin_name)
             if not pin_loc:
                 logger.error(f"Could not locate pin {component_ref}/{pin_name}")
-                return False
+                return None
 
             # Add a small wire stub from the pin (2.54mm = 0.1 inch, standard grid spacing)
             # Stub direction follows the pin's outward angle from the PinLocator
@@ -271,7 +271,7 @@ class ConnectionManager:
             wire_success = WireManager.add_wire(schematic_path, pin_loc, stub_end)
             if not wire_success:
                 logger.error(f"Failed to create wire stub for net connection")
-                return False
+                return None
 
             # Add label at the end of the stub using WireManager
             label_success = WireManager.add_label(
@@ -279,17 +279,17 @@ class ConnectionManager:
             )
             if not label_success:
                 logger.error(f"Failed to add net label '{net_name}'")
-                return False
+                return None
 
             logger.info(f"Connected {component_ref}/{pin_name} to net '{net_name}'")
-            return True
+            return stub_end
 
         except Exception as e:
             logger.error(f"Error connecting to net: {e}")
             import traceback
 
             logger.error(traceback.format_exc())
-            return False
+            return None
 
     @staticmethod
     def connect_passthrough(

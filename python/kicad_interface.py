@@ -390,6 +390,8 @@ class KiCADInterface:
             "add_schematic_wire": self._handle_add_schematic_wire,
             "add_schematic_connection": self._handle_add_schematic_connection,
             "add_schematic_net_label": self._handle_add_schematic_net_label,
+            "add_no_connect": self._handle_add_no_connect,
+            "save_schematic": self._handle_save_schematic,
             "connect_to_net": self._handle_connect_to_net,
             "connect_passthrough": self._handle_connect_passthrough,
             "get_schematic_pin_locations": self._handle_get_schematic_pin_locations,
@@ -631,7 +633,12 @@ class KiCADInterface:
             file_path = f"{path}/{project_name}.kicad_sch"
             success = SchematicManager.save_schematic(schematic, file_path)
 
-            return {"success": success, "file_path": file_path}
+            from commands.schematic import _last_removed_templates
+            result = {"success": success, "file_path": file_path}
+            if _last_removed_templates:
+                result["removed_template_components"] = list(_last_removed_templates)
+                result["note"] = f"Removed {len(_last_removed_templates)} template placeholder components"
+            return result
         except Exception as e:
             logger.error(f"Error creating schematic: {str(e)}")
             return {"success": False, "message": str(e)}
@@ -1490,6 +1497,64 @@ class KiCADInterface:
                 "errorDetails": traceback.format_exc(),
             }
 
+    def _handle_add_no_connect(self, params):
+        """Add a no-connect flag to mark an intentionally unconnected pin"""
+        logger.info("Adding no-connect flag to schematic")
+        try:
+            from pathlib import Path
+            from commands.wire_manager import WireManager
+
+            schematic_path = params.get("schematicPath")
+            position = params.get("position")
+
+            if not all([schematic_path, position]):
+                return {"success": False, "message": "Missing required parameters: schematicPath, position"}
+
+            success = WireManager.add_no_connect(Path(schematic_path), position)
+
+            if success:
+                return {
+                    "success": True,
+                    "message": f"Added no-connect flag at {position}",
+                }
+            else:
+                return {"success": False, "message": "Failed to add no-connect flag"}
+        except Exception as e:
+            logger.error(f"Error adding no-connect: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {
+                "success": False,
+                "message": str(e),
+                "errorDetails": traceback.format_exc(),
+            }
+
+    def _handle_save_schematic(self, params):
+        """Save schematic - confirms the schematic file exists (schematic changes are written immediately by each tool)"""
+        logger.info("Save schematic requested")
+        try:
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "Missing required parameter: schematicPath"}
+
+            import os
+            if not os.path.exists(schematic_path):
+                return {"success": False, "message": f"Schematic file not found: {schematic_path}"}
+
+            # Schematic tools write changes directly to disk (no in-memory state)
+            # This tool confirms the file is present and returns its size as proof
+            size = os.path.getsize(schematic_path)
+            return {
+                "success": True,
+                "message": f"Schematic is saved at {schematic_path}",
+                "file_path": schematic_path,
+                "file_size_bytes": size,
+                "note": "Schematic tools write changes directly to disk. No separate save step is required."
+            }
+        except Exception as e:
+            logger.error(f"Error in save_schematic: {str(e)}")
+            return {"success": False, "message": str(e)}
+
     def _handle_connect_to_net(self, params):
         """Connect a component pin to a named net using wire stub and label"""
         logger.info("Connecting component pin to net")
@@ -1505,14 +1570,16 @@ class KiCADInterface:
                 return {"success": False, "message": "Missing required parameters: schematicPath, reference, pinNumber, netName"}
 
             # Use ConnectionManager with new WireManager integration
-            success = ConnectionManager.connect_to_net(
+            label_pos = ConnectionManager.connect_to_net(
                 Path(schematic_path), component_ref, pin_name, net_name
             )
 
-            if success:
+            if label_pos is not None:
                 return {
                     "success": True,
                     "message": f"Connected {component_ref}/{pin_name} to net '{net_name}'",
+                    "label_position": label_pos,
+                    "note": "If ERC still shows 'Pin not connected' for this pin, the label_position above may not match the pin endpoint exactly. In that case, use get_schematic_pin_locations to get the exact pin coordinates and add_schematic_net_label to place the label manually."
                 }
             else:
                 return {"success": False, "message": "Failed to connect to net"}
@@ -2584,6 +2651,17 @@ class KiCADInterface:
                 violations = []
                 severity_counts = {"error": 0, "warning": 0, "info": 0}
 
+                BENIGN_PATTERNS = [
+                    "symbol not found in global library",
+                    "not found in global",
+                    "footprint library",
+                    "footprint not found",
+                ]
+
+                def _is_benign_violation(v):
+                    desc = v.get("message", "").lower()
+                    return any(pat in desc for pat in BENIGN_PATTERNS)
+
                 all_violations = []
                 for sheet in erc_data.get("sheets", []):
                     all_violations.extend(sheet.get("violations", []))
@@ -2607,23 +2685,27 @@ class KiCADInterface:
                         items_detail.append(item_info)
                     if items_detail and "pos" in items_detail[0]:
                         loc = items_detail[0]["pos"]
-                    violations.append(
-                        {
-                            "type": v.get("type", "unknown"),
-                            "severity": vseverity,
-                            "message": v.get("description", ""),
-                            "items": items_detail,
-                            "location": loc,
-                        }
-                    )
+                    violation_dict = {
+                        "type": v.get("type", "unknown"),
+                        "severity": vseverity,
+                        "message": v.get("description", ""),
+                        "items": items_detail,
+                        "location": loc,
+                    }
+                    violation_dict["benign"] = _is_benign_violation(violation_dict)
+                    violations.append(violation_dict)
                     if vseverity in severity_counts:
                         severity_counts[vseverity] += 1
 
                 return {
                     "success": True,
                     "message": f"ERC complete: {len(violations)} violation(s)",
+                    "coordinate_units": "mm",
+                    "notes": ["All coordinates are in millimeters (mm)."],
                     "summary": {
                         "total": len(violations),
+                        "actionable": sum(1 for v in violations if not v.get("benign")),
+                        "benign": sum(1 for v in violations if v.get("benign")),
                         "by_severity": severity_counts,
                     },
                     "violations": violations,

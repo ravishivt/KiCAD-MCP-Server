@@ -250,9 +250,17 @@ class SymbolLibraryManager:
                 start_pos = match.start()
 
                 # Extract properties from this symbol block
-                # We need to find the matching closing paren - use a simple heuristic
-                # Look for the next 2000 characters for properties
-                block_end = min(start_pos + 5000, len(content))
+                # Use parenthesis counting to find the actual end of this symbol block
+                depth = 0
+                block_end = start_pos
+                for j in range(start_pos, min(start_pos + 50000, len(content))):
+                    if content[j] == '(':
+                        depth += 1
+                    elif content[j] == ')':
+                        depth -= 1
+                        if depth == 0:
+                            block_end = j + 1
+                            break
                 symbol_block = content[start_pos:block_end]
 
                 # Extract properties

@@ -1834,6 +1834,43 @@ SCHEMATIC_TOOLS = [
             },
             "required": ["schematicPath", "outputPath"]
         }
+    },
+    {
+        "name": "add_no_connect",
+        "title": "Add No-Connect Flag",
+        "description": "Marks an intentionally unconnected pin with a no-connect flag (X marker) to suppress ERC 'Pin not connected' errors. Use get_schematic_pin_locations to get the exact pin coordinates first, then place the no-connect flag at the pin endpoint. This is the correct way to handle pins that are intentionally left unconnected (e.g., NC/DNP pins, unused GPIO, SBU pins on USB-C).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                },
+                "position": {
+                    "type": "array",
+                    "description": "Pin endpoint coordinates [x, y] in mm where the no-connect flag should be placed. Must match the pin endpoint exactly.",
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                    "maxItems": 2
+                }
+            },
+            "required": ["schematicPath", "position"]
+        }
+    },
+    {
+        "name": "save_schematic",
+        "title": "Save Schematic",
+        "description": "Confirms the schematic file is saved to disk. Note: all schematic editing tools (add_schematic_wire, connect_to_net, add_schematic_net_label, etc.) write changes directly to the .kicad_sch file immediately — there is no separate save step required. Use this tool to verify the file exists and check its current size.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                }
+            },
+            "required": ["schematicPath"]
+        }
     }
 ]
 
