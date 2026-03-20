@@ -315,10 +315,26 @@ class DynamicSymbolLoader:
 
         block = self._extract_symbol_block(lib_content, symbol_name)
         if block is None:
-            logger.warning(
-                f"Symbol '{symbol_name}' not found in {library_name}.kicad_sym"
+            # Find close matches to help the caller recover
+            all_names = re.findall(
+                r'^\s*\(symbol "([^"_][^"]*(?<![_\d]{3}))"',
+                lib_content,
+                flags=re.MULTILINE,
             )
-            return None
+            # Filter out sub-symbols (Name_0_1 pattern)
+            top_level = [n for n in all_names if not re.search(r'_\d+_\d+$', n)]
+            import difflib
+            close = difflib.get_close_matches(symbol_name, top_level, n=5, cutoff=0.4)
+            hint = f" Close matches: {close}" if close else ""
+            logger.warning(
+                f"Symbol '{symbol_name}' not found in {library_name}.kicad_sym.{hint}"
+            )
+            # Attach suggestions so callers can surface them in error messages
+            err = ValueError(
+                f"Symbol '{symbol_name}' not found in library '{library_name}'.{hint}"
+            )
+            err.suggestions = close  # type: ignore[attr-defined]
+            raise err
 
         # If the symbol uses (extends "ParentName"), inline the parent content
         # so that the result is a fully self-contained definition.
@@ -421,6 +437,7 @@ class DynamicSymbolLoader:
         footprint: str = "",
         x: float = 0,
         y: float = 0,
+        rotation: float = 0,
     ) -> bool:
         """
         Add a component instance to the schematic.
@@ -439,7 +456,17 @@ class DynamicSymbolLoader:
         pro_files = list(schematic_path.parent.glob("*.kicad_pro"))
         project_name = pro_files[0].stem if pro_files else schematic_path.stem
 
-        instance_block = f"""  (symbol (lib_id "{full_lib_id}") (at {x} {y} 0) (unit 1)
+        with open(schematic_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Extract the schematic's own UUID so we can build the correct instance path.
+        # KiCAD 8+ requires (path "/<schematic-uuid>" ...) in the instances block —
+        # using just "/" causes all references to display as "R?", "C?", etc. in the UI.
+        sch_uuid_match = re.search(r'^\s*\(uuid\s+([0-9a-fA-F-]+)\)', content, re.MULTILINE)
+        sch_uuid = sch_uuid_match.group(1) if sch_uuid_match else ""
+        instance_path = f"/{sch_uuid}" if sch_uuid else "/"
+
+        instance_block = f"""  (symbol (lib_id "{full_lib_id}") (at {x} {y} {int(rotation)}) (unit 1)
     (in_bom yes) (on_board yes) (dnp no)
     (uuid "{new_uuid}")
     (property "Reference" "{reference}" (at {x} {y - 2.54} 0)
@@ -456,13 +483,10 @@ class DynamicSymbolLoader:
     )
     (instances
       (project "{project_name}"
-        (path "/" (reference "{reference}") (unit 1))
+        (path "{instance_path}" (reference "{reference}") (unit 1))
       )
     )
   )"""
-
-        with open(schematic_path, "r", encoding="utf-8") as f:
-            content = f.read()
 
         # Insert before (sheet_instances using direct string search.
         # This works for both pretty-printed and sexpdata-compacted single-line files.
@@ -521,6 +545,7 @@ class DynamicSymbolLoader:
         footprint: str = "",
         x: float = 0,
         y: float = 0,
+        rotation: float = 0,
         project_path: Optional[Path] = None,
     ) -> bool:
         """
@@ -530,6 +555,7 @@ class DynamicSymbolLoader:
         Args:
             project_path: Optional project directory. When set, project-specific
                           sym-lib-table is also searched for the library file.
+            rotation: Rotation in degrees (CCW positive, multiples of 90).
         """
         if project_path:
             self.project_path = project_path
@@ -546,7 +572,26 @@ class DynamicSymbolLoader:
             footprint=footprint,
             x=x,
             y=y,
+            rotation=rotation,
         )
+
+    def list_symbol_pins(self, library_name: str, symbol_name: str) -> list:
+        """
+        Return pin data for a symbol directly from the library file (no schematic needed).
+        Each entry: {"number": "1", "name": "VCC", "type": "power_in"}
+        Raises ValueError (with .suggestions) if the symbol is not found.
+        """
+        block = self.extract_symbol_from_library(library_name, symbol_name)
+        pins = []
+        # Pins live in sub-symbols (Name_1_1, Name_0_1, etc.)
+        # Pattern: (pin <type> <shape> ... (name "NAME" ...) (number "NUM" ...))
+        for m in re.finditer(
+            r'\(pin\s+(\S+)\s+\S+[^)]*?\(name\s+"([^"]*)"[^)]*?\)[^)]*?\(number\s+"([^"]*)"',
+            block,
+            re.DOTALL,
+        ):
+            pins.append({"number": m.group(3), "name": m.group(2), "type": m.group(1)})
+        return sorted(pins, key=lambda p: (len(p["number"]), p["number"]))
 
 
 if __name__ == "__main__":

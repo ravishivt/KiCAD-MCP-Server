@@ -33,7 +33,7 @@ export function registerSchematicTools(
   // Add component to schematic
   server.tool(
     "add_schematic_component",
-    "Add a component to the schematic. Symbol format is 'Library:SymbolName' (e.g., 'Device:R', 'EDA-MCP:ESP32-C3'). The position is auto-snapped to the KiCAD 50mil (1.27mm) grid. The response includes the snapped position and pin coordinates so a separate get_schematic_pin_locations call is not needed.",
+    "Add a component to the schematic. Symbol format is 'Library:SymbolName' (e.g., 'Device:R', 'EDA-MCP:ESP32-C3'). The position is auto-snapped to the KiCAD 50mil (1.27mm) grid. The response includes the snapped position and pin coordinates so a separate get_schematic_pin_locations call is not needed. Use list_symbol_pins to discover pin names before placement. If symbol is not found, close-match suggestions are returned.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       symbol: z
@@ -51,6 +51,8 @@ export function registerSchematicTools(
         })
         .optional()
         .describe("Position on schematic"),
+      rotation: z.number().optional().describe("Rotation in degrees, CCW positive, multiples of 90 (0, 90, 180, 270). Default 0. Use 90 for horizontal resistors/capacitors in a left-to-right power path."),
+      includePins: z.boolean().optional().describe("Return pin coordinates in the response (default true). Set false for large ICs where pin data is not needed, to save context."),
     },
     async (args: {
       schematicPath: string;
@@ -59,6 +61,8 @@ export function registerSchematicTools(
       value?: string;
       footprint?: string;
       position?: { x: number; y: number };
+      rotation?: number;
+      includePins?: boolean;
     }) => {
       // Transform to what Python backend expects
       const [library, symbolName] = args.symbol.includes(":")
@@ -76,6 +80,8 @@ export function registerSchematicTools(
           // Python expects flat x, y not nested position
           x: args.position?.x ?? 0,
           y: args.position?.y ?? 0,
+          rotation: args.rotation ?? 0,
+          includePins: args.includePins !== false,
         },
       };
 

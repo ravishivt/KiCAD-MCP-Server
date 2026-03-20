@@ -401,6 +401,7 @@ class KiCADInterface:
             "place_net_label_at_pin": self._handle_place_net_label_at_pin,
             "list_unconnected_pins": self._handle_list_unconnected_pins,
             "search_schematic_symbols": self._handle_search_schematic_symbols,
+            "list_symbol_pins": self._handle_list_symbol_pins,
             "generate_netlist": self._handle_generate_netlist,
             "sync_schematic_to_board": self._handle_sync_schematic_to_board,
             "list_schematic_libraries": self._handle_list_schematic_libraries,
@@ -730,6 +731,8 @@ class KiCADInterface:
             footprint = component.get("footprint", "")
             x = component.get("x", 0)
             y = component.get("y", 0)
+            rotation = component.get("rotation", 0)
+            include_pins = component.get("includePins", True)
 
             # Snap to KiCAD 50mil grid so pins land on-grid (same snap applied inside loader)
             snapped_x = _snap(x)
@@ -749,31 +752,35 @@ class KiCADInterface:
                 footprint=footprint,
                 x=x,
                 y=y,
+                rotation=rotation,
                 project_path=derived_project_path,
             )
 
-            # Return pin locations so caller doesn't need a separate round-trip
-            from commands.pin_locator import PinLocator
-            locator = PinLocator()
-            pins_raw = locator.get_all_symbol_pins(schematic_file, reference) or {}
-            # Enrich with pin names from lib definition
-            lib_id = f"{library}:{comp_type}"
-            pins_def = locator.get_symbol_pins(schematic_file, lib_id) or {}
-            pins = {}
-            for pin_num, coords in pins_raw.items():
-                pins[pin_num] = {
-                    "x": coords[0],
-                    "y": coords[1],
-                    "name": pins_def.get(str(pin_num), {}).get("name", str(pin_num)),
-                }
-
-            return {
+            response = {
                 "success": True,
                 "component_reference": reference,
                 "symbol_source": f"{library}:{comp_type}",
                 "snapped_position": {"x": snapped_x, "y": snapped_y},
-                "pins": pins,
             }
+
+            if include_pins:
+                # Return pin locations so caller doesn't need a separate round-trip
+                from commands.pin_locator import PinLocator
+                locator = PinLocator()
+                pins_raw = locator.get_all_symbol_pins(schematic_file, reference) or {}
+                # Enrich with pin names from lib definition
+                lib_id = f"{library}:{comp_type}"
+                pins_def = locator.get_symbol_pins(schematic_file, lib_id) or {}
+                pins = {}
+                for pin_num, coords in pins_raw.items():
+                    pins[pin_num] = {
+                        "x": coords[0],
+                        "y": coords[1],
+                        "name": pins_def.get(str(pin_num), {}).get("name", str(pin_num)),
+                    }
+                response["pins"] = pins
+
+            return response
         except Exception as e:
             logger.error(f"Error adding component to schematic: {str(e)}")
             import traceback
@@ -1928,6 +1935,47 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e), "errorDetails": traceback.format_exc()}
 
+    def _handle_list_symbol_pins(self, params):
+        """List pin names and numbers for a symbol directly from its library (no schematic needed)"""
+        logger.info("Listing symbol pins from library")
+        try:
+            from commands.dynamic_symbol_loader import DynamicSymbolLoader
+            from pathlib import Path
+
+            symbol_spec = params.get("symbol", "")
+            schematic_path = params.get("schematicPath")
+
+            if not symbol_spec or ":" not in symbol_spec:
+                return {"success": False, "message": "symbol must be 'Library:SymbolName'"}
+
+            library_name, symbol_name = symbol_spec.split(":", 1)
+
+            project_path = None
+            if schematic_path:
+                project_path = Path(schematic_path).parent
+
+            loader = DynamicSymbolLoader(project_path=project_path)
+            try:
+                pins = loader.list_symbol_pins(library_name, symbol_name)
+            except ValueError as e:
+                suggestions = getattr(e, "suggestions", [])
+                return {
+                    "success": False,
+                    "message": str(e),
+                    "suggestions": suggestions,
+                }
+
+            return {
+                "success": True,
+                "symbol": symbol_spec,
+                "pin_count": len(pins),
+                "pins": pins,
+            }
+
+        except Exception as e:
+            logger.error(f"Error listing symbol pins: {str(e)}")
+            return {"success": False, "message": str(e)}
+
     def _handle_get_schematic_pin_locations(self, params):
         """Return exact pin endpoint coordinates for one or more schematic components"""
         logger.info("Getting schematic pin locations")
@@ -2838,7 +2886,10 @@ class KiCADInterface:
                     "success": True,
                     "message": f"ERC complete: {len(violations)} violation(s)",
                     "coordinate_units": "mm",
-                    "notes": ["All coordinates are in millimeters (mm)."],
+                    "notes": [
+                        "All coordinates are in millimeters (mm).",
+                        "ERC reads the saved file on disk. If the schematic is open in KiCad UI with unsaved changes, reload it in KiCad to sync before comparing results.",
+                    ],
                     "summary": {
                         "total": len(violations),
                         "actionable": sum(1 for v in violations if not v.get("benign")),

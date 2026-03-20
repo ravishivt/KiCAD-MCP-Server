@@ -186,4 +186,70 @@ Returns symbol references that can be used directly in schematics.`,
       };
     }
   );
+
+  // List pins for a symbol from the library (no schematic needed)
+  server.tool(
+    "list_symbol_pins",
+    "Return pin names, numbers, and types for a symbol directly from the library — no schematic required. Use this before add_schematic_component to discover pin names for batch_connect / connect_to_net calls. Returns close-match suggestions if the symbol name is slightly wrong (e.g., 'FerriteBead' instead of 'Ferrite_Bead').",
+    {
+      symbol: z.string()
+        .describe("Symbol in 'Library:SymbolName' format (e.g., Device:R, Connector:Conn_01x04, Device:FerriteBead)"),
+      schematicPath: z.string().optional()
+        .describe("Path to .kicad_sch — enables project-local sym-lib-table lookup for project-specific symbols"),
+    },
+    async (args: { symbol: string; schematicPath?: string }) => {
+      const result = await callKicadScript("list_symbol_pins", args);
+      if (result.success) {
+        if (result.pins.length === 0) {
+          return {
+            content: [{ type: "text", text: `Symbol ${result.symbol} has no pins.` }]
+          };
+        }
+        const lines = result.pins.map((p: any) => `  Pin ${p.number} (${p.name}) — type: ${p.type}`);
+        return {
+          content: [{
+            type: "text",
+            text: `${result.symbol} — ${result.pin_count} pin(s):\n${lines.join('\n')}`
+          }]
+        };
+      }
+      const hint = result.suggestions?.length
+        ? `\nDid you mean: ${result.suggestions.join(', ')}?`
+        : '';
+      return {
+        content: [{
+          type: "text",
+          text: `Failed to list pins: ${result.message || 'Unknown error'}${hint}`
+        }]
+      };
+    }
+  );
+
+  // Search symbol names across KiCAD standard libraries (fast name/lib search)
+  server.tool(
+    "search_schematic_symbols",
+    "Search for symbol names across KiCAD standard symbol libraries by name substring. Returns 'Library:SymbolName' strings usable in add_schematic_component. Use this when you know part of the symbol name (e.g., 'FerriteBead', 'NPN', 'AMS1117') but not the exact library. For JLCPCB/LCSC parts use search_symbols instead.",
+    {
+      query: z.string().describe("Name substring to search for (matched against symbol name and library name)"),
+      maxResults: z.number().optional().default(20).describe("Maximum results to return (default 20, max 100)"),
+    },
+    async (args: { query: string; maxResults?: number }) => {
+      const result = await callKicadScript("search_schematic_symbols", args);
+      if (result.success) {
+        if (result.count === 0) {
+          return { content: [{ type: "text", text: `No symbols found matching "${args.query}".` }] };
+        }
+        const lines = result.results.map((r: any) => `  ${r.fullName}`);
+        return {
+          content: [{
+            type: "text",
+            text: `Found ${result.count} symbol(s) matching "${args.query}":\n${lines.join('\n')}`
+          }]
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Search failed: ${result.message || 'Unknown error'}` }]
+      };
+    }
+  );
 }

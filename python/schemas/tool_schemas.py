@@ -1388,7 +1388,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "add_schematic_component",
         "title": "Add Component to Schematic",
-        "description": "Places a symbol (resistor, capacitor, IC, etc.) on the schematic. Coordinates are in mm. Use 2.54mm grid multiples. Y increases downward. Space components 15-20mm apart. Use search_schematic_symbols to find the correct library:symbol_name before calling this tool.",
+        "description": "Places a symbol (resistor, capacitor, IC, etc.) on the schematic. Coordinates are in mm. Use 2.54mm grid multiples. Y increases downward. Space components 15-20mm apart. Use search_schematic_symbols to find the correct library:symbol_name before calling this tool. Use list_symbol_pins to discover pin names before placement.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1411,6 +1411,14 @@ SCHEMATIC_TOOLS = [
                 "y": {
                     "type": "number",
                     "description": "Y coordinate on schematic"
+                },
+                "rotation": {
+                    "type": "number",
+                    "description": "Rotation in degrees, CCW positive, multiples of 90 (e.g., 0, 90, 180, 270). Default 0."
+                },
+                "includePins": {
+                    "type": "boolean",
+                    "description": "Return pin coordinates in the response. Default true. Set false for large ICs where pin data is not needed to save context."
                 }
             },
             "required": ["reference", "symbol", "x", "y"]
@@ -1672,6 +1680,25 @@ SCHEMATIC_TOOLS = [
                 }
             },
             "required": ["query"]
+        }
+    },
+    {
+        "name": "list_symbol_pins",
+        "title": "List Symbol Pins",
+        "description": "Returns pin names, numbers, and types for a symbol directly from the library — no schematic required. Use before add_schematic_component to discover pin names for connect_to_net / batch_connect calls. Returns close-match suggestions if the symbol name is slightly wrong.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "Symbol in Library:SymbolName format (e.g., Device:R, Connector:Conn_01x04)"
+                },
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Optional path to .kicad_sch file; enables project-local sym-lib-table lookup"
+                }
+            },
+            "required": ["symbol"]
         }
     },
     {
