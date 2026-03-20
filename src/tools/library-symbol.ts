@@ -190,7 +190,7 @@ Returns symbol references that can be used directly in schematics.`,
   // List pins for a symbol from the library (no schematic needed)
   server.tool(
     "list_symbol_pins",
-    "Return pin names, numbers, and types for a symbol directly from the library — no schematic required. Use this before add_schematic_component to discover pin names for batch_connect / connect_to_net calls. Returns close-match suggestions if the symbol name is slightly wrong (e.g., 'FerriteBead' instead of 'Ferrite_Bead').",
+    "Return pin names, numbers, and types for a symbol directly from the library — no schematic required. Use this before add_schematic_component or batch_add_components to discover pins for batch_connect / connect_to_net calls. Each pin has 'number' (e.g. '1', 'A5') and 'name' (e.g. 'FB', 'GND') — batch_connect and connect_to_net accept either. Pass schematicPath to resolve project-local symbols (e.g. connectors:Korean-Hroparts_TYPE-C-31-M-12). Returns close-match suggestions if the symbol name is slightly wrong.",
     {
       symbol: z.string()
         .describe("Symbol in 'Library:SymbolName' format (e.g., Device:R, Connector:Conn_01x04, Device:FerriteBead)"),

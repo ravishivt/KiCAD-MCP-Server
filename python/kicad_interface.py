@@ -384,6 +384,7 @@ class KiCADInterface:
             "create_schematic": self._handle_create_schematic,
             "load_schematic": self._handle_load_schematic,
             "add_schematic_component": self._handle_add_schematic_component,
+            "batch_add_components": self._handle_batch_add_components,
             "delete_schematic_component": self._handle_delete_schematic_component,
             "edit_schematic_component": self._handle_edit_schematic_component,
             "get_schematic_component": self._handle_get_schematic_component,
@@ -636,7 +637,21 @@ class KiCADInterface:
             success = SchematicManager.save_schematic(schematic, file_path)
 
             from commands.schematic import _last_removed_templates
+            # Read back the schematic UUID from the saved file so callers can use it
+            schematic_uuid = None
+            try:
+                import re as _re
+                with open(file_path, "r", encoding="utf-8") as _f:
+                    _content = _f.read()
+                _m = _re.search(r'\(uuid\s+([0-9a-fA-F-]+)\)', _content)
+                if _m:
+                    schematic_uuid = _m.group(1)
+            except Exception:
+                pass
+
             result = {"success": success, "file_path": file_path}
+            if schematic_uuid:
+                result["schematic_uuid"] = schematic_uuid
             if _last_removed_templates:
                 result["removed_template_components"] = list(_last_removed_templates)
                 result["note"] = f"Removed {len(_last_removed_templates)} template placeholder components"
@@ -785,6 +800,98 @@ class KiCADInterface:
             logger.error(f"Error adding component to schematic: {str(e)}")
             import traceback
 
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_batch_add_components(self, params):
+        """Add multiple components to a schematic in a single call."""
+        logger.info("Batch adding components to schematic")
+        try:
+            from pathlib import Path
+            from commands.dynamic_symbol_loader import DynamicSymbolLoader, _snap
+            from commands.pin_locator import PinLocator
+
+            schematic_path = params.get("schematicPath")
+            components = params.get("components", [])
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not components:
+                return {"success": False, "message": "components list is required and must be non-empty"}
+
+            schematic_file = Path(schematic_path)
+            project_path = schematic_file.parent
+            loader = DynamicSymbolLoader(project_path=project_path)
+            locator = PinLocator()
+
+            results = []
+            errors = []
+
+            for comp in components:
+                symbol = comp.get("symbol", "")
+                if ":" not in symbol:
+                    errors.append({"symbol": symbol, "reference": comp.get("reference", "?"), "error": "symbol must be 'Library:SymbolName'"})
+                    continue
+
+                library, sym_name = symbol.split(":", 1)
+                reference = comp.get("reference", "X?")
+                value = comp.get("value", sym_name)
+                footprint = comp.get("footprint", "")
+                pos = comp.get("position", {})
+                x = pos.get("x", 0) if isinstance(pos, dict) else 0
+                y = pos.get("y", 0) if isinstance(pos, dict) else 0
+                rotation = comp.get("rotation", 0)
+                include_pins = comp.get("includePins", True)
+
+                try:
+                    loader.add_component(
+                        schematic_file,
+                        library,
+                        sym_name,
+                        reference=reference,
+                        value=value,
+                        footprint=footprint,
+                        x=x,
+                        y=y,
+                        rotation=rotation,
+                        project_path=project_path,
+                    )
+
+                    entry = {
+                        "reference": reference,
+                        "symbol": symbol,
+                        "snapped_position": {"x": _snap(x), "y": _snap(y)},
+                    }
+
+                    if include_pins:
+                        pins_raw = locator.get_all_symbol_pins(schematic_file, reference) or {}
+                        pins_def = locator.get_symbol_pins(schematic_file, symbol) or {}
+                        pins = {}
+                        for pin_num, coords in pins_raw.items():
+                            pins[pin_num] = {
+                                "x": coords[0],
+                                "y": coords[1],
+                                "name": pins_def.get(str(pin_num), {}).get("name", str(pin_num)),
+                            }
+                        entry["pins"] = pins
+
+                    results.append(entry)
+
+                except Exception as e:
+                    logger.error(f"Error adding {reference} ({symbol}): {e}")
+                    errors.append({"symbol": symbol, "reference": reference, "error": str(e)})
+
+            return {
+                "success": len(errors) == 0,
+                "added": results,
+                "errors": errors,
+                "added_count": len(results),
+                "error_count": len(errors),
+            }
+
+        except Exception as e:
+            logger.error(f"Error in batch_add_components: {str(e)}")
+            import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 

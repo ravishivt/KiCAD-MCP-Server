@@ -462,7 +462,7 @@ class DynamicSymbolLoader:
         # Extract the schematic's own UUID so we can build the correct instance path.
         # KiCAD 8+ requires (path "/<schematic-uuid>" ...) in the instances block —
         # using just "/" causes all references to display as "R?", "C?", etc. in the UI.
-        sch_uuid_match = re.search(r'^\s*\(uuid\s+([0-9a-fA-F-]+)\)', content, re.MULTILINE)
+        sch_uuid_match = re.search(r'\(uuid\s+([0-9a-fA-F-]+)\)', content)
         sch_uuid = sch_uuid_match.group(1) if sch_uuid_match else ""
         instance_path = f"/{sch_uuid}" if sch_uuid else "/"
 
@@ -586,7 +586,7 @@ class DynamicSymbolLoader:
         # Pins live in sub-symbols (Name_1_1, Name_0_1, etc.)
         # Pattern: (pin <type> <shape> ... (name "NAME" ...) (number "NUM" ...))
         for m in re.finditer(
-            r'\(pin\s+(\S+)\s+\S+[^)]*?\(name\s+"([^"]*)"[^)]*?\)[^)]*?\(number\s+"([^"]*)"',
+            r'\(pin\s+(\S+)\s+\S+.*?\(name\s+"([^"]*)".*?\(number\s+"([^"]*)"',
             block,
             re.DOTALL,
         ):

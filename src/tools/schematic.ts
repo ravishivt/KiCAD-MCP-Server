@@ -19,13 +19,21 @@ export function registerSchematicTools(
     },
     async (args: { name: string; path?: string }) => {
       const result = await callKicadScript("create_schematic", args);
-      return {
-        content: [
-          {
+      if (result.success) {
+        const uuidNote = result.schematic_uuid ? `\nschematic_uuid: ${result.schematic_uuid}` : "";
+        const templateNote = result.note ? `\n${result.note}` : "";
+        return {
+          content: [{
             type: "text",
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
+            text: `Created schematic: ${result.file_path}${uuidNote}${templateNote}`,
+          }],
+        };
+      }
+      return {
+        content: [{
+          type: "text",
+          text: `Failed to create schematic: ${result.message || JSON.stringify(result)}`,
+        }],
       };
     },
   );
@@ -121,6 +129,61 @@ export function registerSchematicTools(
           ],
         };
       }
+    },
+  );
+
+  // Batch add multiple components in one call
+  server.tool(
+    "batch_add_components",
+    "Place multiple schematic components in a single call. Prefer this over calling add_schematic_component repeatedly — it injects all symbol definitions and creates all instances in one round-trip, returning snapped positions and pin coordinates for each. Each component uses 'Library:SymbolName' format. If any component fails, the rest are still placed and errors are reported per-component.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      components: z.array(z.object({
+        symbol: z.string().describe("Symbol in 'Library:SymbolName' format (e.g., Device:R, power:GND)"),
+        reference: z.string().describe("Reference designator (e.g., R1, C3, U2)"),
+        value: z.string().optional().describe("Component value (e.g., 10k, 100nF, AP63203WU-7)"),
+        footprint: z.string().optional().describe("KiCAD footprint (e.g., Resistor_SMD:R_0603_1608Metric)"),
+        position: z.object({ x: z.number(), y: z.number() }).optional().describe("Schematic position in mm (auto-snapped to 50mil grid)"),
+        rotation: z.number().optional().describe("Rotation in degrees CCW, multiples of 90. Use 90 for horizontal resistors/capacitors."),
+        includePins: z.boolean().optional().describe("Include pin coordinates in response (default true). Set false for large ICs to save tokens."),
+      })).describe("List of components to place"),
+    },
+    async (args: {
+      schematicPath: string;
+      components: Array<{
+        symbol: string;
+        reference: string;
+        value?: string;
+        footprint?: string;
+        position?: { x: number; y: number };
+        rotation?: number;
+        includePins?: boolean;
+      }>;
+    }) => {
+      const result = await callKicadScript("batch_add_components", args);
+      if (result.added_count > 0 || result.error_count === 0) {
+        const lines: string[] = [`Placed ${result.added_count} component(s)${result.error_count > 0 ? `, ${result.error_count} failed` : ""}:`];
+        for (const comp of (result.added || [])) {
+          const pos = comp.snapped_position;
+          const pinLines = Object.entries(comp.pins || {}).map(
+            ([num, p]: [string, any]) => `      Pin ${num} (${p.name}): x=${p.x}, y=${p.y}`
+          );
+          lines.push(`  ${comp.reference} (${comp.symbol}) @ (${pos?.x}, ${pos?.y})`);
+          if (pinLines.length) lines.push(...pinLines);
+        }
+        if (result.errors?.length) {
+          lines.push("Errors:");
+          result.errors.forEach((e: any) => lines.push(`  ${e.reference} (${e.symbol}): ${e.error}`));
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+      return {
+        content: [{
+          type: "text",
+          text: `batch_add_components failed: ${result.message || "Unknown error"}\n` +
+            (result.errors || []).map((e: any) => `  ${e.reference}: ${e.error}`).join("\n"),
+        }],
+      };
     },
   );
 
