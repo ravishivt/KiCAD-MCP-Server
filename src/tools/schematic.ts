@@ -33,7 +33,7 @@ export function registerSchematicTools(
   // Add component to schematic
   server.tool(
     "add_schematic_component",
-    "Add a component to the schematic. Symbol format is 'Library:SymbolName' (e.g., 'Device:R', 'EDA-MCP:ESP32-C3')",
+    "Add a component to the schematic. Symbol format is 'Library:SymbolName' (e.g., 'Device:R', 'EDA-MCP:ESP32-C3'). The position is auto-snapped to the KiCAD 50mil (1.27mm) grid. The response includes the snapped position and pin coordinates so a separate get_schematic_pin_locations call is not needed.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       symbol: z
@@ -84,11 +84,24 @@ export function registerSchematicTools(
         transformed,
       );
       if (result.success) {
+        const pos = result.snapped_position;
+        const snappedNote = pos
+          ? ` (snapped to grid: ${pos.x}, ${pos.y})`
+          : "";
+        const pins: Record<string, any> = result.pins || {};
+        const pinLines = Object.entries(pins).map(
+          ([num, p]: [string, any]) =>
+            `  Pin ${num} (${p.name}): x=${p.x}, y=${p.y}`,
+        );
+        const pinSection =
+          pinLines.length > 0
+            ? `\nPin locations:\n${pinLines.join("\n")}`
+            : "";
         return {
           content: [
             {
               type: "text",
-              text: `Successfully added ${args.reference} (${args.symbol}) to schematic`,
+              text: `Added ${args.reference} (${args.symbol})${snappedNote}${pinSection}`,
             },
           ],
         };
@@ -468,7 +481,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // List all unconnected pins
   server.tool(
     "list_unconnected_pins",
-    "List all pins that have no net connection and no no-connect marker. Use this after wiring to identify which pins still need to be connected or marked NC. Returns component ref, pin number, pin name, pin type, and position for each unconnected pin.",
+    "List all pins that have no net connection and no no-connect marker. Use this after wiring to identify which pins still need to be connected or marked NC. Returns component ref, pin number, pin name, pin type, and position for each unconnected pin. NOTE: reads netlist from the saved file; results may differ from kicad-cli ERC if the skip library computes connectivity differently — use run_erc for the authoritative answer.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
     },
@@ -580,6 +593,50 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
           }],
         };
       }
+    },
+  );
+
+  // Batch connect: place net labels on multiple pins in one call
+  server.tool(
+    "batch_connect",
+    "Place net labels on multiple component pins in a single call. Accepts a map of {componentRef: {pinNumber: netName}} and places all labels in one round-trip. Use this instead of calling connect_to_net repeatedly — it is dramatically more token-efficient for wiring many pins at once.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      connections: z
+        .record(
+          z.record(z.string()).describe("Map of pinNumber -> netName for this component")
+        )
+        .describe(
+          "Map of componentRef -> {pinNumber: netName}. " +
+          "Example: {\"J1\": {\"1\": \"VCC\", \"2\": \"GND\"}, \"U1\": {\"VDD\": \"VCC\"}}"
+        ),
+    },
+    async (args: { schematicPath: string; connections: Record<string, Record<string, string>> }) => {
+      const result = await callKicadScript("batch_connect", args);
+      if (result.placed?.length > 0 || result.failed?.length === 0) {
+        const lines: string[] = [result.message || ""];
+        if (result.placed?.length) {
+          lines.push(`Placed (${result.placed.length}):`);
+          result.placed.slice(0, 10).forEach((p: any) =>
+            lines.push(`  ${p.ref}/${p.pin} → ${p.net} @ (${p.position?.x}, ${p.position?.y})`)
+          );
+          if (result.placed.length > 10) lines.push(`  ... and ${result.placed.length - 10} more`);
+        }
+        if (result.failed?.length) {
+          lines.push(`Failed (${result.failed.length}):`);
+          result.failed.forEach((f: any) =>
+            lines.push(`  ${f.ref}/${f.pin}: ${f.reason}`)
+          );
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+      return {
+        content: [{
+          type: "text",
+          text: `batch_connect failed: ${result.message || "Unknown error"}\n` +
+            (result.failed || []).map((f: any) => `  ${f.ref}/${f.pin}: ${f.reason}`).join("\n"),
+        }],
+      };
     },
   );
 
@@ -781,7 +838,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Move schematic component
   server.tool(
     "move_schematic_component",
-    "Move a placed symbol to a new position in the schematic.",
+    "Move a placed symbol to a new position in the schematic. The position is auto-snapped to the KiCAD 50mil (1.27mm) grid; the response shows the actual snapped position.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       reference: z.string().describe("Reference designator (e.g., R1, U1)"),
@@ -1123,7 +1180,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Run Electrical Rules Check (ERC)
   server.tool(
     "run_erc",
-    "Runs the KiCAD Electrical Rules Check (ERC) on a schematic. Returns violations grouped by type with counts. Use errorsOnly=false to also see warnings. All coordinates are in mm.",
+    "Runs the KiCAD Electrical Rules Check (ERC) on a schematic via kicad-cli (operates on the saved file on disk). Returns violations grouped by type with counts. Use errorsOnly=false to also see warnings. All coordinates are in mm. NOTE: all schematic tools auto-save after each change, so the on-disk file is always current.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
       errorsOnly: z.boolean().optional().describe("If true (default), only show error-severity violations. Set false to also show warnings and info."),

@@ -143,12 +143,14 @@ Returns symbol references that can be used directly in schematics.`,
   // Get detailed information about a specific symbol
   server.tool(
     "get_symbol_info",
-    "Get detailed information about a specific symbol",
+    "Get detailed information about a specific symbol. Pass schematicPath to also search project-local symbol libraries (sym-lib-table) — required for project-specific symbols like custom connectors.",
     {
       symbol: z.string()
-        .describe("Symbol specification (e.g., 'Device:R' or 'PCM_JLCPCB-MCUs:STM32F103C8T6')")
+        .describe("Symbol specification (e.g., 'Device:R' or 'connectors:Korean-Hroparts_TYPE-C-31-M-12')"),
+      schematicPath: z.string().optional()
+        .describe("Path to .kicad_sch — enables project-local library search in addition to global KiCad libs"),
     },
-    async (args: { symbol: string }) => {
+    async (args: { symbol: string; schematicPath?: string }) => {
       const result = await callKicadScript("get_symbol_info", args);
       if (result.success && result.symbol_info) {
         const info = result.symbol_info;

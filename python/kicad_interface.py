@@ -393,6 +393,7 @@ class KiCADInterface:
             "add_no_connect": self._handle_add_no_connect,
             "save_schematic": self._handle_save_schematic,
             "connect_to_net": self._handle_connect_to_net,
+            "batch_connect": self._handle_batch_connect,
             "connect_passthrough": self._handle_connect_passthrough,
             "get_schematic_pin_locations": self._handle_get_schematic_pin_locations,
             "get_net_connections": self._handle_get_net_connections,
@@ -720,6 +721,8 @@ class KiCADInterface:
             if not component:
                 return {"success": False, "message": "Component definition is required"}
 
+            from commands.dynamic_symbol_loader import _snap
+
             comp_type = component.get("type", "R")
             library = component.get("library", "Device")
             reference = component.get("reference", "X?")
@@ -727,6 +730,10 @@ class KiCADInterface:
             footprint = component.get("footprint", "")
             x = component.get("x", 0)
             y = component.get("y", 0)
+
+            # Snap to KiCAD 50mil grid so pins land on-grid (same snap applied inside loader)
+            snapped_x = _snap(x)
+            snapped_y = _snap(y)
 
             # Derive project path from schematic path for project-local library resolution
             schematic_file = Path(schematic_path)
@@ -745,10 +752,27 @@ class KiCADInterface:
                 project_path=derived_project_path,
             )
 
+            # Return pin locations so caller doesn't need a separate round-trip
+            from commands.pin_locator import PinLocator
+            locator = PinLocator()
+            pins_raw = locator.get_all_symbol_pins(schematic_file, reference) or {}
+            # Enrich with pin names from lib definition
+            lib_id = f"{library}:{comp_type}"
+            pins_def = locator.get_symbol_pins(schematic_file, lib_id) or {}
+            pins = {}
+            for pin_num, coords in pins_raw.items():
+                pins[pin_num] = {
+                    "x": coords[0],
+                    "y": coords[1],
+                    "name": pins_def.get(str(pin_num), {}).get("name", str(pin_num)),
+                }
+
             return {
                 "success": True,
                 "component_reference": reference,
                 "symbol_source": f"{library}:{comp_type}",
+                "snapped_position": {"x": snapped_x, "y": snapped_y},
+                "pins": pins,
             }
         except Exception as e:
             logger.error(f"Error adding component to schematic: {str(e)}")
@@ -980,6 +1004,12 @@ class KiCADInterface:
             if new_reference is not None:
                 block_text = re.sub(
                     r'(\(property\s+"Reference"\s+)"[^"]*"',
+                    rf'\1"{new_reference}"',
+                    block_text,
+                )
+                # Also update instances...reference so KiCad UI shows the new designator
+                block_text = re.sub(
+                    r'(\(reference\s+)"[^"]*"',
                     rf'\1"{new_reference}"',
                     block_text,
                 )
@@ -1710,6 +1740,72 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e), "errorDetails": traceback.format_exc()}
 
+    def _handle_batch_connect(self, params):
+        """Place net labels on multiple pins in a single call to avoid per-pin round-trips."""
+        logger.info("Batch connect: placing net labels on multiple pins")
+        try:
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+            from commands.wire_manager import WireManager
+
+            schematic_path = params.get("schematicPath")
+            connections = params.get("connections")  # {ref: {pin: netName}}
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not connections or not isinstance(connections, dict):
+                return {"success": False, "message": "connections must be a dict {ref: {pin: netName}}"}
+
+            locator = PinLocator()
+            sch_path = Path(schematic_path)
+
+            placed = []
+            failed = []
+
+            for ref, pin_map in connections.items():
+                if not isinstance(pin_map, dict):
+                    failed.append({"ref": ref, "reason": "pin_map must be a dict {pin: netName}"})
+                    continue
+                for pin_id, net_name in pin_map.items():
+                    try:
+                        position = locator.get_pin_location(sch_path, ref, str(pin_id))
+                        if not position:
+                            failed.append({"ref": ref, "pin": str(pin_id), "reason": "pin not found"})
+                            continue
+
+                        raw_angle = locator.get_pin_angle(sch_path, ref, str(pin_id)) or 0
+                        cardinal = round(raw_angle / 90) * 90 % 360
+                        angle_map = {0: 180, 90: 270, 180: 0, 270: 90}
+                        orientation = angle_map.get(cardinal, 0)
+
+                        ok = WireManager.add_label(
+                            sch_path, net_name, position, label_type="label", orientation=orientation
+                        )
+                        if ok:
+                            placed.append({
+                                "ref": ref,
+                                "pin": str(pin_id),
+                                "net": net_name,
+                                "position": {"x": position[0], "y": position[1]},
+                            })
+                        else:
+                            failed.append({"ref": ref, "pin": str(pin_id), "net": net_name, "reason": "add_label failed"})
+                    except Exception as pin_err:
+                        failed.append({"ref": ref, "pin": str(pin_id), "reason": str(pin_err)})
+
+            return {
+                "success": len(failed) == 0,
+                "message": f"Placed {len(placed)} label(s), {len(failed)} failed",
+                "placed": placed,
+                "failed": failed,
+            }
+
+        except Exception as e:
+            logger.error(f"Error in batch_connect: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e), "errorDetails": traceback.format_exc()}
+
     def _handle_list_unconnected_pins(self, params):
         """List pins with no net connection and no no-connect marker"""
         logger.info("Listing unconnected pins")
@@ -2306,15 +2402,20 @@ class KiCADInterface:
                     old_pos = list(symbol.at.value)
                     old_position = {"x": float(old_pos[0]), "y": float(old_pos[1])}
 
+                    # Snap to 50mil grid so pins land on-grid
+                    from commands.dynamic_symbol_loader import _snap
+                    snapped_x = _snap(new_x)
+                    snapped_y = _snap(new_y)
+
                     # Preserve rotation (third element)
                     rotation = float(old_pos[2]) if len(old_pos) > 2 else 0
-                    symbol.at.value = [new_x, new_y, rotation]
+                    symbol.at.value = [snapped_x, snapped_y, rotation]
 
                     SchematicManager.save_schematic(schematic, schematic_path)
                     return {
                         "success": True,
                         "oldPosition": old_position,
-                        "newPosition": {"x": new_x, "y": new_y},
+                        "newPosition": {"x": snapped_x, "y": snapped_y},
                     }
 
             return {"success": False, "message": f"Component {reference} not found"}
@@ -2435,7 +2536,12 @@ class KiCADInterface:
 
                 old_ref = symbol.property.Reference.value
                 new_ref = f"{prefix}{next_num}"
-                symbol.property.Reference.value = new_ref
+                # Update both property.Reference AND instances...reference so KiCad UI
+                # reads the correct designator (KiCad 8+ authoritative source is instances).
+                if hasattr(symbol, 'setAllReferences'):
+                    symbol.setAllReferences(new_ref)
+                else:
+                    symbol.property.Reference.value = new_ref
                 existing_refs[prefix].add(next_num)
 
                 uuid_val = str(symbol.uuid.value) if hasattr(symbol, "uuid") else ""

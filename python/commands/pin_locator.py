@@ -184,6 +184,134 @@ class PinLocator:
 
         return (rotated_x, rotated_y)
 
+    def _get_component_transform(self, symbol) -> Tuple[float, float, float, bool, bool]:
+        """
+        Extract (comp_x, comp_y, rotation_deg, mirror_x, mirror_y) from a skip symbol.
+
+        In KiCAD schematics, rotation is CCW-positive when viewed on screen (Y-down).
+        """
+        at_val = symbol.at.value if hasattr(symbol, "at") and hasattr(symbol.at, "value") else [0, 0, 0]
+        comp_x = float(at_val[0])
+        comp_y = float(at_val[1])
+        rotation = float(at_val[2]) if len(at_val) > 2 else 0.0
+
+        mirror_x = False
+        mirror_y = False
+        try:
+            if hasattr(symbol, "mirror"):
+                mirror_val = str(symbol.mirror.value if hasattr(symbol.mirror, "value") else symbol.mirror)
+                mirror_x = "x" in mirror_val.lower()
+                mirror_y = "y" in mirror_val.lower()
+        except Exception:
+            pass
+
+        return comp_x, comp_y, rotation, mirror_x, mirror_y
+
+    def _transform_pin_to_schematic(
+        self,
+        px_lib: float,
+        py_lib: float,
+        comp_x: float,
+        comp_y: float,
+        rotation: float,
+        mirror_x: bool = False,
+        mirror_y: bool = False,
+    ) -> Tuple[float, float]:
+        """
+        Transform a pin endpoint from library space to absolute schematic coordinates.
+
+        KiCAD library files use Y-UP; schematics use Y-DOWN.
+        KiCAD rotation in schematics is CCW-positive when viewed on screen.
+
+        The transformation steps are:
+          1. Apply mirror (in lib Y-up space)
+          2. Y-flip: py_sch = -py_lib
+          3. Rotate by component rotation (CCW positive in screen/schematic space):
+               rx = px_sch * cos(R) + py_sch * sin(R)
+               ry = -px_sch * sin(R) + py_sch * cos(R)
+          4. Translate by component position
+        """
+        # Step 1: mirror in lib space (before Y-flip)
+        if mirror_x:
+            py_lib = -py_lib
+        if mirror_y:
+            px_lib = -px_lib
+
+        # Step 2: Y-flip
+        px_sch = px_lib
+        py_sch = -py_lib
+
+        # Step 3: rotate in schematic space (CCW positive on screen)
+        if rotation != 0.0:
+            R_rad = math.radians(rotation)
+            cos_r = math.cos(R_rad)
+            sin_r = math.sin(R_rad)
+            rx = px_sch * cos_r + py_sch * sin_r
+            ry = -px_sch * sin_r + py_sch * cos_r
+        else:
+            rx, ry = px_sch, py_sch
+
+        # Step 4: translate
+        return round(comp_x + rx, 4), round(comp_y + ry, 4)
+
+    def _transform_pin_angle_to_schematic(
+        self, angle_lib: float, rotation: float, mirror_x: bool = False, mirror_y: bool = False
+    ) -> float:
+        """
+        Transform a pin's outward angle from library space to schematic space.
+
+        In lib space (Y-up), angle 0 = right, 90 = up, 180 = left, 270 = down.
+        In schematic space (Y-down), the Y-flip negates Y, so angles in the upper
+        half (0-180) map to angles in the lower half.
+
+        Y-flip formula:  angle_sch = (-angle_lib) % 360
+        Then apply component rotation (CCW-positive on screen):
+                         angle_final = (angle_sch - rotation) % 360
+        """
+        a = float(angle_lib)
+        if mirror_x:
+            a = (-a) % 360
+        if mirror_y:
+            a = (180 - a) % 360
+        # Y-flip
+        a = (-a) % 360
+        # CCW rotation on screen subtracts from angle
+        a = (a - rotation) % 360
+        return a
+
+    def _get_all_pins_from_lib_symbols(
+        self, schematic_path: Path, symbol, symbol_reference: str
+    ) -> Dict[str, List[float]]:
+        """
+        Compute absolute pin endpoints from the lib_symbols section + component transform.
+        Used as fallback when skip's symbol.pin is empty.
+        """
+        lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else None
+        if not lib_id:
+            logger.error(f"Cannot get lib_id for {symbol_reference}")
+            return {}
+
+        pins_def = self.get_symbol_pins(schematic_path, lib_id)
+        if not pins_def:
+            logger.warning(f"No pin definitions found in lib_symbols for {lib_id}")
+            return {}
+
+        comp_x, comp_y, rotation, mirror_x, mirror_y = self._get_component_transform(symbol)
+        result = {}
+        for pin_num, pin_data in pins_def.items():
+            px_lib = float(pin_data["x"])
+            py_lib = float(pin_data["y"])
+            abs_x, abs_y = self._transform_pin_to_schematic(
+                px_lib, py_lib, comp_x, comp_y, rotation, mirror_x, mirror_y
+            )
+            result[str(pin_num)] = [abs_x, abs_y]
+
+        logger.info(
+            f"Fallback: computed {len(result)} pin locations for {symbol_reference} "
+            f"from lib_symbols (rotation={rotation}, mirror_x={mirror_x}, mirror_y={mirror_y})"
+        )
+        return result
+
     def _get_lib_id(self, schematic_path: Path, symbol_reference: str) -> Optional[str]:
         """Helper: return the lib_id string for a placed symbol"""
         try:
@@ -222,17 +350,43 @@ class PinLocator:
         self, schematic_path: Path, symbol_reference: str, pin_number: str
     ) -> Optional[float]:
         """
-        Get the outward angle of a pin endpoint in degrees (0=right, 90=up, 180=left, 270=down).
-        Uses skip's SymbolPin.location which correctly handles symbol rotation and Y-axis flip.
+        Get the outward angle of a pin endpoint in degrees (0=right, 90=up in screen, 180=left, 270=down in screen).
+        Tries skip's SymbolPin.location first; falls back to lib_symbols + component transform.
         """
         try:
             symbol = self._find_symbol(str(schematic_path), symbol_reference)
             if not symbol:
                 return None
-            pin = self._find_skip_pin(symbol, pin_number)
-            if not pin:
+
+            # Try skip's pin.location.rotation first
+            try:
+                pin = self._find_skip_pin(symbol, pin_number)
+                if pin:
+                    return float(pin.location.rotation)
+            except Exception:
+                pass
+
+            # Fallback: compute from lib_symbols definition
+            lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else None
+            if not lib_id:
                 return None
-            return float(pin.location.rotation)
+            pins_def = self.get_symbol_pins(schematic_path, lib_id)
+
+            # Find pin by number or name
+            pin_data = pins_def.get(str(pin_number))
+            if pin_data is None:
+                for num, data in pins_def.items():
+                    if data.get("name") == str(pin_number):
+                        pin_data = data
+                        break
+
+            if pin_data is None:
+                return None
+
+            comp_x, comp_y, rotation, mirror_x, mirror_y = self._get_component_transform(symbol)
+            return self._transform_pin_angle_to_schematic(
+                pin_data.get("angle", 0), rotation, mirror_x, mirror_y
+            )
         except Exception:
             return None
 
@@ -242,9 +396,10 @@ class PinLocator:
         """
         Get the absolute location of a pin on a symbol instance.
 
-        Uses skip's SymbolPin.location which correctly handles symbol rotation,
-        mirroring, and KiCad's Y-axis convention (lib editor uses Y-up;
-        schematic uses Y-down — skip applies the negation automatically).
+        Tries skip's SymbolPin.location first (handles rotation/mirror/Y-flip automatically).
+        Falls back to lib_symbols-based manual computation when skip returns nothing —
+        this covers custom library symbols (connectors, power, project-specific libs)
+        where skip may not expose pins via symbol.pin.
 
         Args:
             schematic_path: Path to .kicad_sch file
@@ -254,32 +409,59 @@ class PinLocator:
         Returns:
             [x, y] absolute schematic coordinates of the pin endpoint (Y-axis DOWN),
             or None if not found.
-
-        Coordinate convention:
-            KiCad symbol library files use Y-UP (positive Y goes up).
-            KiCad schematics use Y-DOWN (positive Y goes down).
-            The correct manual formula would be:
-                schematic_y = component_y - pin_symbol_y
-            skip's pin.location applies this flip automatically, so callers
-            receive ready-to-use schematic coordinates and must NOT apply any
-            additional Y transformation.
         """
         try:
             symbol = self._find_symbol(str(schematic_path), symbol_reference)
             if not symbol:
                 logger.error(f"Symbol {symbol_reference} not found in schematic")
                 return None
-            pin = self._find_skip_pin(symbol, pin_number)
-            if not pin:
-                available = [(str(p.number), p.name) for p in symbol.pin]
-                logger.error(
-                    f"Pin {pin_number} not found on {symbol_reference}. "
-                    f"Available: {available}"
-                )
+
+            # Try skip's pin.location first
+            try:
+                pin = self._find_skip_pin(symbol, pin_number)
+                if pin:
+                    loc = pin.location
+                    logger.info(f"Pin {symbol_reference}/{pin_number} located at ({loc.x}, {loc.y}) via skip")
+                    return [loc.x, loc.y]
+            except Exception as skip_err:
+                logger.debug(f"skip pin lookup failed for {symbol_reference}/{pin_number}: {skip_err}")
+
+            # Fallback: compute from lib_symbols + component transform
+            logger.info(
+                f"skip pin lookup empty for {symbol_reference}/{pin_number}, "
+                "trying lib_symbols fallback"
+            )
+            all_pins = self._get_all_pins_from_lib_symbols(schematic_path, symbol, symbol_reference)
+            if not all_pins:
+                logger.error(f"Could not find pin {pin_number} on {symbol_reference} via any method")
                 return None
-            loc = pin.location
-            logger.info(f"Pin {symbol_reference}/{pin_number} located at ({loc.x}, {loc.y})")
-            return [loc.x, loc.y]
+
+            # Match by pin number
+            if str(pin_number) in all_pins:
+                coords = all_pins[str(pin_number)]
+                logger.info(
+                    f"Pin {symbol_reference}/{pin_number} located at {coords} via lib_symbols fallback"
+                )
+                return [coords[0], coords[1]]
+
+            # Match by pin name
+            lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else None
+            if lib_id:
+                pins_def = self.get_symbol_pins(schematic_path, lib_id)
+                for num, data in pins_def.items():
+                    if data.get("name") == str(pin_number) and str(num) in all_pins:
+                        coords = all_pins[str(num)]
+                        logger.info(
+                            f"Pin {symbol_reference}/{pin_number} (name match on #{num}) "
+                            f"located at {coords} via lib_symbols fallback"
+                        )
+                        return [coords[0], coords[1]]
+
+            logger.error(
+                f"Pin {pin_number} not found on {symbol_reference}. "
+                f"Available pins: {sorted(all_pins.keys())}"
+            )
+            return None
         except Exception as e:
             logger.error(f"Error getting pin location: {e}")
             import traceback
@@ -292,6 +474,9 @@ class PinLocator:
         """
         Get locations of all pins on a symbol instance.
 
+        Tries skip's symbol.pin first; falls back to lib_symbols + component transform
+        when skip returns no pins (common for custom/connector/power symbols).
+
         Returns:
             Dictionary mapping pin number -> [x, y] coordinates
         """
@@ -300,12 +485,27 @@ class PinLocator:
             if not symbol:
                 logger.error(f"Symbol {symbol_reference} not found")
                 return {}
+
+            # Try skip's pin.location first
             result = {}
-            for pin in symbol.pin:
-                loc = pin.location
-                result[str(pin.number)] = [loc.x, loc.y]
-            logger.info(f"Located {len(result)} pins on {symbol_reference}")
-            return result
+            try:
+                for pin in symbol.pin:
+                    loc = pin.location
+                    result[str(pin.number)] = [loc.x, loc.y]
+            except Exception as skip_err:
+                logger.debug(f"skip pin iteration failed for {symbol_reference}: {skip_err}")
+
+            if result:
+                logger.info(f"Located {len(result)} pins on {symbol_reference} via skip")
+                return result
+
+            # Fallback: compute from lib_symbols + component transform
+            logger.info(
+                f"skip returned no pins for {symbol_reference}, "
+                "using lib_symbols fallback"
+            )
+            fallback = self._get_all_pins_from_lib_symbols(schematic_path, symbol, symbol_reference)
+            return fallback
         except Exception as e:
             logger.error(f"Error getting all symbol pins: {e}")
             return {}

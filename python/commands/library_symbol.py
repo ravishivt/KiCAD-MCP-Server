@@ -609,6 +609,20 @@ class SymbolLibraryCommands:
                     "message": "Missing symbol parameter"
                 }
 
+            # If a schematic/project path is provided, search project-local sym-lib-table
+            # first so project-specific symbols (e.g. connectors:TYPE-C) are found.
+            schematic_path = params.get("schematicPath") or params.get("projectPath")
+            if schematic_path:
+                project_dir = Path(schematic_path)
+                if project_dir.is_file():
+                    project_dir = project_dir.parent
+                project_table = project_dir / "sym-lib-table"
+                if project_table.exists():
+                    mgr = SymbolLibraryManager(project_path=project_dir)
+                    result = mgr.find_symbol(symbol_spec)
+                    if result:
+                        return {"success": True, "symbol_info": asdict(result)}
+
             result = self.library_manager.find_symbol(symbol_spec)
 
             if result:
