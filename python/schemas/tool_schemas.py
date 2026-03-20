@@ -1418,10 +1418,68 @@ SCHEMATIC_TOOLS = [
                 },
                 "includePins": {
                     "type": "boolean",
-                    "description": "Return pin coordinates in the response. Default true. Set false for large ICs where pin data is not needed to save context."
+                    "description": "Return pin coordinates in the response. Default false. Set true only when planning add_wire routing; batch_connect does not need coordinates."
                 }
             },
             "required": ["reference", "symbol", "x", "y"]
+        }
+    },
+    {
+        "name": "batch_add_components",
+        "title": "Batch Add Components to Schematic",
+        "description": "Places multiple symbols on the schematic in a single call. Prefer this over repeated add_schematic_component calls. All symbols must be specified as Library:SymbolName. Returns snapped positions; set includePins: true only when planning add_wire routing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                },
+                "components": {
+                    "type": "array",
+                    "description": "List of components to place",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": {
+                                "type": "string",
+                                "description": "Symbol in Library:SymbolName format (e.g., Device:R)"
+                            },
+                            "reference": {
+                                "type": "string",
+                                "description": "Reference designator (e.g., R1, C2, U3)"
+                            },
+                            "value": {
+                                "type": "string",
+                                "description": "Component value (e.g., 10k, 100nF)"
+                            },
+                            "footprint": {
+                                "type": "string",
+                                "description": "Optional footprint (e.g., Resistor_SMD:R_0402)"
+                            },
+                            "position": {
+                                "type": "object",
+                                "description": "Placement position in mm",
+                                "properties": {
+                                    "x": {"type": "number"},
+                                    "y": {"type": "number"}
+                                },
+                                "required": ["x", "y"]
+                            },
+                            "rotation": {
+                                "type": "number",
+                                "description": "Rotation in degrees, CCW positive, multiples of 90. Default 0."
+                            },
+                            "includePins": {
+                                "type": "boolean",
+                                "description": "Return pin coordinates for this component. Default false. Set true only when planning add_wire routing; batch_connect does not need coordinates."
+                            }
+                        },
+                        "required": ["symbol", "reference", "position"]
+                    }
+                }
+            },
+            "required": ["schematicPath", "components"]
         }
     },
     {
@@ -1664,7 +1722,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "search_schematic_symbols",
         "title": "Search Schematic Symbols",
-        "description": "Search symbol libraries by name to find the correct Library:SymbolName before calling add_schematic_component. Searches symbol names and library names. E.g. query='STM32F103' returns 'MCU_ST_STM32F1:STM32F103C8Tx'.",
+        "description": "Search symbol libraries by name to find the correct Library:SymbolName before calling add_schematic_component. Searches symbol names and library names. E.g. query='STM32F103' returns 'MCU_ST_STM32F1:STM32F103C8Tx'. When schematicPath is provided, project-local libraries are searched first and global libraries with the same nickname are skipped (they are shadowed).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1677,6 +1735,10 @@ SCHEMATIC_TOOLS = [
                     "description": "Maximum number of results to return (default: 20, max: 100)",
                     "default": 20,
                     "maximum": 100
+                },
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Optional path to .kicad_sch file. When provided, searches project-local libraries first and excludes shadowed global libraries. Always provide this when working in a project."
                 }
             },
             "required": ["query"]
@@ -1699,6 +1761,26 @@ SCHEMATIC_TOOLS = [
                 }
             },
             "required": ["symbol"]
+        }
+    },
+    {
+        "name": "batch_list_symbol_pins",
+        "title": "Batch List Symbol Pins",
+        "description": "Returns pin names, numbers, and types for multiple symbols in a single call. Prefer this over calling list_symbol_pins repeatedly. Returns a map of symbol -> {pins, pin_count}.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "symbols": {
+                    "type": "array",
+                    "description": "List of symbols in Library:SymbolName format (e.g., [\"Device:R\", \"Device:C\", \"Connector:Conn_01x04\"])",
+                    "items": {"type": "string"}
+                },
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Optional path to .kicad_sch file; enables project-local sym-lib-table lookup"
+                }
+            },
+            "required": ["symbols"]
         }
     },
     {

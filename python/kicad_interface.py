@@ -403,6 +403,7 @@ class KiCADInterface:
             "list_unconnected_pins": self._handle_list_unconnected_pins,
             "search_schematic_symbols": self._handle_search_schematic_symbols,
             "list_symbol_pins": self._handle_list_symbol_pins,
+            "batch_list_symbol_pins": self._handle_batch_list_symbol_pins,
             "generate_netlist": self._handle_generate_netlist,
             "sync_schematic_to_board": self._handle_sync_schematic_to_board,
             "list_schematic_libraries": self._handle_list_schematic_libraries,
@@ -614,16 +615,35 @@ class KiCADInterface:
                 params.get("projectName") or params.get("name") or params.get("title")
             )
 
-            # Handle filename parameter - it may contain full path
+            # Compute the full output file_path before calling create_schematic.
+            # BUG-2 fix (a): if `path` ends with .kicad_sch, treat it as the full
+            #   output path (don't append name again).
+            # BUG-2 fix (b): when no path given and a project board is loaded,
+            #   default to the project directory instead of CWD.
             filename = params.get("filename")
             if filename:
-                # If filename provided, extract name and path from it
                 if filename.endswith(".kicad_sch"):
-                    filename = filename[:-10]  # Remove .kicad_sch extension
-                path = os.path.dirname(filename) or "."
-                project_name = project_name or os.path.basename(filename)
+                    file_path = os.path.abspath(filename)
+                    project_name = project_name or os.path.splitext(os.path.basename(file_path))[0]
+                else:
+                    path = os.path.dirname(filename) or "."
+                    project_name = project_name or os.path.basename(filename)
+                    file_path = os.path.abspath(os.path.join(path, f"{project_name}.kicad_sch"))
             else:
-                path = params.get("path", ".")
+                path_param = params.get("path", "")
+                if path_param and path_param.endswith(".kicad_sch"):
+                    # path is actually a full file path — use it directly
+                    file_path = os.path.abspath(path_param)
+                    project_name = project_name or os.path.splitext(os.path.basename(file_path))[0]
+                elif path_param:
+                    file_path = os.path.abspath(os.path.join(path_param, f"{project_name}.kicad_sch"))
+                elif self.board:
+                    # Default to project directory when a project is open
+                    board_dir = os.path.dirname(self.board.GetFileName())
+                    file_path = os.path.abspath(os.path.join(board_dir, f"{project_name}.kicad_sch"))
+                else:
+                    file_path = os.path.abspath(f"{project_name}.kicad_sch")
+
             metadata = params.get("metadata", {})
 
             if not project_name:
@@ -632,8 +652,8 @@ class KiCADInterface:
                     "message": "Schematic name is required. Provide 'name', 'projectName', or 'filename' parameter.",
                 }
 
-            schematic = SchematicManager.create_schematic(project_name, metadata)
-            file_path = f"{path}/{project_name}.kicad_sch"
+            # Pass the full file_path so create_schematic writes to the right location
+            schematic = SchematicManager.create_schematic(file_path, metadata)
             success = SchematicManager.save_schematic(schematic, file_path)
 
             from commands.schematic import _last_removed_templates
@@ -747,7 +767,7 @@ class KiCADInterface:
             x = component.get("x", 0)
             y = component.get("y", 0)
             rotation = component.get("rotation", 0)
-            include_pins = component.get("includePins", True)
+            include_pins = component.get("includePins", False)
 
             # Snap to KiCAD 50mil grid so pins land on-grid (same snap applied inside loader)
             snapped_x = _snap(x)
@@ -841,7 +861,7 @@ class KiCADInterface:
                 x = pos.get("x", 0) if isinstance(pos, dict) else 0
                 y = pos.get("y", 0) if isinstance(pos, dict) else 0
                 rotation = comp.get("rotation", 0)
-                include_pins = comp.get("includePins", True)
+                include_pins = comp.get("includePins", False)
 
                 try:
                     loader.add_component(
@@ -1995,21 +2015,84 @@ class KiCADInterface:
         logger.info("Searching schematic symbols")
         try:
             import re
+            from pathlib import Path
             from commands.dynamic_symbol_loader import DynamicSymbolLoader
 
             query = params.get("query", "").strip()
             max_results = min(int(params.get("maxResults", 20)), 100)
+            schematic_path = params.get("schematicPath")
 
             if not query:
                 return {"success": False, "message": "query is required"}
 
-            loader = DynamicSymbolLoader()
+            # Build project library map: nickname -> resolved path
+            # These take precedence over (and shadow) global libraries with the same nickname.
+            project_libs: dict = {}  # nickname -> Path
+            project_path = None
+            if schematic_path:
+                project_path = Path(schematic_path).parent
+                loader_proj = DynamicSymbolLoader(project_path=project_path)
+                sym_lib_table = project_path / "sym-lib-table"
+                if sym_lib_table.exists():
+                    try:
+                        with open(sym_lib_table, "r", encoding="utf-8") as f:
+                            table_content = f.read()
+                        for m in re.finditer(
+                            r'\(lib\s+\(name\s+"?([^"\)\s]+)"?\)\s*\(type\s+[^)]+\)\s*\(uri\s+"?([^"\)\s]+)"?',
+                            table_content,
+                            re.IGNORECASE,
+                        ):
+                            nickname = m.group(1)
+                            uri = m.group(2)
+                            resolved = loader_proj._resolve_sym_uri(uri)
+                            if resolved:
+                                p = Path(resolved)
+                                if p.exists():
+                                    project_libs[nickname] = p
+                    except Exception as e:
+                        logger.warning(f"Could not parse project sym-lib-table: {e}")
+
+            loader = DynamicSymbolLoader(project_path=project_path)
             lib_dirs = loader.find_kicad_symbol_libraries()
 
             results = []
             query_lower = query.lower()
             sub_symbol_re = re.compile(r'.+_\d+_\d+$')
 
+            def _search_lib_file(lib_file: Path, lib_name: str, shadowed_by: str = None):
+                """Search a single .kicad_sym file and append matching symbols to results."""
+                try:
+                    content = lib_file.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    return
+                symbol_names = re.findall(r'\(symbol\s+"([^"]+)"', content)
+                for sym_name in symbol_names:
+                    if len(results) >= max_results:
+                        return
+                    if sub_symbol_re.match(sym_name):
+                        continue
+                    if query_lower in sym_name.lower() or query_lower in lib_name.lower():
+                        entry: dict = {
+                            "library": lib_name,
+                            "symbol": sym_name,
+                            "fullName": f"{lib_name}:{sym_name}",
+                        }
+                        if shadowed_by:
+                            entry["warning"] = (
+                                f"Global library '{lib_name}' is shadowed by the project-local "
+                                f"library with the same nickname. Use results from the project "
+                                f"library instead, or check the project sym-lib-table."
+                            )
+                            entry["shadowed"] = True
+                        results.append(entry)
+
+            # 1. Search project-local libraries first (highest priority)
+            for nickname, lib_file in project_libs.items():
+                if len(results) >= max_results:
+                    break
+                _search_lib_file(lib_file, nickname)
+
+            # 2. Search global libraries, skipping any whose nickname is shadowed by project libs
             for lib_dir in lib_dirs:
                 if len(results) >= max_results:
                     break
@@ -2017,22 +2100,10 @@ class KiCADInterface:
                     if len(results) >= max_results:
                         break
                     lib_name = lib_file.stem
-                    try:
-                        content = lib_file.read_text(encoding="utf-8", errors="ignore")
-                    except Exception:
+                    if lib_name in project_libs:
+                        # This global library is fully shadowed; skip silently
                         continue
-                    symbol_names = re.findall(r'\(symbol\s+"([^"]+)"', content)
-                    for sym_name in symbol_names:
-                        if sub_symbol_re.match(sym_name):
-                            continue
-                        if query_lower in sym_name.lower() or query_lower in lib_name.lower():
-                            results.append({
-                                "library": lib_name,
-                                "symbol": sym_name,
-                                "fullName": f"{lib_name}:{sym_name}",
-                            })
-                            if len(results) >= max_results:
-                                break
+                    _search_lib_file(lib_file, lib_name)
 
             return {"success": True, "results": results, "count": len(results)}
 
@@ -2081,6 +2152,49 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error listing symbol pins: {str(e)}")
+            return {"success": False, "message": str(e)}
+
+    def _handle_batch_list_symbol_pins(self, params):
+        """List pin names, numbers, and types for multiple symbols in a single call."""
+        logger.info("Batch listing symbol pins")
+        try:
+            from commands.dynamic_symbol_loader import DynamicSymbolLoader
+            from pathlib import Path
+
+            symbols = params.get("symbols", [])
+            schematic_path = params.get("schematicPath")
+
+            if not symbols:
+                return {"success": False, "message": "symbols list is required"}
+
+            project_path = None
+            if schematic_path:
+                project_path = Path(schematic_path).parent
+
+            loader = DynamicSymbolLoader(project_path=project_path)
+            results = {}
+            errors = {}
+
+            for symbol_spec in symbols:
+                if ":" not in symbol_spec:
+                    errors[symbol_spec] = "symbol must be 'Library:SymbolName'"
+                    continue
+                library_name, symbol_name = symbol_spec.split(":", 1)
+                try:
+                    pins = loader.list_symbol_pins(library_name, symbol_name)
+                    results[symbol_spec] = {"pins": pins, "pin_count": len(pins)}
+                except ValueError as e:
+                    suggestions = getattr(e, "suggestions", [])
+                    errors[symbol_spec] = {"message": str(e), "suggestions": suggestions}
+
+            return {
+                "success": len(errors) == 0,
+                "symbols": results,
+                "errors": errors if errors else None,
+            }
+
+        except Exception as e:
+            logger.error(f"Error in batch_list_symbol_pins: {str(e)}")
             return {"success": False, "message": str(e)}
 
     def _handle_get_schematic_pin_locations(self, params):
@@ -2177,6 +2291,7 @@ class KiCADInterface:
             fmt = params.get("format", "png")
             width = params.get("width", 1200)
             height = params.get("height", 900)
+            crop = params.get("crop", False)
 
             # Step 1: Export schematic to SVG via kicad-cli
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -2232,6 +2347,30 @@ class KiCADInterface:
                 png_data = svg2png(
                     url=svg_path, output_width=width, output_height=height
                 )
+
+                # Crop to component bounding box if requested (IMPROVEMENT-3)
+                if crop:
+                    try:
+                        from PIL import Image, ImageChops
+                        import io as _io
+                        img = Image.open(_io.BytesIO(png_data)).convert("RGB")
+                        bg = Image.new("RGB", img.size, (255, 255, 255))
+                        diff = ImageChops.difference(img, bg)
+                        bbox = diff.getbbox()
+                        if bbox:
+                            margin_px = max(20, int(min(img.width, img.height) * 0.04))
+                            left = max(0, bbox[0] - margin_px)
+                            top = max(0, bbox[1] - margin_px)
+                            right = min(img.width, bbox[2] + margin_px)
+                            bottom = min(img.height, bbox[3] + margin_px)
+                            img = img.crop((left, top, right, bottom))
+                        buf = _io.BytesIO()
+                        img.save(buf, format="PNG")
+                        png_data = buf.getvalue()
+                    except ImportError:
+                        logger.info("Pillow not installed — returning uncropped image (pip install Pillow to enable crop)")
+                    except Exception as crop_err:
+                        logger.warning(f"Crop failed: {crop_err}")
 
                 return {
                     "success": True,
@@ -2878,6 +3017,55 @@ class KiCADInterface:
             logger.error(f"Error getting net connections: {str(e)}")
             return {"success": False, "message": str(e)}
 
+    @staticmethod
+    def _resolve_sym_lib_table_for_erc(schematic_path: str):
+        """
+        Temporarily write a resolved sym-lib-table with ${KIPRJMOD} substituted by
+        the absolute project directory so kicad-cli can open project-local libraries.
+
+        Returns a cleanup callable (call after kicad-cli finishes), or None if no
+        resolution was needed.
+        """
+        import shutil
+        from pathlib import Path
+
+        project_dir = Path(schematic_path).parent
+        sym_lib_table = project_dir / "sym-lib-table"
+
+        if not sym_lib_table.exists():
+            return None
+
+        with open(sym_lib_table, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        if "${KIPRJMOD}" not in content:
+            return None
+
+        project_abs = str(project_dir.resolve())
+        resolved = content.replace("${KIPRJMOD}", project_abs)
+
+        backup_path = sym_lib_table.with_suffix(".erc-backup")
+        shutil.copy2(sym_lib_table, backup_path)
+        try:
+            with open(sym_lib_table, "w", encoding="utf-8") as f:
+                f.write(resolved)
+            logger.info(f"Wrote resolved sym-lib-table for ERC (KIPRJMOD={project_abs})")
+        except Exception as e:
+            logger.warning(f"Could not write resolved sym-lib-table: {e}")
+            if backup_path.exists():
+                backup_path.unlink()
+            return None
+
+        def cleanup():
+            try:
+                if backup_path.exists():
+                    shutil.copy2(backup_path, sym_lib_table)
+                    backup_path.unlink()
+            except Exception as ex:
+                logger.warning(f"Could not restore sym-lib-table backup: {ex}")
+
+        return cleanup
+
     def _handle_run_erc(self, params):
         """Run Electrical Rules Check on a schematic via kicad-cli"""
         logger.info("Running ERC on schematic")
@@ -2906,6 +3094,10 @@ class KiCADInterface:
                 mode="w", suffix=".json", delete=False
             ) as tmp:
                 json_output = tmp.name
+
+            # Pre-resolve ${KIPRJMOD} in the project sym-lib-table so kicad-cli
+            # can open project-local libraries that use relative paths.
+            erc_cleanup = self._resolve_sym_lib_table_for_erc(schematic_path)
 
             try:
                 cmd = [
@@ -2938,15 +3130,14 @@ class KiCADInterface:
                 violations = []
                 severity_counts = {"error": 0, "warning": 0, "info": 0}
 
+                # BUG-3 fix: only suppress lib_symbol_issues for truly unresolvable
+                # global libraries. footprint_link_issues ("footprint library" /
+                # "footprint not found") are actionable and must NOT be filtered.
                 BENIGN_PATTERNS = [
                     "symbol not found in global library",
                     "not found in global",
-                    "footprint library",
-                    "footprint not found",
                 ]
-                # Violation types that are always benign (cached symbol version mismatch
-                # is normal when a schematic embeds lib_symbols at creation time)
-                BENIGN_TYPES = {"lib_symbol_mismatch"}
+                BENIGN_TYPES: set = set()
 
                 def _is_benign_violation(v):
                     if v.get("type", "") in BENIGN_TYPES:
@@ -2989,14 +3180,24 @@ class KiCADInterface:
                     if vseverity in severity_counts:
                         severity_counts[vseverity] += 1
 
+                notes = [
+                    "All coordinates are in millimeters (mm).",
+                    "ERC reads the saved file on disk. If the schematic is open in KiCad UI with unsaved changes, reload it in KiCad to sync before comparing results.",
+                ]
+                if any(v["type"] == "lib_symbol_issues" for v in violations):
+                    notes.append(
+                        "lib_symbol_issues can be false-positives if project .kicad_sym "
+                        "files contain ; lines with (, ), or [ characters. KiCAD's "
+                        "s-expression parser treats ; lines as data, not comments — "
+                        "such lines corrupt the parse tree. Remove ; lines from the "
+                        "affected library files to resolve."
+                    )
+
                 return {
                     "success": True,
                     "message": f"ERC complete: {len(violations)} violation(s)",
                     "coordinate_units": "mm",
-                    "notes": [
-                        "All coordinates are in millimeters (mm).",
-                        "ERC reads the saved file on disk. If the schematic is open in KiCad UI with unsaved changes, reload it in KiCad to sync before comparing results.",
-                    ],
+                    "notes": notes,
                     "summary": {
                         "total": len(violations),
                         "actionable": sum(1 for v in violations if not v.get("benign")),
@@ -3009,6 +3210,8 @@ class KiCADInterface:
             finally:
                 if os.path.exists(json_output):
                     os.unlink(json_output)
+                if erc_cleanup:
+                    erc_cleanup()
 
         except subprocess.TimeoutExpired:
             return {"success": False, "message": "ERC timed out after 120 seconds"}

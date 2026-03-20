@@ -60,7 +60,7 @@ export function registerSchematicTools(
         .optional()
         .describe("Position on schematic"),
       rotation: z.number().optional().describe("Rotation in degrees, CCW positive, multiples of 90 (0, 90, 180, 270). Default 0. Use 90 for horizontal resistors/capacitors in a left-to-right power path."),
-      includePins: z.boolean().optional().describe("Return pin coordinates in the response (default true). Set false for large ICs where pin data is not needed, to save context."),
+      includePins: z.boolean().optional().describe("Return pin coordinates in the response (default false). Set true for ICs where pin coordinate planning is needed."),
     },
     async (args: {
       schematicPath: string;
@@ -89,7 +89,7 @@ export function registerSchematicTools(
           x: args.position?.x ?? 0,
           y: args.position?.y ?? 0,
           rotation: args.rotation ?? 0,
-          includePins: args.includePins !== false,
+          includePins: args.includePins === true,
         },
       };
 
@@ -145,7 +145,7 @@ export function registerSchematicTools(
         footprint: z.string().optional().describe("KiCAD footprint (e.g., Resistor_SMD:R_0603_1608Metric)"),
         position: z.object({ x: z.number(), y: z.number() }).optional().describe("Schematic position in mm (auto-snapped to 50mil grid)"),
         rotation: z.number().optional().describe("Rotation in degrees CCW, multiples of 90. Use 90 for horizontal resistors/capacitors."),
-        includePins: z.boolean().optional().describe("Include pin coordinates in response (default true). Set false for large ICs to save tokens."),
+        includePins: z.boolean().optional().describe("Include pin coordinates in response (default false). Set true for ICs where pin coordinate planning is needed."),
       })).describe("List of components to place"),
     },
     async (args: {
@@ -682,30 +682,18 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     },
     async (args: { schematicPath: string; connections: Record<string, Record<string, string>> }) => {
       const result = await callKicadScript("batch_connect", args);
-      if (result.placed?.length > 0 || result.failed?.length === 0) {
-        const lines: string[] = [result.message || ""];
-        if (result.placed?.length) {
-          lines.push(`Placed (${result.placed.length}):`);
-          result.placed.slice(0, 10).forEach((p: any) =>
-            lines.push(`  ${p.ref}/${p.pin} → ${p.net} @ (${p.position?.x}, ${p.position?.y})`)
-          );
-          if (result.placed.length > 10) lines.push(`  ... and ${result.placed.length - 10} more`);
-        }
-        if (result.failed?.length) {
-          lines.push(`Failed (${result.failed.length}):`);
-          result.failed.forEach((f: any) =>
-            lines.push(`  ${f.ref}/${f.pin}: ${f.reason}`)
-          );
-        }
-        return { content: [{ type: "text", text: lines.join("\n") }] };
+      const placed: any[] = result.placed || [];
+      const failed: any[] = result.failed || [];
+      const total = placed.length + failed.length;
+      if (failed.length === 0) {
+        // Full success — summary only, no per-pin noise
+        return { content: [{ type: "text", text: `${placed.length}/${total} labels placed.` }] };
       }
-      return {
-        content: [{
-          type: "text",
-          text: `batch_connect failed: ${result.message || "Unknown error"}\n` +
-            (result.failed || []).map((f: any) => `  ${f.ref}/${f.pin}: ${f.reason}`).join("\n"),
-        }],
-      };
+      // Partial or full failure — show only failures
+      const lines: string[] = [`${placed.length}/${total} labels placed.`];
+      lines.push(`Failed (${failed.length}):`);
+      failed.forEach((f: any) => lines.push(`  ${f.ref}/${f.pin}: ${f.reason}`));
+      return { content: [{ type: "text", text: lines.join("\n") }] };
     },
   );
 
@@ -1203,12 +1191,14 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
         .describe("Output format (default: png)"),
       width: z.number().optional().describe("Image width in pixels (default: 1200)"),
       height: z.number().optional().describe("Image height in pixels (default: 900)"),
+      crop: z.boolean().optional().describe("Auto-crop to the bounding box of placed components with a small margin (default: false). Makes the image readable when components occupy only a small portion of the sheet. Requires Pillow (pip install Pillow)."),
     },
     async (args: {
       schematicPath: string;
       format?: "png" | "svg";
       width?: number;
       height?: number;
+      crop?: boolean;
     }) => {
       const result = await callKicadScript("get_schematic_view", args);
       if (result.success) {
@@ -1290,7 +1280,10 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
                 .map((it: any) => it.description)
                 .filter(Boolean)
                 .join("; ");
-              const loc = v.location?.x !== undefined ? ` @ (${v.location.x}, ${v.location.y}) mm` : "";
+              const toMils = (mm: number) => Math.round(mm * 1000 / 25.4);
+              const loc = v.location?.x !== undefined
+                ? ` @ (${toMils(v.location.x)}, ${toMils(v.location.y)}) mils / (${v.location.x.toFixed(2)}, ${v.location.y.toFixed(2)}) mm`
+                : "";
               const detail = itemDescs ? `  ${itemDescs}${loc}` : `  ${v.message}${loc}`;
               lines.push(detail);
             });

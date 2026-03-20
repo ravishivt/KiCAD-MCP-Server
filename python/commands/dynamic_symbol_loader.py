@@ -362,29 +362,56 @@ class DynamicSymbolLoader:
         logger.info(f"Extracted symbol {full_name} ({len(result)} chars)")
         return result
 
+    def _remove_lib_symbol_block(self, content: str, full_name: str) -> str:
+        """Remove a symbol definition block from lib_symbols, including its leading whitespace."""
+        marker = f'(symbol "{full_name}"'
+        start_idx = content.find(marker)
+        if start_idx == -1:
+            return content
+
+        # Find matching closing paren
+        depth = 0
+        end_idx = start_idx
+        for i in range(start_idx, len(content)):
+            if content[i] == "(":
+                depth += 1
+            elif content[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    end_idx = i + 1
+                    break
+
+        # Include the leading newline + whitespace before the block so that the
+        # next symbol (if any) retains its own leading newline/indentation.
+        line_start = content.rfind("\n", 0, start_idx)
+        actual_start = line_start if line_start != -1 else start_idx
+
+        return content[:actual_start] + content[end_idx:]
+
     def inject_symbol_into_schematic(
         self, schematic_path: Path, library_name: str, symbol_name: str
     ) -> bool:
         """
         Inject a symbol definition into a schematic's lib_symbols section.
-        Uses text manipulation to preserve file formatting.
+        If the symbol already exists (e.g. from a stale template), replace it with
+        the current definition from disk. Uses text manipulation to preserve formatting.
         """
         full_name = f"{library_name}:{symbol_name}"
 
         with open(schematic_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        # Check if symbol already exists
-        if f'(symbol "{full_name}"' in content:
-            logger.info(f"Symbol {full_name} already exists in schematic")
-            return True
-
-        # Extract symbol from library
+        # Extract symbol from library (fresh from disk)
         symbol_block = self.extract_symbol_from_library(library_name, symbol_name)
         if not symbol_block:
             raise ValueError(
                 f"Symbol '{symbol_name}' not found in library '{library_name}'"
             )
+
+        # If symbol already exists, remove the stale definition so we can re-inject fresh
+        if f'(symbol "{full_name}"' in content:
+            logger.info(f"Replacing existing symbol definition: {full_name}")
+            content = self._remove_lib_symbol_block(content, full_name)
 
         # Indent the block to match lib_symbols indentation (4 spaces for top-level)
         indented_lines = []
