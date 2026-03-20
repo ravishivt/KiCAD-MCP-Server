@@ -433,6 +433,12 @@ class DynamicSymbolLoader:
         x = _snap(x)
         y = _snap(y)
 
+        # Derive project name from .kicad_pro file so KiCad's annotation table is correct.
+        # KiCad renders the reference from (instances ...) not from (property "Reference" ...),
+        # so omitting this block causes all symbols to show as "R?", "C?", etc.
+        pro_files = list(schematic_path.parent.glob("*.kicad_pro"))
+        project_name = pro_files[0].stem if pro_files else schematic_path.stem
+
         instance_block = f"""  (symbol (lib_id "{full_lib_id}") (at {x} {y} 0) (unit 1)
     (in_bom yes) (on_board yes) (dnp no)
     (uuid "{new_uuid}")
@@ -447,6 +453,11 @@ class DynamicSymbolLoader:
     )
     (property "Datasheet" "~" (at {x} {y} 0)
       (effects (font (size 1.27 1.27)) (hide yes))
+    )
+    (instances
+      (project "{project_name}"
+        (path "/" (reference "{reference}") (unit 1))
+      )
     )
   )"""
 
