@@ -3475,6 +3475,11 @@ class KiCADInterface:
             with open(parent_file, "w", encoding="utf-8") as f:
                 f.write(content)
 
+            # Fix sub-sheet component instances so the hierarchical path entry
+            # is present for every component (required for ERC to resolve references
+            # correctly when the parent schematic is open in KiCad GUI).
+            self._fix_subsheet_instances(str(parent_file), content)
+
             return {
                 "success": True,
                 "sheet_uuid": sheet_block_uuid,
@@ -3539,7 +3544,9 @@ class KiCADInterface:
                     logger.warning(f"Sub-sheet not found: {sub_sheet_path}")
                     continue
 
-                target_path = f"/{sheet_block_uuid}"
+                parent_uuid_match = _re.search(r'\(uuid\s+([0-9a-fA-F-]+)\)', parent_content)
+                parent_uuid = parent_uuid_match.group(1) if parent_uuid_match else ""
+                target_path = f"/{parent_uuid}/{sheet_block_uuid}" if parent_uuid else f"/{sheet_block_uuid}"
 
                 # Read the sub-sheet
                 with open(sub_sheet_path, "r", encoding="utf-8") as f:
@@ -3553,64 +3560,49 @@ class KiCADInterface:
                 except Exception:
                     project_name = parent_file.stem
 
-                # Patch instances blocks using text manipulation to preserve formatting.
-                # Each component has (instances (project "name" (path "/<uuid>" ...))) .
-                # We need to add a path entry for target_path if not already present.
+                # Patch each (instances ...) block using balance-counting so this works
+                # for both single-line (MCP-generated) and multi-line (KiCad-saved) files.
+                def _find_balanced_end(s: str, start: int) -> int:
+                    depth = 0
+                    for j in range(start, len(s)):
+                        if s[j] == "(":
+                            depth += 1
+                        elif s[j] == ")":
+                            depth -= 1
+                            if depth == 0:
+                                return j
+                    return len(s) - 1
+
+                result_parts = []
+                pos = 0
                 changed = False
+                while True:
+                    idx = sub_content.find("(instances", pos)
+                    if idx == -1:
+                        result_parts.append(sub_content[pos:])
+                        break
+                    result_parts.append(sub_content[pos:idx])
+                    end = _find_balanced_end(sub_content, idx)
+                    block = sub_content[idx : end + 1]
 
-                def _add_instance_path(match_text: str) -> str:
-                    nonlocal changed
-                    if target_path in match_text:
-                        return match_text  # already has this path
-
-                    # Extract existing (path "..." ...) to copy reference/unit
-                    existing_path_match = _re.search(
-                        r'\(path\s+"([^"]+)"\s+\(reference\s+"([^"]+)"\)\s+\(unit\s+(\d+)\)',
-                        match_text,
-                    )
-                    if not existing_path_match:
-                        return match_text
-
-                    reference = existing_path_match.group(2)
-                    unit = existing_path_match.group(3)
-                    new_entry = f'        (path "{target_path}" (reference "{reference}") (unit {unit}))\n'
-
-                    # Insert new path entry inside the (project ...) block before closing )
-                    # Find the last ) in the instances block for the project block
-                    insert_pos = match_text.rfind(")")
-                    if insert_pos == -1:
-                        return match_text
-                    changed = True
-                    return match_text[:insert_pos] + new_entry + "      " + match_text[insert_pos:]
-
-                # Match each (instances ...) block
-                # Use line-by-line depth matching to find and patch each block
-                lines = sub_content.split("\n")
-                result_lines = []
-                i = 0
-                while i < len(lines):
-                    line = lines[i]
-                    if "(instances" not in line:
-                        result_lines.append(line)
-                        i += 1
-                        continue
-
-                    # Collect the full instances block
-                    block_lines = [line]
-                    depth = line.count("(") - line.count(")")
-                    i += 1
-                    while i < len(lines) and depth > 0:
-                        block_lines.append(lines[i])
-                        depth += lines[i].count("(") - lines[i].count(")")
-                        i += 1
-
-                    block_text = "\n".join(block_lines)
-                    patched = _add_instance_path(block_text)
-                    result_lines.extend(patched.split("\n"))
+                    if target_path not in block:
+                        existing = _re.search(
+                            r'\(reference\s+"([^"]+)"\)\s*\(unit\s+(\d+)\)', block
+                        )
+                        if existing:
+                            reference = existing.group(1)
+                            unit = existing.group(2)
+                            new_entry = f'(path "{target_path}" (reference "{reference}") (unit {unit}))'
+                            # Insert after the last existing path closes, before project+instances close
+                            # Block ends: ...last_path_close)) where )) = project + instances
+                            block = block[:-2] + " " + new_entry + "))"
+                            changed = True
+                    result_parts.append(block)
+                    pos = end + 1
 
                 if changed:
                     with open(sub_sheet_path, "w", encoding="utf-8") as f:
-                        f.write("\n".join(result_lines))
+                        f.write("".join(result_parts))
                     modified_sheets.append(str(sub_sheet_path))
                     logger.info(f"Fixed instances in {sub_sheet_path} for sheet-block {sheet_block_uuid}")
 
