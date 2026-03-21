@@ -535,6 +535,30 @@ class ConnectionManager:
             return []
 
     @staticmethod
+    def build_full_netmap(schematic, schematic_path) -> dict:
+        """
+        Build a complete {(ref, pin_num_str): net_name} mapping for the entire schematic.
+
+        Iterates all net labels, calls get_net_connections() for each, and inverts the
+        result. Callers should cache the returned dict if reusing within a single request.
+        """
+        net_names = set()
+        for label in getattr(schematic, "label", []):
+            if hasattr(label, "value"):
+                net_names.add(label.value)
+        for label in getattr(schematic, "global_label", []):
+            if hasattr(label, "value"):
+                net_names.add(label.value)
+
+        netmap = {}
+        for net_name in net_names:
+            for conn in ConnectionManager.get_net_connections(
+                schematic, net_name, Path(schematic_path)
+            ):
+                netmap[(conn["component"], str(conn["pin"]))] = net_name
+        return netmap
+
+    @staticmethod
     def generate_netlist(schematic: Schematic, schematic_path: Optional[Path] = None):
         """
         Generate a netlist from the schematic

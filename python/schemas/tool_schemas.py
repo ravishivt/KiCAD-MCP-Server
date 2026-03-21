@@ -1859,7 +1859,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "list_schematic_components",
         "title": "List Schematic Components",
-        "description": "Returns structured data for all components in the schematic including reference, value, footprint, position, and pins with coordinates. Preferred over get_schematic_view for data access.",
+        "description": "Returns structured data for all components in the schematic including reference, value, footprint, position, pins with coordinates, and a 'properties' dict containing all KiCad symbol properties (MPN, Description, Manufacturer, Datasheet, and any custom user-defined fields). Preferred over get_schematic_view for data access.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1882,7 +1882,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "list_schematic_nets",
         "title": "List Schematic Nets",
-        "description": "Fast nets-only query returning all net names and their pin connections. For full connectivity + component data, use generate_netlist.",
+        "description": "Returns all net names and their pin connections. Each connection now includes 'pinName' (semantic name, e.g. 'FB', 'EN') and 'pinType' (e.g. 'input', 'output', 'passive') in addition to the pin number. For full connectivity + component data, use generate_netlist. For a single compact view of the whole schematic, use get_schematic_summary.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1980,6 +1980,71 @@ SCHEMATIC_TOOLS = [
             },
             "required": ["schematicPath"]
         }
+    },
+    {
+        "name": "get_schematic_summary",
+        "title": "Get Schematic Summary",
+        "description": "Returns a compact, human-readable text summary of the entire schematic: a components table (ref, value, MPN, description, footprint) and a net adjacency list (net name → REF/pin_name connections). Nets are classified as ground, power_rail, clock, differential_pair, or signal. Optimised for LLM consumption — much more token-efficient than calling list_schematic_components + list_schematic_nets separately.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                }
+            },
+            "required": ["schematicPath"]
+        }
+    },
+    {
+        "name": "get_net_graph",
+        "title": "Get Component Net Graph",
+        "description": "Returns a compact text adjacency graph showing which components connect to which through signal nets. Each line shows: SOURCE(pin) --[NET]--> DEST1(pin), DEST2(pin). Power/ground nets with fewer than 3 real components are filtered by default (use skipPower=false to include all). Useful for tracing signal paths and identifying topology (e.g. voltage-divider feedback networks) without reconstructing from two separate flat lists.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                },
+                "skipPower": {
+                    "type": "boolean",
+                    "description": "Skip GND/power-rail nets that connect fewer than 3 real components (default: true)",
+                    "default": True
+                }
+            },
+            "required": ["schematicPath"]
+        }
+    },
+    {
+        "name": "find_single_pin_nets",
+        "title": "Find Single-Pin (Dangling) Nets",
+        "description": "Returns all nets that have exactly one connected pin — dangling/floating connections that are likely unintentional wiring errors or in-progress stubs. Each entry includes the net name, component reference, pin number, and semantic pin name. Especially useful during design review to catch open connections that ERC may miss depending on pin type.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                }
+            },
+            "required": ["schematicPath"]
+        }
+    },
+    {
+        "name": "classify_nets",
+        "title": "Classify Schematic Nets",
+        "description": "Classifies every net by type (ground, power_rail, clock, differential_pair, signal) and returns driver/load pin counts and fan-out. Classification heuristics: GND/AGND/DGND/PGND → ground; voltage-pattern names or PWR_FLAG present → power_rail; CLK/SCK/OSC in name → clock; _P/_N or +/- suffix pairs → differential_pair. Useful for quickly identifying structurally interesting nets (high fan-out, no driver, etc.) without manually counting.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                }
+            },
+            "required": ["schematicPath"]
+        }
     }
 ]
 
@@ -2030,4 +2095,4 @@ for tool in (PROJECT_TOOLS + BOARD_TOOLS + COMPONENT_TOOLS + ROUTING_TOOLS +
              SCHEMATIC_TOOLS + UI_TOOLS):
     TOOL_SCHEMAS[tool["name"]] = tool
 
-# Total: 46 tools with comprehensive schemas
+# Total: 50 tools with comprehensive schemas

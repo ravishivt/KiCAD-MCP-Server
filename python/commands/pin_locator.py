@@ -510,6 +510,17 @@ class PinLocator:
             logger.error(f"Error getting all symbol pins: {e}")
             return {}
 
+    def get_pin_metadata(self, schematic_path: Path, ref: str, pin_num: str) -> dict:
+        """
+        Return {"name": str, "type": str} for a given (ref, pin_num), or {} on miss.
+        Uses _get_lib_id() + get_symbol_pins() with their caches — fast for bulk lookups.
+        """
+        lib_id = self._get_lib_id(schematic_path, ref)
+        if not lib_id:
+            return {}
+        pins_def = self.get_symbol_pins(schematic_path, lib_id)
+        return pins_def.get(str(pin_num), {})
+
 
 if __name__ == "__main__":
     # Test pin location discovery

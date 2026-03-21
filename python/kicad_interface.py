@@ -410,6 +410,10 @@ class KiCADInterface:
             "get_schematic_view": self._handle_get_schematic_view,
             "list_schematic_components": self._handle_list_schematic_components,
             "list_schematic_nets": self._handle_list_schematic_nets,
+            "find_single_pin_nets": self._handle_find_single_pin_nets,
+            "classify_nets": self._handle_classify_nets,
+            "get_net_graph": self._handle_get_net_graph,
+            "get_schematic_summary": self._handle_get_schematic_summary,
             "list_schematic_wires": self._handle_list_schematic_wires,
             "list_schematic_labels": self._handle_list_schematic_labels,
             "move_schematic_component": self._handle_move_schematic_component,
@@ -477,6 +481,79 @@ class KiCADInterface:
         # Save command
         "save_project": "_ipc_save_project",
     }
+
+    # KiCad-internal property names that are not user-visible component properties
+    _KICAD_INTERNAL_PROPS = frozenset(
+        {"ki_keywords", "ki_description", "ki_fp_filters", "ki_locked", "ki_model"}
+    )
+
+    @staticmethod
+    def _find_matching_paren(s: str, start: int) -> int:
+        """Return index of the closing ')' that matches the '(' at position start."""
+        depth = 0
+        i = start
+        while i < len(s):
+            if s[i] == "(":
+                depth += 1
+            elif s[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    @staticmethod
+    def _extract_component_properties(block_text: str, exclude_internal: bool = True) -> dict:
+        """
+        Extract all (property "Name" "Value" ...) entries from a placed symbol block.
+        Returns {"Name": "Value", ...}.  When exclude_internal=True, ki_* fields are skipped.
+        """
+        import re
+        prop_pattern = re.compile(r'\(property\s+"([^"]*)"\s+"([^"]*)"')
+        props = {}
+        for m in prop_pattern.finditer(block_text):
+            name, value = m.group(1), m.group(2)
+            if exclude_internal and name in KiCADInterface._KICAD_INTERNAL_PROPS:
+                continue
+            props[name] = value
+        return props
+
+    @staticmethod
+    def _find_placed_symbol_block(content: str, reference: str):
+        """
+        Find the placed symbol block for *reference* in schematic file content.
+        Returns (block_text, block_start, block_end) or (None, -1, -1) if not found.
+        Skips the lib_symbols section.
+        """
+        import re
+        lib_sym_pos = content.find("(lib_symbols")
+        lib_sym_end = (
+            KiCADInterface._find_matching_paren(content, lib_sym_pos)
+            if lib_sym_pos >= 0
+            else -1
+        )
+        pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
+        search_start = 0
+        while True:
+            m = pattern.search(content, search_start)
+            if not m:
+                break
+            pos = m.start()
+            if lib_sym_pos >= 0 and lib_sym_pos <= pos <= lib_sym_end:
+                search_start = lib_sym_end + 1
+                continue
+            end = KiCADInterface._find_matching_paren(content, pos)
+            if end < 0:
+                search_start = pos + 1
+                continue
+            block_text = content[pos: end + 1]
+            if re.search(
+                r'\(property\s+"Reference"\s+"' + re.escape(reference) + r'"',
+                block_text,
+            ):
+                return block_text, pos, end
+            search_start = end + 1
+        return None, -1, -1
 
     def handle_command(self, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Route command to appropriate handler, preferring IPC when available"""
@@ -1187,11 +1264,13 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_get_schematic_component(self, params):
-        """Return full component info: position and all field values with their (at x y angle) positions."""
+        """Return full component info: position, all field values, properties, and pin→net assignments."""
         logger.info("Getting schematic component info")
         try:
-            from pathlib import Path
             import re
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+            from commands.connection_schematic import ConnectionManager as CM
 
             schematic_path = params.get("schematicPath")
             reference = params.get("reference")
@@ -1211,57 +1290,16 @@ class KiCADInterface:
             with open(sch_file, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            def find_matching_paren(s, start):
-                depth = 0
-                i = start
-                while i < len(s):
-                    if s[i] == "(":
-                        depth += 1
-                    elif s[i] == ")":
-                        depth -= 1
-                        if depth == 0:
-                            return i
-                    i += 1
-                return -1
-
-            # Skip lib_symbols section
-            lib_sym_pos = content.find("(lib_symbols")
-            lib_sym_end = (
-                find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
+            # Use shared helper to find the placed symbol block
+            block_text, block_start, block_end = KiCADInterface._find_placed_symbol_block(
+                content, reference
             )
 
-            # Find the placed symbol block for this reference
-            block_start = block_end = None
-            search_start = 0
-            pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
-            while True:
-                m = pattern.search(content, search_start)
-                if not m:
-                    break
-                pos = m.start()
-                if lib_sym_pos >= 0 and lib_sym_pos <= pos <= lib_sym_end:
-                    search_start = lib_sym_end + 1
-                    continue
-                end = find_matching_paren(content, pos)
-                if end < 0:
-                    search_start = pos + 1
-                    continue
-                block_text = content[pos : end + 1]
-                if re.search(
-                    r'\(property\s+"Reference"\s+"' + re.escape(reference) + r'"',
-                    block_text,
-                ):
-                    block_start, block_end = pos, end
-                    break
-                search_start = end + 1
-
-            if block_start is None:
+            if block_text is None:
                 return {
                     "success": False,
                     "message": f"Component '{reference}' not found in schematic",
                 }
-
-            block_text = content[block_start : block_end + 1]
 
             # Extract component position: first (at x y angle) in the symbol header line
             comp_at = re.search(
@@ -1277,7 +1315,7 @@ class KiCADInterface:
             else:
                 comp_pos = None
 
-            # Extract all properties with their at positions
+            # Extract all properties with their at positions (for backward compat: keep fields)
             prop_pattern = re.compile(
                 r'\(property\s+"([^"]*)"\s+"([^"]*)"\s+\(at\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)\s*\)'
             )
@@ -1297,11 +1335,48 @@ class KiCADInterface:
                     "angle": float(angle),
                 }
 
+            # All properties as flat name→value dict (excludes ki_* internal props)
+            properties = KiCADInterface._extract_component_properties(block_text)
+
+            # ── Pin→net assignments ───────────────────────────────────────────
+            pins = []
+            try:
+                schematic = SchematicManager.load_schematic(schematic_path)
+                netmap = CM.build_full_netmap(schematic, schematic_path)
+
+                locator = PinLocator()
+
+                # Get lib_id from block_text
+                lib_id_m = re.search(r'\(lib_id\s+"([^"]+)"', block_text)
+                lib_id = lib_id_m.group(1) if lib_id_m else None
+
+                pins_def = locator.get_symbol_pins(sch_file, lib_id) if lib_id else {}
+                all_pins = locator.get_all_symbol_pins(sch_file, reference)
+
+                def _pin_sort_key(pn):
+                    return int(pn) if pn.isdigit() else pn
+
+                for pin_num in sorted(all_pins.keys(), key=_pin_sort_key):
+                    pin_data = pins_def.get(str(pin_num), {})
+                    net = netmap.get((reference, str(pin_num)), "unconnected")
+                    coords = all_pins[pin_num]
+                    pins.append({
+                        "pinNumber": pin_num,
+                        "pinName": pin_data.get("name", pin_num),
+                        "pinType": pin_data.get("type", "unknown"),
+                        "connectedNet": net,
+                        "position": {"x": coords[0], "y": coords[1]},
+                    })
+            except Exception as pin_err:
+                logger.warning(f"Could not build pin→net assignments: {pin_err}")
+
             return {
                 "success": True,
                 "reference": reference,
                 "position": comp_pos,
                 "fields": fields,
+                "properties": properties,
+                "pins": pins,
             }
 
         except Exception as e:
@@ -2411,6 +2486,10 @@ class KiCADInterface:
             if not schematic:
                 return {"success": False, "message": "Failed to load schematic"}
 
+            # Read raw content once for property extraction
+            with open(sch_file, "r", encoding="utf-8") as f:
+                raw_content = f.read()
+
             # Optional filters
             filter_params = params.get("filter", {})
             lib_id_filter = filter_params.get("libId", "")
@@ -2458,6 +2537,18 @@ class KiCADInterface:
                     "uuid": str(uuid_val),
                 }
 
+                # Extract all KiCad properties (MPN, Description, Manufacturer, etc.)
+                try:
+                    block_text, _, _ = KiCADInterface._find_placed_symbol_block(
+                        raw_content, ref
+                    )
+                    if block_text:
+                        comp["properties"] = KiCADInterface._extract_component_properties(
+                            block_text
+                        )
+                except Exception:
+                    pass
+
                 # Get pins if available
                 try:
                     all_pins = locator.get_all_symbol_pins(sch_file, ref)
@@ -2498,6 +2589,7 @@ class KiCADInterface:
         logger.info("Listing schematic nets")
         try:
             from pathlib import Path
+            from commands.pin_locator import PinLocator
 
             schematic_path = params.get("schematicPath")
             if not schematic_path:
@@ -2506,6 +2598,9 @@ class KiCADInterface:
             schematic = SchematicManager.load_schematic(schematic_path)
             if not schematic:
                 return {"success": False, "message": "Failed to load schematic"}
+
+            sch_path = Path(schematic_path)
+            locator = PinLocator()
 
             # Get all net names from labels and global labels
             net_names = set()
@@ -2521,8 +2616,19 @@ class KiCADInterface:
             nets = []
             for net_name in sorted(net_names):
                 connections = ConnectionManager.get_net_connections(
-                    schematic, net_name, Path(schematic_path)
+                    schematic, net_name, sch_path
                 )
+                # Enrich each connection with pin name and type
+                for conn in connections:
+                    try:
+                        meta = locator.get_pin_metadata(
+                            sch_path, conn["component"], str(conn["pin"])
+                        )
+                        conn["pinName"] = meta.get("name", str(conn["pin"]))
+                        conn["pinType"] = meta.get("type", "unknown")
+                    except Exception:
+                        conn["pinName"] = str(conn["pin"])
+                        conn["pinType"] = "unknown"
                 nets.append(
                     {
                         "name": net_name,
@@ -2536,6 +2642,439 @@ class KiCADInterface:
             logger.error(f"Error listing schematic nets: {e}")
             import traceback
 
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_find_single_pin_nets(self, params):
+        """Return all nets that have exactly one connected pin (dangling connections)."""
+        logger.info("Finding single-pin nets")
+        try:
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            sch_path = Path(schematic_path)
+            if not sch_path.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            net_names = set()
+            for label in getattr(schematic, "label", []):
+                if hasattr(label, "value"):
+                    net_names.add(label.value)
+            for label in getattr(schematic, "global_label", []):
+                if hasattr(label, "value"):
+                    net_names.add(label.value)
+
+            locator = PinLocator()
+            single_pin_nets = []
+            for net_name in sorted(net_names):
+                connections = ConnectionManager.get_net_connections(
+                    schematic, net_name, sch_path
+                )
+                if len(connections) == 1:
+                    conn = connections[0]
+                    try:
+                        meta = locator.get_pin_metadata(
+                            sch_path, conn["component"], str(conn["pin"])
+                        )
+                        pin_name = meta.get("name", str(conn["pin"]))
+                    except Exception:
+                        pin_name = str(conn["pin"])
+                    single_pin_nets.append({
+                        "netName": net_name,
+                        "component": conn["component"],
+                        "pinNumber": str(conn["pin"]),
+                        "pinName": pin_name,
+                    })
+
+            return {
+                "success": True,
+                "singlePinNets": single_pin_nets,
+                "count": len(single_pin_nets),
+            }
+
+        except Exception as e:
+            logger.error(f"Error finding single-pin nets: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_classify_nets(self, params):
+        """Classify all nets by type and return driver/load pin counts."""
+        logger.info("Classifying nets")
+        try:
+            import re
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+            from commands.connection_schematic import ConnectionManager as CM
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            sch_path = Path(schematic_path)
+            if not sch_path.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            # Build full netmap and invert to net_name -> [(ref, pin_num)]
+            netmap = CM.build_full_netmap(schematic, schematic_path)
+            nets_to_conns = {}
+            for (ref, pin_num), net_name in netmap.items():
+                nets_to_conns.setdefault(net_name, []).append((ref, pin_num))
+
+            # Also collect nets that may have labels but no matched pins
+            all_net_names = set()
+            for label in getattr(schematic, "label", []):
+                if hasattr(label, "value"):
+                    all_net_names.add(label.value)
+            for label in getattr(schematic, "global_label", []):
+                if hasattr(label, "value"):
+                    all_net_names.add(label.value)
+            # Add any nets found via netmap
+            all_net_names.update(nets_to_conns.keys())
+
+            locator = PinLocator()
+            _DRIVER_TYPES = {"output", "power_out", "tri_state", "open_collector", "open_emitter"}
+            _LOAD_TYPES = {"input", "passive", "power_in", "no_connect"}
+
+            classified = []
+            for net_name in sorted(all_net_names):
+                conns = nets_to_conns.get(net_name, [])
+                fanout = len(conns)
+                driver_count = 0
+                load_count = 0
+                has_pwr_symbol = False
+
+                for ref, pin_num in conns:
+                    if ref.startswith("#PWR") or ref.startswith("#FLG"):
+                        has_pwr_symbol = True
+                        continue
+                    try:
+                        meta = locator.get_pin_metadata(sch_path, ref, pin_num)
+                        ptype = meta.get("type", "")
+                        if ptype in _DRIVER_TYPES:
+                            driver_count += 1
+                        elif ptype in _LOAD_TYPES:
+                            load_count += 1
+                    except Exception:
+                        pass
+
+                # Classify (priority order: ground > power_rail > clock > diff_pair > signal)
+                net_upper = net_name.upper()
+                if re.match(r'^(A?D?P?S?GND|EARTH|AGND|DGND|PGND|SGND)', net_upper):
+                    net_type = "ground"
+                elif (
+                    has_pwr_symbol
+                    or re.match(
+                        r'^(\+?[\d]+V[\d]*[A-Z0-9_]*|VCC|VDD|VIN|VBAT|VREF|AVCC|DVCC|PVCC|3V3|5V|1V8|3\.3V|5\.0V)',
+                        net_upper,
+                    )
+                ):
+                    net_type = "power_rail"
+                elif re.search(r'(CLK|SCK|MCLK|XTAL|OSC)', net_upper):
+                    net_type = "clock"
+                elif (net_name.endswith("_P") or net_name.endswith("_N")) and (
+                    net_name[:-2] + "_N" in all_net_names
+                    or net_name[:-2] + "_P" in all_net_names
+                ):
+                    net_type = "differential_pair"
+                elif (net_name.endswith("+") or net_name.endswith("-")) and (
+                    net_name[:-1] + "-" in all_net_names
+                    or net_name[:-1] + "+" in all_net_names
+                ):
+                    net_type = "differential_pair"
+                else:
+                    net_type = "signal"
+
+                classified.append({
+                    "netName": net_name,
+                    "type": net_type,
+                    "fanout": fanout,
+                    "driverCount": driver_count,
+                    "loadCount": load_count,
+                })
+
+            return {"success": True, "nets": classified, "count": len(classified)}
+
+        except Exception as e:
+            logger.error(f"Error classifying nets: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_get_net_graph(self, params):
+        """Return a compact component-to-component adjacency graph via named nets."""
+        logger.info("Building net graph")
+        try:
+            import re
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            skip_power = params.get("skipPower", True)
+
+            sch_path = Path(schematic_path)
+            if not sch_path.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            net_names = set()
+            for label in getattr(schematic, "label", []):
+                if hasattr(label, "value"):
+                    net_names.add(label.value)
+            for label in getattr(schematic, "global_label", []):
+                if hasattr(label, "value"):
+                    net_names.add(label.value)
+
+            locator = PinLocator()
+            _DRIVER_TYPES = {"output", "power_out", "tri_state", "open_collector", "open_emitter"}
+
+            def _is_power_or_ground(name):
+                n = name.upper()
+                return bool(
+                    re.match(r'^(A?D?P?S?GND|EARTH|AGND|DGND|PGND|SGND)', n)
+                    or re.match(
+                        r'^(\+?[\d]+V[\d]*[A-Z0-9_]*|VCC|VDD|VIN|VBAT|VREF|AVCC|DVCC|PVCC|3V3|5V|1V8)',
+                        n,
+                    )
+                )
+
+            lines = []
+            for net_name in sorted(net_names):
+                connections = ConnectionManager.get_net_connections(
+                    schematic, net_name, sch_path
+                )
+
+                # Filter out power symbols (#PWR, #FLG)
+                real_conns = [c for c in connections if not c["component"].startswith("#")]
+
+                if skip_power and _is_power_or_ground(net_name) and len(real_conns) < 3:
+                    continue
+
+                if len(real_conns) < 2:
+                    continue  # Nothing to show for isolated or single-pin nets
+
+                # Enrich with pin names and types
+                enriched = []
+                for conn in real_conns:
+                    try:
+                        meta = locator.get_pin_metadata(
+                            sch_path, conn["component"], str(conn["pin"])
+                        )
+                        enriched.append((
+                            conn["component"],
+                            meta.get("name", str(conn["pin"])),
+                            meta.get("type", ""),
+                        ))
+                    except Exception:
+                        enriched.append((conn["component"], str(conn["pin"]), ""))
+
+                drivers = [
+                    (ref, pin) for ref, pin, ptype in enriched if ptype in _DRIVER_TYPES
+                ]
+                non_drivers = [
+                    (ref, pin) for ref, pin, ptype in enriched if ptype not in _DRIVER_TYPES
+                ]
+
+                if drivers:
+                    src_ref, src_pin = drivers[0]
+                    dests = ", ".join(f"{r}({p})" for r, p in non_drivers)
+                    if len(drivers) > 1:
+                        extra_drivers = ", ".join(f"{r}({p})" for r, p in drivers[1:])
+                        dests = (extra_drivers + ", " + dests).strip(", ")
+                    lines.append(f"{src_ref}({src_pin}) --[{net_name}]--> {dests}")
+                else:
+                    all_nodes = ", ".join(f"{r}({p})" for r, p, _ in enriched)
+                    lines.append(f"[{net_name}]: {all_nodes}")
+
+            graph_text = "\n".join(lines)
+            return {"success": True, "graph": graph_text, "netCount": len(lines)}
+
+        except Exception as e:
+            logger.error(f"Error building net graph: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_get_schematic_summary(self, params):
+        """Return a compact, LLM-optimised text summary of the entire schematic."""
+        logger.info("Getting schematic summary")
+        try:
+            import re
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+            from commands.connection_schematic import ConnectionManager as CM
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            sch_path = Path(schematic_path)
+            if not sch_path.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            with open(sch_path, "r", encoding="utf-8") as f:
+                raw_content = f.read()
+
+            locator = PinLocator()
+
+            # ── Components table ──────────────────────────────────────────────
+            rows = []
+            for symbol in schematic.symbol:
+                if not hasattr(symbol.property, "Reference"):
+                    continue
+                ref = symbol.property.Reference.value
+                if ref.startswith("_TEMPLATE") or ref.startswith("#"):
+                    continue
+                lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
+                if lib_id.lower().startswith("power:"):
+                    continue  # Skip pure power symbols from component table
+
+                value = (
+                    symbol.property.Value.value
+                    if hasattr(symbol.property, "Value") else ""
+                )
+                footprint = (
+                    symbol.property.Footprint.value
+                    if hasattr(symbol.property, "Footprint") else ""
+                )
+                # Abbreviate footprint to just the last component
+                fp_short = footprint.split(":")[-1] if footprint else "-"
+
+                props = {}
+                try:
+                    block_text, _, _ = KiCADInterface._find_placed_symbol_block(
+                        raw_content, ref
+                    )
+                    if block_text:
+                        props = KiCADInterface._extract_component_properties(block_text)
+                except Exception:
+                    pass
+
+                rows.append({
+                    "ref": ref,
+                    "value": value or "-",
+                    "mpn": props.get("MPN", "-"),
+                    "description": props.get("Description", "-"),
+                    "footprint": fp_short,
+                })
+
+            # Sort by reference prefix then number
+            def _ref_sort_key(r):
+                m = re.match(r'^([A-Za-z_]+)(\d+)', r["ref"])
+                return (m.group(1), int(m.group(2))) if m else (r["ref"], 0)
+
+            rows.sort(key=_ref_sort_key)
+
+            # ── Net adjacency list ────────────────────────────────────────────
+            netmap = CM.build_full_netmap(schematic, schematic_path)
+            nets_to_conns = {}
+            for (ref, pin_num), net_name in netmap.items():
+                nets_to_conns.setdefault(net_name, []).append((ref, pin_num))
+
+            # Classification helper (same heuristics as classify_nets)
+            all_net_names = set(nets_to_conns.keys())
+            for label in getattr(schematic, "label", []):
+                if hasattr(label, "value"):
+                    all_net_names.add(label.value)
+            for label in getattr(schematic, "global_label", []):
+                if hasattr(label, "value"):
+                    all_net_names.add(label.value)
+
+            def _classify(net_name, conns):
+                n = net_name.upper()
+                has_pwr = any(
+                    r.startswith("#PWR") or r.startswith("#FLG") for r, _ in conns
+                )
+                if re.match(r'^(A?D?P?S?GND|EARTH|AGND|DGND|PGND|SGND)', n):
+                    return "ground"
+                if has_pwr or re.match(
+                    r'^(\+?[\d]+V[\d]*[A-Z0-9_]*|VCC|VDD|VIN|VBAT|VREF|AVCC|DVCC|PVCC|3V3|5V|1V8)',
+                    n,
+                ):
+                    return "power_rail"
+                if re.search(r'(CLK|SCK|MCLK|XTAL|OSC)', n):
+                    return "clock"
+                if (net_name.endswith("_P") or net_name.endswith("_N")) and (
+                    net_name[:-2] + "_N" in all_net_names
+                    or net_name[:-2] + "_P" in all_net_names
+                ):
+                    return "differential_pair"
+                if (net_name.endswith("+") or net_name.endswith("-")) and (
+                    net_name[:-1] + "-" in all_net_names
+                    or net_name[:-1] + "+" in all_net_names
+                ):
+                    return "differential_pair"
+                return "signal"
+
+            # ── Format text output ────────────────────────────────────────────
+            out = []
+
+            # Component table
+            out.append(f"=== COMPONENTS ({len(rows)}) ===")
+            out.append(
+                f"{'REF':<8} {'VALUE':<14} {'MPN':<22} {'DESCRIPTION':<26} FOOTPRINT"
+            )
+            out.append("-" * 90)
+            for r in rows:
+                out.append(
+                    f"{r['ref']:<8} {r['value']:<14} {r['mpn']:<22} {r['description']:<26} {r['footprint']}"
+                )
+
+            # Net adjacency list
+            out.append("")
+            out.append(f"=== NETS ({len(all_net_names)}) ===")
+            out.append(f"{'TYPE':<16} {'NAME':<22} CONNECTIONS")
+            out.append("-" * 90)
+
+            for net_name in sorted(all_net_names):
+                conns = nets_to_conns.get(net_name, [])
+                net_type = _classify(net_name, conns)
+
+                conn_strs = []
+                for ref, pin_num in sorted(conns):
+                    if ref.startswith("#"):
+                        continue
+                    try:
+                        meta = locator.get_pin_metadata(sch_path, ref, pin_num)
+                        pin_label = meta.get("name", pin_num)
+                    except Exception:
+                        pin_label = pin_num
+                    conn_strs.append(f"{ref}/{pin_label}")
+
+                conn_str = ", ".join(conn_strs)
+                if len(conn_str) > 64:
+                    conn_str = conn_str[:61] + "..."
+
+                out.append(f"{net_type:<16} {net_name:<22} {conn_str}")
+
+            summary_text = "\n".join(out)
+            return {"success": True, "summary": summary_text}
+
+        except Exception as e:
+            logger.error(f"Error getting schematic summary: {e}")
+            import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
