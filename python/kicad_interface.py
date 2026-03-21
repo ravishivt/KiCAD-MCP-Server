@@ -1006,6 +1006,9 @@ class KiCADInterface:
                     }
 
                     if include_pins:
+                        # Invalidate the stale cached Schematic object — loader.add_component
+                        # just wrote a new version to disk, so the cached parse is out of date.
+                        locator._schematic_cache.pop(str(schematic_file), None)
                         pins_raw = locator.get_all_symbol_pins(schematic_file, reference) or {}
                         pins_def = locator.get_symbol_pins(schematic_file, symbol) or {}
                         pins = {}
@@ -1016,6 +1019,11 @@ class KiCADInterface:
                                 "name": pins_def.get(str(pin_num), {}).get("name", str(pin_num)),
                             }
                         entry["pins"] = pins
+                        if not pins:
+                            entry["pins_error"] = (
+                                f"Pin extraction returned no data for {reference} ({symbol}). "
+                                "Use get_schematic_pin_locations as a follow-up if pin coordinates are needed."
+                            )
 
                     results.append(entry)
 
@@ -4013,8 +4021,12 @@ class KiCADInterface:
                     return any(pat in desc for pat in BENIGN_PATTERNS)
 
                 all_violations = []
+                sheets_checked = []
                 for sheet in erc_data.get("sheets", []):
                     all_violations.extend(sheet.get("violations", []))
+                    fname = sheet.get("filename") or sheet.get("source") or ""
+                    if fname:
+                        sheets_checked.append(os.path.basename(fname))
 
                 for v in all_violations:
                     vseverity = v.get("severity", "error")
@@ -4065,6 +4077,7 @@ class KiCADInterface:
                     "message": f"ERC complete: {len(violations)} violation(s)",
                     "coordinate_units": "mm",
                     "notes": notes,
+                    "sheets_checked": sheets_checked,
                     "summary": {
                         "total": len(violations),
                         "actionable": sum(1 for v in violations if not v.get("benign")),

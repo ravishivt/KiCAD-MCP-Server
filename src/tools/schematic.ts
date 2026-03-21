@@ -136,7 +136,7 @@ export function registerSchematicTools(
   // Batch add multiple components in one call
   server.tool(
     "batch_add_components",
-    "Place multiple schematic components in a single call. Prefer this over calling add_schematic_component repeatedly — it injects all symbol definitions and creates all instances in one round-trip, returning snapped positions and pin coordinates for each. Each component uses 'Library:SymbolName' format. If any component fails, the rest are still placed and errors are reported per-component.",
+    "Place multiple schematic components in a single call. Prefer this over calling add_schematic_component repeatedly — it injects all symbol definitions and creates all instances in one round-trip. Each component uses 'Library:SymbolName' format. If any component fails, the rest are still placed and errors are reported per-component. NOTE: includePins defaults to false and should stay false in almost all cases — batch_connect and connect_to_net accept pin name or number directly and never need pin coordinates. Only set includePins:true if you specifically need absolute schematic coordinates for manual wire routing.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       components: z.array(z.object({
@@ -171,6 +171,7 @@ export function registerSchematicTools(
           );
           lines.push(`  ${comp.reference} (${comp.symbol}) @ (${pos?.x}, ${pos?.y})`);
           if (pinLines.length) lines.push(...pinLines);
+          if (comp.pins_error) lines.push(`      [pins_error] ${comp.pins_error}`);
         }
         if (result.errors?.length) {
           lines.push("Errors:");
@@ -1282,6 +1283,9 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
         const benignCount = violations.length - actionable.length;
 
         const lines: string[] = [];
+        if (result.sheets_checked?.length) {
+          lines.push(`Checked: ${(result.sheets_checked as string[]).join(", ")}`);
+        }
         const s = result.summary?.by_severity ?? {};
         lines.push(`ERC: ${s.error ?? 0} error(s), ${s.warning ?? 0} warning(s)${errorsOnly ? " [showing errors only]" : ""}`);
         if (benignCount > 0) lines.push(`  (${benignCount} benign library warnings hidden)`);

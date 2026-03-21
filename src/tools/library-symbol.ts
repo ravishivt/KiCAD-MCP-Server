@@ -225,6 +225,41 @@ Returns symbol references that can be used directly in schematics.`,
     }
   );
 
+  // List pins for multiple symbols in one call
+  server.tool(
+    "batch_list_symbol_pins",
+    "Return pin names, numbers, and types for multiple symbols in a single call. Use instead of calling list_symbol_pins repeatedly when placing a subcircuit — saves 5–10 round-trips. Each result has the same shape as list_symbol_pins. Pass schematicPath to resolve project-local symbols.",
+    {
+      symbols: z.array(z.string())
+        .describe("Array of symbols in 'Library:SymbolName' format (e.g., ['Device:R', 'Device:C', 'Device:FerriteBead'])"),
+      schematicPath: z.string().optional()
+        .describe("Path to .kicad_sch — enables project-local sym-lib-table lookup for project-specific symbols"),
+    },
+    async (args: { symbols: string[]; schematicPath?: string }) => {
+      const result = await callKicadScript("batch_list_symbol_pins", args);
+      if (result.success !== false || (result.symbols && Object.keys(result.symbols).length > 0)) {
+        const lines: string[] = [];
+        for (const [sym, data] of Object.entries(result.symbols || {})) {
+          const d = data as any;
+          const pinLines = (d.pins || []).map((p: any) => `    Pin ${p.number} (${p.name}) — type: ${p.type}`);
+          lines.push(`${sym} — ${d.pin_count} pin(s):`);
+          lines.push(...pinLines);
+        }
+        if (result.errors && Object.keys(result.errors).length > 0) {
+          lines.push("\nErrors:");
+          for (const [sym, err] of Object.entries(result.errors as Record<string, any>)) {
+            const hint = err.suggestions?.length ? ` (did you mean: ${err.suggestions.join(", ")}?)` : "";
+            lines.push(`  ${sym}: ${err.message || err}${hint}`);
+          }
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+      return {
+        content: [{ type: "text", text: `Failed to list pins: ${result.message || "Unknown error"}` }]
+      };
+    }
+  );
+
   // Search symbol names across KiCAD standard libraries (fast name/lib search)
   server.tool(
     "search_schematic_symbols",

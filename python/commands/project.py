@@ -226,10 +226,36 @@ class ProjectCommands:
         """Get information about the current project"""
         try:
             if not self.board:
+                # Try to find a .kicad_pro in the current working directory and
+                # return project name + schematic list even when no board is open
+                # in the PCB editor.
+                import glob as glob_mod
+                import json as json_mod
+
+                pro_files = glob_mod.glob(os.path.join(os.getcwd(), "*.kicad_pro"))
+                if not pro_files:
+                    return {
+                        "success": False,
+                        "message": "No board is loaded",
+                        "errorDetails": "Load or create a board first",
+                    }
+
+                pro_path = pro_files[0]
+                pro_name = os.path.splitext(os.path.basename(pro_path))[0]
+                pro_dir = os.path.dirname(pro_path)
+
+                # Collect all schematic files in the project directory
+                sch_files = sorted(glob_mod.glob(os.path.join(pro_dir, "*.kicad_sch")))
+                schematics = [os.path.basename(f) for f in sch_files]
+
                 return {
-                    "success": False,
-                    "message": "No board is loaded",
-                    "errorDetails": "Load or create a board first",
+                    "success": True,
+                    "note": "No board loaded in PCB editor; project info derived from .kicad_pro on disk",
+                    "project": {
+                        "name": pro_name,
+                        "path": pro_path,
+                        "schematics": schematics,
+                    },
                 }
 
             title_block = self.board.GetTitleBlock()
