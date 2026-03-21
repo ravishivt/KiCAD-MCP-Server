@@ -24,6 +24,22 @@ def _snap(val: float) -> float:
     return round(round(val / _SCHEMATIC_GRID_MM) * _SCHEMATIC_GRID_MM, 4)
 
 
+def _find_project_root(start_dir: Path) -> Path:
+    """Walk up from start_dir to find the nearest directory containing a .kicad_pro file.
+
+    Returns start_dir if no .kicad_pro is found (safe fallback).
+    """
+    current = start_dir.resolve()
+    while True:
+        if list(current.glob("*.kicad_pro")):
+            return current
+        parent = current.parent
+        if parent == current:  # filesystem root
+            break
+        current = parent
+    return start_dir
+
+
 class DynamicSymbolLoader:
     """
     Dynamically loads symbols from KiCad library files and injects them into schematics.
@@ -480,7 +496,7 @@ class DynamicSymbolLoader:
         # Derive project name from .kicad_pro file so KiCad's annotation table is correct.
         # KiCad renders the reference from (instances ...) not from (property "Reference" ...),
         # so omitting this block causes all symbols to show as "R?", "C?", etc.
-        pro_files = list(schematic_path.parent.glob("*.kicad_pro"))
+        pro_files = list(_find_project_root(schematic_path.parent).glob("*.kicad_pro"))
         project_name = pro_files[0].stem if pro_files else schematic_path.stem
 
         with open(schematic_path, "r", encoding="utf-8") as f:

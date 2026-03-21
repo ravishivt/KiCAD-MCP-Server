@@ -568,6 +568,115 @@ class WireManager:
             return False
 
     @staticmethod
+    def delete_all_labels(schematic_path: Path) -> int:
+        """Remove all net labels from the schematic in a single file read/write.
+
+        Returns the number of labels deleted.
+        """
+        try:
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                sch_content = f.read()
+
+            sch_data = sexpdata.loads(sch_content)
+            before = len(sch_data)
+            sch_data = [
+                item for item in sch_data
+                if not (isinstance(item, list) and len(item) > 0 and item[0] == Symbol("label"))
+            ]
+            deleted = before - len(sch_data)
+
+            with open(schematic_path, "w", encoding="utf-8") as f:
+                f.write(sexpdata.dumps(sch_data))
+
+            logger.info(f"Deleted {deleted} labels from {schematic_path}")
+            return deleted
+
+        except Exception as e:
+            logger.error(f"Error deleting all labels: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return 0
+
+    @staticmethod
+    def delete_labels_batch(
+        schematic_path: Path,
+        items: List[dict],
+        tolerance: float = 0.5,
+    ) -> dict:
+        """Delete multiple net labels in a single file read/write.
+
+        Args:
+            schematic_path: Path to .kicad_sch file
+            items: List of dicts with keys 'netName' (str) and optional 'position' {x, y}
+            tolerance: Maximum coordinate difference to consider a match (mm)
+
+        Returns:
+            {"deleted": int, "notFound": [str]}
+        """
+        try:
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                sch_content = f.read()
+
+            sch_data = sexpdata.loads(sch_content)
+
+            # Build a lookup: netName -> list of positions requested (None = any)
+            targets: List[dict] = []
+            for item in items:
+                targets.append({
+                    "netName": item.get("netName", ""),
+                    "position": item.get("position"),
+                    "matched": False,
+                })
+
+            new_sch_data = []
+            for elem in sch_data:
+                if not (isinstance(elem, list) and len(elem) > 0 and elem[0] == Symbol("label")):
+                    new_sch_data.append(elem)
+                    continue
+
+                label_name = elem[1] if len(elem) > 1 else None
+                at_entry = next(
+                    (p for p in elem[1:] if isinstance(p, list) and len(p) >= 3 and p[0] == Symbol("at")),
+                    None,
+                )
+                lx = float(at_entry[1]) if at_entry else None
+                ly = float(at_entry[2]) if at_entry else None
+
+                consumed = False
+                for target in targets:
+                    if target["matched"]:
+                        continue
+                    if label_name != target["netName"]:
+                        continue
+                    pos = target["position"]
+                    if pos is not None:
+                        if lx is None or ly is None:
+                            continue
+                        if not (abs(lx - pos["x"]) < tolerance and abs(ly - pos["y"]) < tolerance):
+                            continue
+                    target["matched"] = True
+                    consumed = True
+                    break
+
+                if not consumed:
+                    new_sch_data.append(elem)
+
+            deleted = sum(1 for t in targets if t["matched"])
+            not_found = [t["netName"] for t in targets if not t["matched"]]
+
+            with open(schematic_path, "w", encoding="utf-8") as f:
+                f.write(sexpdata.dumps(new_sch_data))
+
+            logger.info(f"Batch deleted {deleted} labels, {len(not_found)} not found")
+            return {"deleted": deleted, "notFound": not_found}
+
+        except Exception as e:
+            logger.error(f"Error batch deleting labels: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"deleted": 0, "notFound": [item.get("netName", "") for item in items]}
+
+    @staticmethod
     def create_orthogonal_path(
         start: List[float], end: List[float], prefer_horizontal_first: bool = True
     ) -> List[List[float]]:

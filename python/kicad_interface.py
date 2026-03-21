@@ -421,6 +421,7 @@ class KiCADInterface:
             "move_schematic_component": self._handle_move_schematic_component,
             "rotate_schematic_component": self._handle_rotate_schematic_component,
             "annotate_schematic": self._handle_annotate_schematic,
+            "add_hierarchical_sheet": self._handle_add_hierarchical_sheet,
             "delete_schematic_wire": self._handle_delete_schematic_wire,
             "delete_schematic_net_label": self._handle_delete_schematic_net_label,
             "export_schematic_pdf": self._handle_export_schematic_pdf,
@@ -737,6 +738,24 @@ class KiCADInterface:
                     "message": "Schematic name is required. Provide 'name', 'projectName', or 'filename' parameter.",
                 }
 
+            # Warn if the schematic is in a subdirectory relative to the nearest .kicad_pro.
+            # ${KIPRJMOD} is resolved relative to the project root, so sub-sheet paths
+            # outside the root directory cause "Symbol not found" errors.
+            _subdir_warning = None
+            try:
+                from commands.dynamic_symbol_loader import _find_project_root as _fpr
+                _fp = Path(file_path)
+                _proj_root = _fpr(_fp.parent)
+                if _fp.parent.resolve() != _proj_root.resolve() and _proj_root != _fp.parent:
+                    _rel = _fp.relative_to(_proj_root) if _fp.is_relative_to(_proj_root) else _fp.name
+                    _subdir_warning = (
+                        f"Sub-sheet created at {_rel} — library paths using ${{KIPRJMOD}} "
+                        f"may not resolve correctly from this location. Place the sub-sheet "
+                        f"in the same directory as the .kicad_pro file to avoid lookup errors."
+                    )
+            except Exception:
+                pass
+
             # Pass the full file_path so create_schematic writes to the right location
             schematic = SchematicManager.create_schematic(file_path, metadata)
             success = SchematicManager.save_schematic(schematic, file_path)
@@ -760,6 +779,8 @@ class KiCADInterface:
             if _last_removed_templates:
                 result["removed_template_components"] = list(_last_removed_templates)
                 result["note"] = f"Removed {len(_last_removed_templates)} template placeholder components"
+            if _subdir_warning:
+                result["warning"] = _subdir_warning
             return result
         except Exception as e:
             logger.error(f"Error creating schematic: {str(e)}")
@@ -832,7 +853,7 @@ class KiCADInterface:
         logger.info("Adding component to schematic")
         try:
             from pathlib import Path
-            from commands.dynamic_symbol_loader import DynamicSymbolLoader
+            from commands.dynamic_symbol_loader import DynamicSymbolLoader, _find_project_root
 
             schematic_path = params.get("schematicPath")
             component = params.get("component", {})
@@ -858,9 +879,11 @@ class KiCADInterface:
             snapped_x = _snap(x)
             snapped_y = _snap(y)
 
-            # Derive project path from schematic path for project-local library resolution
+            # Derive project path: walk up from the schematic's directory to find the
+            # nearest .kicad_pro so ${KIPRJMOD} resolves correctly for sub-sheets in
+            # subdirectories (e.g. project/sheets/foo.kicad_sch → project/).
             schematic_file = Path(schematic_path)
-            derived_project_path = schematic_file.parent
+            derived_project_path = _find_project_root(schematic_file.parent)
 
             loader = DynamicSymbolLoader(project_path=derived_project_path)
             loader.add_component(
@@ -876,11 +899,25 @@ class KiCADInterface:
                 project_path=derived_project_path,
             )
 
+            # Resolve footprint: use the caller-supplied value, or extract from library
+            resolved_footprint = footprint
+            if not resolved_footprint:
+                try:
+                    sym_block = loader.extract_symbol_from_library(library, comp_type)
+                    if sym_block:
+                        import re as _re
+                        fp_match = _re.search(r'\(property\s+"Footprint"\s+"([^"]*)"', sym_block)
+                        if fp_match:
+                            resolved_footprint = fp_match.group(1)
+                except Exception:
+                    pass
+
             response = {
                 "success": True,
                 "component_reference": reference,
                 "symbol_source": f"{library}:{comp_type}",
                 "snapped_position": {"x": snapped_x, "y": snapped_y},
+                "footprint": resolved_footprint or "",
             }
 
             if include_pins:
@@ -3178,6 +3215,7 @@ class KiCADInterface:
                         )
 
             # Power symbols (components with power flag)
+            # Note: [power] entries are PWR_FLAG component instances, not net labels.
             if hasattr(schematic, "symbol"):
                 for symbol in schematic.symbol:
                     if not hasattr(symbol.property, "Reference"):
@@ -3200,6 +3238,28 @@ class KiCADInterface:
                             "position": {"x": float(pos[0]), "y": float(pos[1])},
                         }
                     )
+
+            # No-connect markers — kicad-skip does not expose these, so parse with sexpdata
+            try:
+                import sexpdata as _sexpdata
+                from sexpdata import Symbol as _Sym
+                with open(schematic_path, "r", encoding="utf-8") as _f:
+                    _sch_data = _sexpdata.loads(_f.read())
+                for _item in _sch_data:
+                    if not (isinstance(_item, list) and len(_item) > 0 and _item[0] == _Sym("no_connect")):
+                        continue
+                    _at = next(
+                        (p for p in _item if isinstance(p, list) and len(p) >= 3 and p[0] == _Sym("at")),
+                        None,
+                    )
+                    if _at:
+                        labels.append({
+                            "name": "no_connect",
+                            "type": "no_connect",
+                            "position": {"x": float(_at[1]), "y": float(_at[2])},
+                        })
+            except Exception as _e:
+                logger.warning(f"Could not parse no_connect markers: {_e}")
 
             return {"success": True, "labels": labels, "count": len(labels)}
 
@@ -3321,6 +3381,246 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
+    def _handle_add_hierarchical_sheet(self, params):
+        """Insert a hierarchical sheet reference block into a parent schematic."""
+        logger.info("Adding hierarchical sheet")
+        try:
+            import uuid as _uuid
+            import re as _re
+
+            schematic_path = params.get("schematicPath")
+            subsheet_path = params.get("subsheetPath")
+            sheet_name = params.get("sheetName", "Sheet")
+            position = params.get("position", {})
+            size = params.get("size", {})
+
+            if not schematic_path or not subsheet_path:
+                return {"success": False, "message": "schematicPath and subsheetPath are required"}
+
+            x = float(position.get("x", 50))
+            y = float(position.get("y", 50))
+            w = float(size.get("width", 80))
+            h = float(size.get("height", 50))
+
+            parent_file = Path(schematic_path)
+            # Compute relative path from parent schematic's directory to the sub-sheet
+            try:
+                sub_abs = Path(subsheet_path).resolve()
+                rel_path = sub_abs.relative_to(parent_file.parent.resolve())
+                rel_str = str(rel_path).replace("\\", "/")
+            except ValueError:
+                # Not relative — use as-is
+                rel_str = str(subsheet_path).replace("\\", "/")
+
+            sheet_block_uuid = str(_uuid.uuid4())
+
+            # Property label positions: name above top-left, file below bottom-left
+            name_x = round(x + 2.54, 4)
+            name_y = round(y - 1.27, 4)
+            file_x = round(x + 2.54, 4)
+            file_y = round(y + h + 1.27, 4)
+
+            sheet_block = f"""  (sheet (at {x} {y}) (size {w} {h}) (fields_autoplaced yes)
+    (stroke (width 0.0006) (type default))
+    (fill (color 0 0 0 0.0000))
+    (uuid "{sheet_block_uuid}")
+    (property "Sheet name" "{sheet_name}" (at {name_x} {name_y} 0)
+      (effects (font (size 1.27 1.27)) (justify left bottom))
+    )
+    (property "Sheet file" "{rel_str}" (at {file_x} {file_y} 0)
+      (effects (font (size 1.27 1.27)) (justify left bottom))
+    )
+  )
+"""
+
+            with open(parent_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Extract the parent schematic UUID for the sheet_instances path entry
+            parent_uuid_match = _re.search(r'\(uuid\s+([0-9a-fA-F-]+)\)', content)
+            parent_uuid = parent_uuid_match.group(1) if parent_uuid_match else ""
+
+            # Determine the next available page number
+            existing_pages = _re.findall(r'\(page\s+"(\d+)"\)', content)
+            next_page = max((int(p) for p in existing_pages), default=0) + 1
+
+            # Build path entry for sheet_instances
+            instance_path = f'/{parent_uuid}/{sheet_block_uuid}' if parent_uuid else f'/{sheet_block_uuid}'
+            path_entry = f'    (path "{instance_path}" (page "{next_page}"))\n'
+
+            # Insert sheet block before (sheet_instances
+            insert_marker = "(sheet_instances"
+            insert_at = content.rfind(insert_marker)
+            if insert_at == -1:
+                return {"success": False, "message": "Could not find (sheet_instances in schematic"}
+
+            content = content[:insert_at] + sheet_block + "  " + content[insert_at:]
+
+            # Insert path entry inside (sheet_instances ... ) block
+            # Find the closing ) of the sheet_instances block after the insertion
+            si_start = content.rfind("(sheet_instances")
+            si_close = content.find(")", si_start)
+            # Walk to find the matching close paren
+            depth = 0
+            for i in range(si_start, len(content)):
+                if content[i] == "(":
+                    depth += 1
+                elif content[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        si_close = i
+                        break
+            content = content[:si_close] + path_entry + "  " + content[si_close:]
+
+            with open(parent_file, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            return {
+                "success": True,
+                "sheet_uuid": sheet_block_uuid,
+                "sheet_name": sheet_name,
+                "subsheet_path": rel_str,
+                "page": next_page,
+            }
+
+        except Exception as e:
+            logger.error(f"Error adding hierarchical sheet: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _fix_subsheet_instances(self, parent_path: str, parent_content: str) -> list:
+        """Walk all (sheet ...) blocks in the parent schematic and ensure each component
+        in the referenced sub-sheet has an instances entry for the sheet-block UUID.
+
+        KiCAD 8 renders references from the instances block using the SHEET-BLOCK UUID
+        (the uuid inside the (sheet ...) block in the parent), NOT the sub-sheet file UUID.
+        This method adds the missing path entries so ERC shows correct references.
+
+        Returns a list of sub-sheet paths that were modified.
+        """
+        import sexpdata as _sx
+        from sexpdata import Symbol as _Sym
+        import re as _re
+
+        modified_sheets = []
+
+        try:
+            parent_file = Path(parent_path)
+            parent_data = _sx.loads(parent_content)
+
+            # Find all (sheet ...) blocks at the top level
+            for item in parent_data:
+                if not (isinstance(item, list) and len(item) > 0 and item[0] == _Sym("sheet")):
+                    continue
+
+                # Extract sheet-block UUID
+                sheet_block_uuid = None
+                for sub in item:
+                    if isinstance(sub, list) and len(sub) >= 2 and sub[0] == _Sym("uuid"):
+                        sheet_block_uuid = str(sub[1])
+                        break
+
+                # Extract Sheet file property
+                sheet_file_rel = None
+                for sub in item:
+                    if not (isinstance(sub, list) and len(sub) >= 3 and sub[0] == _Sym("property")):
+                        continue
+                    if sub[1] == "Sheet file":
+                        sheet_file_rel = str(sub[2])
+                        break
+
+                if not sheet_block_uuid or not sheet_file_rel:
+                    continue
+
+                # Resolve sub-sheet path relative to parent
+                sub_sheet_path = parent_file.parent / sheet_file_rel
+                if not sub_sheet_path.exists():
+                    logger.warning(f"Sub-sheet not found: {sub_sheet_path}")
+                    continue
+
+                target_path = f"/{sheet_block_uuid}"
+
+                # Read the sub-sheet
+                with open(sub_sheet_path, "r", encoding="utf-8") as f:
+                    sub_content = f.read()
+
+                # Get project name from parent's .kicad_pro
+                try:
+                    from commands.dynamic_symbol_loader import _find_project_root
+                    pro_files = list(_find_project_root(parent_file.parent).glob("*.kicad_pro"))
+                    project_name = pro_files[0].stem if pro_files else parent_file.stem
+                except Exception:
+                    project_name = parent_file.stem
+
+                # Patch instances blocks using text manipulation to preserve formatting.
+                # Each component has (instances (project "name" (path "/<uuid>" ...))) .
+                # We need to add a path entry for target_path if not already present.
+                changed = False
+
+                def _add_instance_path(match_text: str) -> str:
+                    nonlocal changed
+                    if target_path in match_text:
+                        return match_text  # already has this path
+
+                    # Extract existing (path "..." ...) to copy reference/unit
+                    existing_path_match = _re.search(
+                        r'\(path\s+"([^"]+)"\s+\(reference\s+"([^"]+)"\)\s+\(unit\s+(\d+)\)',
+                        match_text,
+                    )
+                    if not existing_path_match:
+                        return match_text
+
+                    reference = existing_path_match.group(2)
+                    unit = existing_path_match.group(3)
+                    new_entry = f'        (path "{target_path}" (reference "{reference}") (unit {unit}))\n'
+
+                    # Insert new path entry inside the (project ...) block before closing )
+                    # Find the last ) in the instances block for the project block
+                    insert_pos = match_text.rfind(")")
+                    if insert_pos == -1:
+                        return match_text
+                    changed = True
+                    return match_text[:insert_pos] + new_entry + "      " + match_text[insert_pos:]
+
+                # Match each (instances ...) block
+                # Use line-by-line depth matching to find and patch each block
+                lines = sub_content.split("\n")
+                result_lines = []
+                i = 0
+                while i < len(lines):
+                    line = lines[i]
+                    if "(instances" not in line:
+                        result_lines.append(line)
+                        i += 1
+                        continue
+
+                    # Collect the full instances block
+                    block_lines = [line]
+                    depth = line.count("(") - line.count(")")
+                    i += 1
+                    while i < len(lines) and depth > 0:
+                        block_lines.append(lines[i])
+                        depth += lines[i].count("(") - lines[i].count(")")
+                        i += 1
+
+                    block_text = "\n".join(block_lines)
+                    patched = _add_instance_path(block_text)
+                    result_lines.extend(patched.split("\n"))
+
+                if changed:
+                    with open(sub_sheet_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(result_lines))
+                    modified_sheets.append(str(sub_sheet_path))
+                    logger.info(f"Fixed instances in {sub_sheet_path} for sheet-block {sheet_block_uuid}")
+
+        except Exception as e:
+            logger.error(f"Error fixing sub-sheet instances: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+        return modified_sheets
+
     def _handle_annotate_schematic(self, params):
         """Annotate unannotated components in schematic (R? -> R1, R2, ...)"""
         logger.info("Annotating schematic")
@@ -3328,6 +3628,7 @@ class KiCADInterface:
             import re
 
             schematic_path = params.get("schematicPath")
+            hierarchical = params.get("hierarchical", False)
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
 
@@ -3358,44 +3659,51 @@ class KiCADInterface:
                     prefix = ref[:-1]
                     unannotated.append((symbol, prefix))
 
-            if not unannotated:
-                return {
-                    "success": True,
-                    "annotated": [],
-                    "message": "All components already annotated",
-                }
-
             annotated = []
-            for symbol, prefix in unannotated:
-                if prefix not in existing_refs:
-                    existing_refs[prefix] = set()
+            if unannotated:
+                for symbol, prefix in unannotated:
+                    if prefix not in existing_refs:
+                        existing_refs[prefix] = set()
 
-                # Find next available number
-                next_num = 1
-                while next_num in existing_refs[prefix]:
-                    next_num += 1
+                    # Find next available number
+                    next_num = 1
+                    while next_num in existing_refs[prefix]:
+                        next_num += 1
 
-                old_ref = symbol.property.Reference.value
-                new_ref = f"{prefix}{next_num}"
-                # Update both property.Reference AND instances...reference so KiCad UI
-                # reads the correct designator (KiCad 8+ authoritative source is instances).
-                if hasattr(symbol, 'setAllReferences'):
-                    symbol.setAllReferences(new_ref)
-                else:
-                    symbol.property.Reference.value = new_ref
-                existing_refs[prefix].add(next_num)
+                    old_ref = symbol.property.Reference.value
+                    new_ref = f"{prefix}{next_num}"
+                    # Update both property.Reference AND instances...reference so KiCad UI
+                    # reads the correct designator (KiCad 8+ authoritative source is instances).
+                    if hasattr(symbol, 'setAllReferences'):
+                        symbol.setAllReferences(new_ref)
+                    else:
+                        symbol.property.Reference.value = new_ref
+                    existing_refs[prefix].add(next_num)
 
-                uuid_val = str(symbol.uuid.value) if hasattr(symbol, "uuid") else ""
-                annotated.append(
-                    {
-                        "uuid": uuid_val,
-                        "oldReference": old_ref,
-                        "newReference": new_ref,
-                    }
-                )
+                    uuid_val = str(symbol.uuid.value) if hasattr(symbol, "uuid") else ""
+                    annotated.append(
+                        {
+                            "uuid": uuid_val,
+                            "oldReference": old_ref,
+                            "newReference": new_ref,
+                        }
+                    )
 
-            SchematicManager.save_schematic(schematic, schematic_path)
-            return {"success": True, "annotated": annotated}
+                SchematicManager.save_schematic(schematic, schematic_path)
+
+            result: dict = {"success": True, "annotated": annotated}
+            if not annotated:
+                result["message"] = "All components already annotated"
+
+            # Hierarchical mode: fix sub-sheet instances paths so parent-context ERC
+            # shows correct references (sheet-block UUID, not sub-sheet file UUID).
+            if hierarchical:
+                with open(schematic_path, "r", encoding="utf-8") as _f:
+                    parent_content = _f.read()
+                modified = self._fix_subsheet_instances(schematic_path, parent_content)
+                result["subSheetsFixed"] = modified
+
+            return result
 
         except Exception as e:
             logger.error(f"Error annotating schematic: {e}")
@@ -3437,27 +3745,47 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_delete_schematic_net_label(self, params):
-        """Delete a net label from the schematic"""
+        """Delete a net label (or labels) from the schematic"""
         logger.info("Deleting schematic net label")
         try:
             schematic_path = params.get("schematicPath")
-            net_name = params.get("netName")
-            position = params.get("position")
-
-            if not schematic_path or not net_name:
-                return {
-                    "success": False,
-                    "message": "schematicPath and netName are required",
-                }
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
 
             from pathlib import Path
             from commands.wire_manager import WireManager
+
+            sch_path = Path(schematic_path)
+
+            # Mode 1: deleteAll — remove every net label in the schematic
+            if params.get("deleteAll"):
+                count = WireManager.delete_all_labels(sch_path)
+                return {"success": True, "deleted": count}
+
+            # Mode 2: positions array — batch delete by (netName, optional position)
+            positions_list = params.get("positions")
+            if positions_list is not None:
+                result = WireManager.delete_labels_batch(sch_path, positions_list)
+                return {
+                    "success": True,
+                    "deleted": result["deleted"],
+                    "notFound": result["notFound"],
+                }
+
+            # Mode 3: single netName (original behaviour)
+            net_name = params.get("netName")
+            position = params.get("position")
+            if not net_name:
+                return {
+                    "success": False,
+                    "message": "Provide netName, deleteAll, or positions",
+                }
 
             pos_list = None
             if position:
                 pos_list = [position.get("x", 0), position.get("y", 0)]
 
-            deleted = WireManager.delete_label(Path(schematic_path), net_name, pos_list)
+            deleted = WireManager.delete_label(sch_path, net_name, pos_list)
             if deleted:
                 return {"success": True}
             else:

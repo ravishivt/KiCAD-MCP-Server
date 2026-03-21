@@ -111,11 +111,12 @@ export function registerSchematicTools(
           pinLines.length > 0
             ? `\nPin locations:\n${pinLines.join("\n")}`
             : "";
+        const footprintNote = result.footprint ? `\nFootprint: ${result.footprint}` : "";
         return {
           content: [
             {
               type: "text",
-              text: `Added ${args.reference} (${args.symbol})${snappedNote}${pinSection}`,
+              text: `Added ${args.reference} (${args.symbol})${snappedNote}${footprintNote}${pinSection}`,
             },
           ],
         };
@@ -857,7 +858,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // List all labels in schematic
   server.tool(
     "list_schematic_labels",
-    "List all net labels, global labels, and power flags in the schematic.",
+    "List all net labels, global labels, power flags, and no-connect markers in the schematic. Types returned: [net] = local net label, [global] = global label, [power] = power symbol instance (e.g. PWR_FLAG, not a net label), [no_connect] = unconnected pin marker.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
     },
@@ -979,31 +980,35 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Annotate schematic
   server.tool(
     "annotate_schematic",
-    "Assign reference designators to unannotated components (R? → R1, R2, ...). Must be called before tools that require known references.",
+    "Assign reference designators to unannotated components (R? → R1, R2, ...). Must be called before tools that require known references. Set hierarchical=true when annotating a parent schematic — this also fixes sub-sheet component instance paths so KiCAD ERC does not show '?' references for sub-sheet components.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      hierarchical: z
+        .boolean()
+        .optional()
+        .describe(
+          "If true, also fix sub-sheet instances paths using sheet-block UUIDs so the parent-context ERC shows correct references instead of '?'",
+        ),
     },
-    async (args: { schematicPath: string }) => {
+    async (args: { schematicPath: string; hierarchical?: boolean }) => {
       const result = await callKicadScript("annotate_schematic", args);
       if (result.success) {
         const annotated = result.annotated || [];
+        const subSheetsFixed: string[] = result.subSheetsFixed || [];
+        const parts: string[] = [];
         if (annotated.length === 0) {
-          return {
-            content: [
-              { type: "text", text: "All components are already annotated." },
-            ],
-          };
+          parts.push("All components are already annotated.");
+        } else {
+          const lines = annotated.map(
+            (a: any) => `  ${a.oldReference} → ${a.newReference}`,
+          );
+          parts.push(`Annotated ${annotated.length} component(s):\n${lines.join("\n")}`);
         }
-        const lines = annotated.map(
-          (a: any) => `  ${a.oldReference} → ${a.newReference}`,
-        );
+        if (subSheetsFixed.length > 0) {
+          parts.push(`Fixed sub-sheet instances in: ${subSheetsFixed.join(", ")}`);
+        }
         return {
-          content: [
-            {
-              type: "text",
-              text: `Annotated ${annotated.length} component(s):\n${lines.join("\n")}`,
-            },
-          ],
+          content: [{ type: "text", text: parts.join("\n") }],
         };
       }
       return {
@@ -1062,30 +1067,50 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Delete net label from schematic
   server.tool(
     "delete_schematic_net_label",
-    "Remove a net label from the schematic.",
+    "Remove net label(s) from the schematic. Three modes: (1) single label by netName + optional position, (2) deleteAll=true to remove every label at once, (3) positions array for batch deletion in one call.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      netName: z.string().describe("Name of the net label to remove"),
+      netName: z.string().optional().describe("Name of the net label to remove (single-delete mode)"),
       position: z
         .object({ x: z.number(), y: z.number() })
         .optional()
-        .describe("Position to disambiguate if multiple labels with same name"),
+        .describe("Position to disambiguate if multiple labels with same name (single-delete mode)"),
+      deleteAll: z
+        .boolean()
+        .optional()
+        .describe("Set true to delete ALL net labels in the schematic at once"),
+      positions: z
+        .array(
+          z.object({
+            netName: z.string().describe("Net label name to delete"),
+            position: z
+              .object({ x: z.number(), y: z.number() })
+              .optional()
+              .describe("Optional position to disambiguate"),
+          }),
+        )
+        .optional()
+        .describe("Batch delete: list of {netName, position?} items removed in one call"),
     },
     async (args: {
       schematicPath: string;
-      netName: string;
+      netName?: string;
       position?: { x: number; y: number };
+      deleteAll?: boolean;
+      positions?: Array<{ netName: string; position?: { x: number; y: number } }>;
     }) => {
       const result = await callKicadScript("delete_schematic_net_label", args);
       if (result.success) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Deleted net label '${args.netName}'`,
-            },
-          ],
-        };
+        let msg: string;
+        if (args.deleteAll) {
+          msg = `Deleted all net labels (${result.deleted ?? 0} removed)`;
+        } else if (args.positions) {
+          msg = `Deleted ${result.deleted ?? 0} label(s)`;
+          if (result.notFound?.length) msg += `, not found: ${result.notFound.join(", ")}`;
+        } else {
+          msg = `Deleted net label '${args.netName}'`;
+        }
+        return { content: [{ type: "text", text: msg }] };
       }
       return {
         content: [
@@ -1387,6 +1412,60 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
       const result = await callKicadScript("sync_schematic_to_board", args);
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    },
+  );
+
+  // Add hierarchical sheet reference to a parent schematic
+  server.tool(
+    "add_hierarchical_sheet",
+    "Insert a hierarchical sheet reference block into a parent schematic. Creates the (sheet ...) block that links the parent to a sub-sheet file, and adds the corresponding entry to (sheet_instances). Call annotate_schematic with hierarchical=true after adding components to the sub-sheet to fix instance paths for the parent context.",
+    {
+      schematicPath: z
+        .string()
+        .describe("Path to the parent .kicad_sch file"),
+      subsheetPath: z
+        .string()
+        .describe(
+          "Path to the referenced sub-sheet .kicad_sch file (resolved relative to the parent schematic's directory)",
+        ),
+      sheetName: z
+        .string()
+        .describe("Display name shown on the sheet block in the schematic"),
+      position: z
+        .object({ x: z.number(), y: z.number() })
+        .describe("Top-left corner of the sheet rectangle in mm"),
+      size: z
+        .object({ width: z.number(), height: z.number() })
+        .optional()
+        .describe("Sheet rectangle dimensions in mm (default 80×50)"),
+    },
+    async (args: {
+      schematicPath: string;
+      subsheetPath: string;
+      sheetName: string;
+      position: { x: number; y: number };
+      size?: { width: number; height: number };
+    }) => {
+      const result = await callKicadScript("add_hierarchical_sheet", args);
+      if (result.success) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Sheet '${result.sheet_name}' added (uuid: ${result.sheet_uuid}, file: ${result.subsheet_path}, page: ${result.page})`,
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to add hierarchical sheet: ${result.message || "Unknown error"}`,
+          },
+        ],
+        isError: true,
       };
     },
   );
