@@ -912,6 +912,20 @@ class KiCADInterface:
                 except Exception:
                     pass
 
+            # If this schematic is a sub-sheet of another, fix hierarchical instance
+            # paths so parent-context ERC shows correct references even when
+            # annotate_schematic is never called (clients often supply explicit refs).
+            sch_name = schematic_file.name
+            for candidate in schematic_file.parent.glob("*.kicad_sch"):
+                if candidate.resolve() == schematic_file.resolve():
+                    continue
+                try:
+                    candidate_content = candidate.read_text(encoding="utf-8")
+                    if sch_name in candidate_content:
+                        self._fix_subsheet_instances(str(candidate), candidate_content)
+                except Exception:
+                    pass
+
             response = {
                 "success": True,
                 "component_reference": reference,
@@ -1030,6 +1044,20 @@ class KiCADInterface:
                 except Exception as e:
                     logger.error(f"Error adding {reference} ({symbol}): {e}")
                     errors.append({"symbol": symbol, "reference": reference, "error": str(e)})
+
+            # If this schematic is a sub-sheet of another, fix hierarchical instance
+            # paths now so parent-context ERC shows correct references even when
+            # annotate_schematic is never called (clients often supply explicit refs).
+            sch_name = schematic_file.name
+            for candidate in project_path.glob("*.kicad_sch"):
+                if candidate.resolve() == schematic_file.resolve():
+                    continue
+                try:
+                    candidate_content = candidate.read_text(encoding="utf-8")
+                    if sch_name in candidate_content:
+                        self._fix_subsheet_instances(str(candidate), candidate_content)
+                except Exception:
+                    pass
 
             return {
                 "success": len(errors) == 0,
@@ -3695,12 +3723,32 @@ class KiCADInterface:
             if not annotated:
                 result["message"] = "All components already annotated"
 
-            # Hierarchical mode: fix sub-sheet instances paths so parent-context ERC
-            # shows correct references (sheet-block UUID, not sub-sheet file UUID).
-            if hierarchical:
-                with open(schematic_path, "r", encoding="utf-8") as _f:
-                    parent_content = _f.read()
-                modified = self._fix_subsheet_instances(schematic_path, parent_content)
+            # Always fix hierarchical instance paths — both for sub-sheets owned by
+            # this schematic AND for any parent schematic that references this file.
+            # This handles the common case where annotate is called on a sub-sheet
+            # (not the parent), which would otherwise leave instances with only the
+            # standalone path, causing '?' references in the parent-context ERC.
+            with open(schematic_path, "r", encoding="utf-8") as _f:
+                final_content = _f.read()
+
+            # Fix sub-sheets owned by this schematic
+            modified = self._fix_subsheet_instances(schematic_path, final_content)
+
+            # Fix instances if this schematic is itself a sub-sheet of another
+            sch_name = Path(schematic_path).name
+            parent_dir = Path(schematic_path).parent
+            for candidate in parent_dir.glob("*.kicad_sch"):
+                if candidate.resolve() == Path(schematic_path).resolve():
+                    continue
+                try:
+                    candidate_content = candidate.read_text(encoding="utf-8")
+                    if sch_name in candidate_content:
+                        extra = self._fix_subsheet_instances(str(candidate), candidate_content)
+                        modified = modified + extra
+                except Exception:
+                    pass
+
+            if modified:
                 result["subSheetsFixed"] = modified
 
             return result

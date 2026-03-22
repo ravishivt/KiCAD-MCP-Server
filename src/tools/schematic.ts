@@ -981,14 +981,14 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Annotate schematic
   server.tool(
     "annotate_schematic",
-    "Assign reference designators to unannotated components (R? → R1, R2, ...). Must be called before tools that require known references. Set hierarchical=true when annotating a parent schematic — this also fixes sub-sheet component instance paths so KiCAD ERC does not show '?' references for sub-sheet components.",
+    "Assign reference designators to unannotated components (R? → R1, R2, ...). Must be called before tools that require known references. Automatically fixes hierarchical instance paths for sub-sheets so KiCAD ERC shows correct references when opening the parent schematic.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       hierarchical: z
         .boolean()
         .optional()
         .describe(
-          "If true, also fix sub-sheet instances paths using sheet-block UUIDs so the parent-context ERC shows correct references instead of '?'",
+          "Deprecated — hierarchical instance path fixing now happens automatically. Accepted for backward compatibility but has no additional effect.",
         ),
     },
     async (args: { schematicPath: string; hierarchical?: boolean }) => {
@@ -1423,7 +1423,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Add hierarchical sheet reference to a parent schematic
   server.tool(
     "add_hierarchical_sheet",
-    "Insert a hierarchical sheet reference block into a parent schematic. Creates the (sheet ...) block that links the parent to a sub-sheet file, and adds the corresponding entry to (sheet_instances). Call annotate_schematic with hierarchical=true after adding components to the sub-sheet to fix instance paths for the parent context.",
+    "Insert a hierarchical sheet reference block into a parent schematic. Creates the (sheet ...) block that links the parent to a sub-sheet file, and adds the corresponding entry to (sheet_instances). After populating the sub-sheet with components, call annotate_schematic on the sub-sheet — it will automatically fix hierarchical instance paths so the parent-context ERC shows correct references.",
     {
       schematicPath: z
         .string()
