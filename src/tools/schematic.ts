@@ -51,7 +51,7 @@ export function registerSchematicTools(
         ),
       reference: z.string().describe("Component reference (e.g., R1, U1)"),
       value: z.string().optional().describe("Component value"),
-      footprint: z.string().optional().describe("KiCAD footprint (e.g. Resistor_SMD:R_0603_1608Metric)"),
+      footprint: z.string().optional().describe("KiCAD footprint (e.g. Resistor_SMD:R_0603_1608Metric). Applied directly to the placed instance's Footprint property field — no separate edit_schematic_component call needed."),
       position: z
         .object({
           x: z.number(),
@@ -143,7 +143,7 @@ export function registerSchematicTools(
         symbol: z.string().describe("Symbol in 'Library:SymbolName' format (e.g., Device:R, power:GND)"),
         reference: z.string().describe("Reference designator (e.g., R1, C3, U2)"),
         value: z.string().optional().describe("Component value (e.g., 10k, 100nF, AP63203WU-7)"),
-        footprint: z.string().optional().describe("KiCAD footprint (e.g., Resistor_SMD:R_0603_1608Metric)"),
+        footprint: z.string().optional().describe("KiCAD footprint (e.g., Resistor_SMD:R_0603_1608Metric). Applied directly to the placed instance's Footprint property — no separate edit_schematic_component call needed. A footprint_warning in the response means library validation failed, NOT that the footprint was omitted."),
         position: z.object({ x: z.number(), y: z.number() }).optional().describe("Schematic position in mm (auto-snapped to 50mil grid)"),
         rotation: z.number().optional().describe("Rotation in degrees CCW, multiples of 90. Use 90 for horizontal resistors/capacitors."),
         includePins: z.boolean().optional().describe("Include pin coordinates in response (default false). Set true for ICs where pin coordinate planning is needed."),
@@ -280,6 +280,54 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
             text: `Failed to edit component: ${result.message || "Unknown error"}`,
           },
         ],
+      };
+    },
+  );
+
+  // Batch edit multiple component properties in one call
+  server.tool(
+    "batch_edit_schematic_components",
+    `Update properties of multiple placed symbols in a KiCAD schematic in a single call.
+
+Use this instead of calling edit_schematic_component repeatedly — all edits are applied
+in one round-trip. Each component entry can set footprint, value, and/or newReference.
+
+Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3": {"footprint": "Capacitor_SMD:C_0402"}}`,
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      components: z.record(z.object({
+        footprint: z.string().optional().describe("New KiCAD footprint string"),
+        value: z.string().optional().describe("New value string (e.g. 10k, 100nF)"),
+        newReference: z.string().optional().describe("Rename the reference designator"),
+      })).describe("Map of current reference → properties to update"),
+    },
+    async (args: {
+      schematicPath: string;
+      components: Record<string, { footprint?: string; value?: string; newReference?: string }>;
+    }) => {
+      const result = await callKicadScript("batch_edit_schematic_components", args);
+      if (result.success || result.updated_count > 0) {
+        const lines: string[] = [
+          `Updated ${result.updated_count} component(s)${result.error_count > 0 ? `, ${result.error_count} failed` : ""}:`,
+        ];
+        for (const [ref, changes] of Object.entries(result.updated ?? {})) {
+          const changeStr = Object.entries(changes as Record<string, unknown>)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(", ");
+          lines.push(`  ${ref}: ${changeStr}`);
+        }
+        if (result.errors?.length) {
+          lines.push("Errors:");
+          result.errors.forEach((e: any) => lines.push(`  ${e.reference}: ${e.error}`));
+        }
+        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      }
+      return {
+        content: [{
+          type: "text" as const,
+          text: `batch_edit_schematic_components failed: ${result.message || "Unknown error"}\n` +
+            (result.errors || []).map((e: any) => `  ${e.reference}: ${e.error}`).join("\n"),
+        }],
       };
     },
   );
@@ -619,7 +667,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Get pin locations for one or more schematic components
   server.tool(
     "get_schematic_pin_locations",
-    "Returns the exact x/y coordinates of every pin on one or more schematic components. Pass a single 'reference' or a list of 'references' to batch multiple components in one call — strongly prefer the batch form to avoid many round-trips.\n\nCoordinate convention: returned x/y are absolute schematic coordinates (Y-axis points DOWN). The Y-axis flip between symbol library space (Y-up) and schematic space (Y-down) is applied automatically by the underlying library — do NOT manually compute pin_schematic_y = component_y ± pin_symbol_y.",
+    "Returns the exact x/y coordinates of every pin on one or more schematic components. Pass a single 'reference' or a list of 'references' to batch multiple components in one call — strongly prefer the batch form to avoid many round-trips.\n\nCoordinate convention: returned x/y are absolute schematic coordinates (Y-axis points DOWN). The Y-axis flip between symbol library space (Y-up) and schematic space (Y-down) is applied automatically by the underlying library — do NOT manually compute pin_schematic_y = component_y ± pin_symbol_y.\n\nNOTE: For components placed in the same session (not yet opened in KiCad), this tool may return empty results because the skip parser cannot always read MCP-generated files. In that case use batch_connect or connect_to_net which look up pin positions internally and do NOT require calling this tool first.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       reference: z.string().optional().describe("Single component reference (e.g. U1). Use 'references' for batch."),
@@ -1258,6 +1306,28 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
             text: `Failed to get schematic view: ${result.message || "Unknown error"}`,
           },
         ],
+        isError: true,
+      };
+    },
+  );
+
+  // Validate schematic syntax (paren balance check, no KiCad process needed)
+  server.tool(
+    "validate_schematic",
+    "Check parenthesis balance and basic syntax of a .kicad_sch file without loading KiCad. Returns pass/fail and the line number of the first syntax error. Run this after placing components if batch_connect is reporting unexpected 'pin not found' errors — a paren underflow will cause those failures.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+    },
+    async (args: { schematicPath: string }) => {
+      const result = await callKicadScript("validate_schematic", args);
+      if (result.valid) {
+        return { content: [{ type: "text" as const, text: `Syntax OK: ${result.message}` }] };
+      }
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Syntax error: ${result.error || result.message || "Unknown error"}`,
+        }],
         isError: true,
       };
     },

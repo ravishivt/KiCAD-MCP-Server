@@ -87,6 +87,8 @@ export const toolCategories: ToolCategory[] = [
     tools: [
       "create_schematic",
       "add_schematic_component",
+      "batch_add_components",
+      "batch_edit_schematic_components",
       "list_schematic_components",
       "move_schematic_component",
       "rotate_schematic_component",
@@ -107,7 +109,8 @@ export const toolCategories: ToolCategory[] = [
       "sync_schematic_to_board",
       "get_schematic_view",
       "export_schematic_svg",
-      "export_schematic_pdf"
+      "export_schematic_pdf",
+      "validate_schematic"
     ]
   },
   {

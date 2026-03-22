@@ -389,6 +389,7 @@ class KiCADInterface:
             "batch_add_components": self._handle_batch_add_components,
             "delete_schematic_component": self._handle_delete_schematic_component,
             "edit_schematic_component": self._handle_edit_schematic_component,
+            "batch_edit_schematic_components": self._handle_batch_edit_schematic_components,
             "get_schematic_component": self._handle_get_schematic_component,
             "add_schematic_wire": self._handle_add_schematic_wire,
             "add_schematic_connection": self._handle_add_schematic_connection,
@@ -400,6 +401,7 @@ class KiCADInterface:
             "connect_passthrough": self._handle_connect_passthrough,
             "get_schematic_pin_locations": self._handle_get_schematic_pin_locations,
             "get_net_connections": self._handle_get_net_connections,
+            "validate_schematic": self._handle_validate_schematic,
             "run_erc": self._handle_run_erc,
             "place_net_label_at_pin": self._handle_place_net_label_at_pin,
             "list_unconnected_pins": self._handle_list_unconnected_pins,
@@ -1024,8 +1026,9 @@ class KiCADInterface:
                         fp_resolved = self.footprint_library.find_footprint(footprint)
                         if fp_resolved is None:
                             entry["footprint_warning"] = (
-                                f"Footprint '{footprint}' was not found in any registered library. "
-                                "The component was placed but the footprint link may be invalid. "
+                                f"Footprint '{footprint}' was not found in any registered footprint library "
+                                "(validation only — the footprint string WAS written to the schematic's "
+                                "Footprint property field). If the string is correct it will still work in KiCad. "
                                 "Use search_footprints to find a valid footprint string."
                             )
 
@@ -1353,6 +1356,40 @@ class KiCADInterface:
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
+
+    def _handle_batch_edit_schematic_components(self, params):
+        """Edit multiple components in a schematic in a single call.
+
+        Accepts: {schematicPath, components: {ref: {footprint?, value?, newReference?, fieldPositions?}}}
+        Applies each edit sequentially using _handle_edit_schematic_component.
+        """
+        logger.info("Batch editing schematic components")
+        schematic_path = params.get("schematicPath")
+        components = params.get("components")
+
+        if not schematic_path:
+            return {"success": False, "message": "schematicPath is required"}
+        if not components or not isinstance(components, dict):
+            return {"success": False, "message": "components must be a dict {reference: {footprint?, value?, newReference?}}"}
+
+        updated = {}
+        errors = []
+
+        for reference, props in components.items():
+            sub_params = {"schematicPath": schematic_path, "reference": reference, **props}
+            result = self._handle_edit_schematic_component(sub_params)
+            if result.get("success"):
+                updated[reference] = result.get("updated", {})
+            else:
+                errors.append({"reference": reference, "error": result.get("message", "Unknown error")})
+
+        return {
+            "success": len(errors) == 0,
+            "updated_count": len(updated),
+            "error_count": len(errors),
+            "updated": updated,
+            "errors": errors,
+        }
 
     def _handle_get_schematic_component(self, params):
         """Return full component info: position, all field values, properties, and pin→net assignments."""
@@ -2006,10 +2043,24 @@ class KiCADInterface:
 
             position = locator.get_pin_location(sch_path, reference, str(pin_number))
             if not position:
-                return {
-                    "success": False,
-                    "message": f"Could not find pin {pin_number} on {reference}",
-                }
+                # For single-pin components (PWR_FLAG, GND, +3V3, etc.) the pin name
+                # is often non-obvious (e.g. "~" for PWR_FLAG).  Fall back to whichever
+                # pin exists when the component has exactly one pin.
+                all_pins = locator.get_all_symbol_pins(sch_path, reference) or {}
+                if len(all_pins) == 1:
+                    only_pin_num = next(iter(all_pins))
+                    coords = all_pins[only_pin_num]
+                    position = coords
+                    pin_number = only_pin_num
+                    logger.info(
+                        f"Single-pin fallback: {reference} has one pin ({only_pin_num}), using it"
+                    )
+                else:
+                    return {
+                        "success": False,
+                        "message": f"Could not find pin '{pin_number}' on {reference}. "
+                                   f"Available pins: {sorted(all_pins.keys()) if all_pins else 'none found'}",
+                    }
 
             raw_angle = locator.get_pin_angle(sch_path, reference, str(pin_number)) or 0
             # Normalize to nearest cardinal angle
@@ -2059,6 +2110,22 @@ class KiCADInterface:
             locator = PinLocator()
             sch_path = Path(schematic_path)
 
+            # Eagerly verify the schematic is parseable before the pin loop.
+            # If skip fails here, ALL pins will silently return "not found" — which is
+            # misleading.  A clear parse error is more actionable.
+            try:
+                from skip import Schematic as _Sch
+                _Sch(str(sch_path))
+            except Exception as parse_err:
+                return {
+                    "success": False,
+                    "message": (
+                        f"ERROR: Failed to load schematic at {schematic_path}: {parse_err}. "
+                        "All pin operations aborted. Run validate_schematic to check for "
+                        "syntax errors (parenthesis balance) in the file."
+                    ),
+                }
+
             placed = []
             failed = []
 
@@ -2068,12 +2135,28 @@ class KiCADInterface:
                     continue
                 for pin_id, net_name in pin_map.items():
                     try:
-                        position = locator.get_pin_location(sch_path, ref, str(pin_id))
+                        resolved_pin = str(pin_id)
+                        position = locator.get_pin_location(sch_path, ref, resolved_pin)
                         if not position:
-                            failed.append({"ref": ref, "pin": str(pin_id), "reason": "pin not found"})
-                            continue
+                            # Single-pin fallback for PWR_FLAG, GND, +3V3, etc.
+                            all_pins = locator.get_all_symbol_pins(sch_path, ref) or {}
+                            if len(all_pins) == 1:
+                                resolved_pin = next(iter(all_pins))
+                                coords = all_pins[resolved_pin]
+                                position = coords
+                                logger.info(
+                                    f"batch_connect single-pin fallback: {ref} pin {resolved_pin}"
+                                )
+                            else:
+                                avail = sorted(all_pins.keys()) if all_pins else []
+                                failed.append({
+                                    "ref": ref,
+                                    "pin": resolved_pin,
+                                    "reason": f"pin not found; available: {avail}",
+                                })
+                                continue
 
-                        raw_angle = locator.get_pin_angle(sch_path, ref, str(pin_id)) or 0
+                        raw_angle = locator.get_pin_angle(sch_path, ref, resolved_pin) or 0
                         cardinal = round(raw_angle / 90) * 90 % 360
                         angle_map = {0: 180, 90: 270, 180: 0, 270: 90}
                         orientation = angle_map.get(cardinal, 0)
@@ -3639,10 +3722,16 @@ class KiCADInterface:
                             reference = existing.group(1)
                             unit = existing.group(2)
                             new_entry = f'(path "{target_path}" (reference "{reference}") (unit {unit}))'
-                            # Insert after the last existing path closes, before project+instances close
-                            # Block ends: ...last_path_close)) where )) = project + instances
-                            block = block[:-2] + " " + new_entry + "))"
-                            changed = True
+                            # Find the (project ...) sub-block and insert the new path entry
+                            # before its closing ')'. This works for both single-line
+                            # (MCP-generated) and multi-line (KiCad-saved) files, because
+                            # we use balanced-paren counting rather than assuming the block
+                            # ends with exactly ")) ".
+                            proj_start = block.find("(project ")
+                            if proj_start != -1:
+                                proj_end = _find_balanced_end(block, proj_start)
+                                block = block[:proj_end] + " " + new_entry + block[proj_end:]
+                                changed = True
                     result_parts.append(block)
                     pos = end + 1
 
@@ -3998,6 +4087,77 @@ class KiCADInterface:
                 logger.warning(f"Could not restore sym-lib-table backup: {ex}")
 
         return cleanup
+
+    def _handle_validate_schematic(self, params):
+        """Check parenthesis balance and basic structure of a .kicad_sch file without fully loading it."""
+        logger.info("Validating schematic syntax")
+        try:
+            from pathlib import Path
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            sch_file = Path(schematic_path)
+            if not sch_file.exists():
+                return {"success": False, "message": f"File not found: {schematic_path}"}
+
+            with open(sch_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            depth = 0
+            in_string = False
+            escape_next = False
+            error_line = None
+            error_char = None
+            line_num = 1
+
+            for i, ch in enumerate(content):
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == "\n":
+                    line_num += 1
+                if in_string:
+                    if ch == "\\":
+                        escape_next = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                    continue
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth < 0:
+                        error_line = line_num
+                        error_char = i
+                        break
+
+            if error_line is not None:
+                return {
+                    "success": False,
+                    "valid": False,
+                    "error": f"Parenthesis underflow at line {error_line} (char {error_char}): unexpected ')'",
+                    "line": error_line,
+                }
+            if depth != 0:
+                return {
+                    "success": False,
+                    "valid": False,
+                    "error": f"Parenthesis mismatch: {depth} unclosed '(' at end of file",
+                    "unclosed": depth,
+                }
+            return {
+                "success": True,
+                "valid": True,
+                "message": f"Schematic syntax OK ({len(content)} bytes, {line_num} lines)",
+            }
+        except Exception as e:
+            logger.error(f"Error validating schematic: {e}")
+            return {"success": False, "message": str(e)}
 
     def _handle_run_erc(self, params):
         """Run Electrical Rules Check on a schematic via kicad-cli"""
