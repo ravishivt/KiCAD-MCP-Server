@@ -1019,6 +1019,16 @@ class KiCADInterface:
                         "snapped_position": {"x": _snap(x), "y": _snap(y)},
                     }
 
+                    # Validate footprint — warn per-component without blocking placement.
+                    if footprint:
+                        fp_resolved = self.footprint_library.find_footprint(footprint)
+                        if fp_resolved is None:
+                            entry["footprint_warning"] = (
+                                f"Footprint '{footprint}' was not found in any registered library. "
+                                "The component was placed but the footprint link may be invalid. "
+                                "Use search_footprints to find a valid footprint string."
+                            )
+
                     if include_pins:
                         # Invalidate the stale cached Schematic object — loader.add_component
                         # just wrote a new version to disk, so the cached parse is out of date.

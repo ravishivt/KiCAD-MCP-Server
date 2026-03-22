@@ -54,6 +54,21 @@ class LibraryManager:
 
         logger.info(f"Loaded {len(self.libraries)} footprint libraries")
 
+        # Fallback: if no libraries were found via fp-lib-table, scan the KiCad
+        # system footprint directory directly.  This handles fresh installs where
+        # the user's fp-lib-table hasn't been created yet (e.g. never opened the
+        # PCB footprint editor).
+        if not self.libraries:
+            logger.info("No libraries loaded from fp-lib-table; falling back to direct scan")
+            footprint_dir = self._find_kicad_footprint_dir()
+            if footprint_dir:
+                for pretty_dir in Path(footprint_dir).glob("*.pretty"):
+                    nickname = pretty_dir.stem
+                    self.libraries[nickname] = str(pretty_dir)
+                logger.info(
+                    f"Direct scan found {len(self.libraries)} footprint libraries in {footprint_dir}"
+                )
+
     def _get_global_fp_lib_table(self) -> Optional[Path]:
         """Get path to global fp-lib-table file"""
         # Try different possible locations

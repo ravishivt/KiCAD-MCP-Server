@@ -171,6 +171,7 @@ export function registerSchematicTools(
           );
           lines.push(`  ${comp.reference} (${comp.symbol}) @ (${pos?.x}, ${pos?.y})`);
           if (pinLines.length) lines.push(...pinLines);
+          if (comp.footprint_warning) lines.push(`      [footprint_warning] ${comp.footprint_warning}`);
           if (comp.pins_error) lines.push(`      [pins_error] ${comp.pins_error}`);
         }
         if (result.errors?.length) {

@@ -121,6 +121,19 @@ export const toolCategories: ToolCategory[] = [
     ]
   },
   {
+    name: "symbol_library",
+    description: "Symbol library access: search symbols, list pins, browse KiCad and project-local libraries",
+    tools: [
+      "list_symbol_libraries",
+      "search_symbols",
+      "search_schematic_symbols",
+      "list_library_symbols",
+      "get_symbol_info",
+      "list_symbol_pins",
+      "batch_list_symbol_pins"
+    ]
+  },
+  {
     name: "routing",
     description: "Advanced routing operations: vias, copper pours",
     tools: [
@@ -165,11 +178,16 @@ export const directToolNames = [
 
   // Schematic essentials (always visible so AI uses them correctly)
   "add_schematic_component",
+  "batch_add_components",
   "list_schematic_components",
   "annotate_schematic",
   "connect_passthrough",
   "connect_to_net",
   "add_schematic_net_label",
+
+  // Symbol pin discovery — always surface both so AI picks the batch form
+  "list_symbol_pins",
+  "batch_list_symbol_pins",
 
   // Schematic <-> PCB sync (F8 equivalent)
   "sync_schematic_to_board",
