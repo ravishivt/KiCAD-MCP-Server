@@ -4192,6 +4192,30 @@ class KiCADInterface:
             # can open project-local libraries that use relative paths.
             erc_cleanup = self._resolve_sym_lib_table_for_erc(schematic_path)
 
+            # kicad-cli determines the project by finding a .kicad_pro file with
+            # the same basename as the input schematic. Sub-sheets don't have their
+            # own .kicad_pro, so kicad-cli falls back to the global library tables
+            # (which may resolve to wrong paths) and produces spurious warnings.
+            # Fix: temporarily symlink the parent .kicad_pro using the sub-sheet's
+            # basename so kicad-cli loads the correct project library tables.
+            from pathlib import Path
+            sch_path_obj = Path(schematic_path)
+            project_dir = sch_path_obj.parent
+            expected_pro = sch_path_obj.with_suffix(".kicad_pro")
+            tmp_pro_symlink = None
+            if not expected_pro.exists():
+                existing_pros = list(project_dir.glob("*.kicad_pro"))
+                if existing_pros:
+                    tmp_pro_symlink = expected_pro
+                    try:
+                        tmp_pro_symlink.symlink_to(existing_pros[0].name)
+                        logger.info(
+                            f"Created temporary project symlink {tmp_pro_symlink.name} -> {existing_pros[0].name}"
+                        )
+                    except Exception as _sym_err:
+                        logger.warning(f"Could not create project symlink: {_sym_err}")
+                        tmp_pro_symlink = None
+
             try:
                 cmd = [
                     kicad_cli,
@@ -4310,6 +4334,12 @@ class KiCADInterface:
                     os.unlink(json_output)
                 if erc_cleanup:
                     erc_cleanup()
+                if tmp_pro_symlink is not None and tmp_pro_symlink.is_symlink():
+                    try:
+                        tmp_pro_symlink.unlink()
+                        logger.info(f"Removed temporary project symlink {tmp_pro_symlink.name}")
+                    except Exception as _del_err:
+                        logger.warning(f"Could not remove project symlink: {_del_err}")
 
         except subprocess.TimeoutExpired:
             return {"success": False, "message": "ERC timed out after 120 seconds"}
