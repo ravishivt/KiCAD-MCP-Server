@@ -7,6 +7,7 @@ on-the-fly using TEXT MANIPULATION (not sexpdata) to preserve file formatting.
 This enables access to all ~10,000+ KiCad symbols dynamically.
 """
 
+import math
 import os
 import re
 import uuid
@@ -22,6 +23,154 @@ _SCHEMATIC_GRID_MM = 1.27  # 50mil — KiCAD standard schematic grid
 def _snap(val: float) -> float:
     """Round a coordinate to the nearest KiCAD schematic grid point (50mil = 1.27mm)."""
     return round(round(val / _SCHEMATIC_GRID_MM) * _SCHEMATIC_GRID_MM, 4)
+
+
+def _get_lib_pin_schematic_bbox(content: str, full_lib_id: str,
+                                comp_x: float, comp_y: float, rotation: float) -> Optional[dict]:
+    """Compute the body bounding-box from lib pin endpoints in schematic coordinates.
+
+    Returns {"x_min", "x_max", "y_min", "y_max"} with 1.27mm padding, or None if no pins found.
+    """
+    lib_start = content.find("(lib_symbols")
+    if lib_start < 0:
+        return None
+    depth = 0
+    lib_end = lib_start
+    for i in range(lib_start, len(content)):
+        if content[i] == "(":
+            depth += 1
+        elif content[i] == ")":
+            depth -= 1
+            if depth == 0:
+                lib_end = i + 1
+                break
+    lib_section = content[lib_start:lib_end]
+
+    sym_marker = f'(symbol "{full_lib_id}"'
+    sym_start = lib_section.find(sym_marker)
+    if sym_start < 0:
+        return None
+    depth = 0
+    sym_end = sym_start
+    for i in range(sym_start, len(lib_section)):
+        if lib_section[i] == "(":
+            depth += 1
+        elif lib_section[i] == ")":
+            depth -= 1
+            if depth == 0:
+                sym_end = i + 1
+                break
+    sym_block = lib_section[sym_start:sym_end]
+
+    # Extract all pin endpoints: (pin TYPE SHAPE (at X Y angle) ...)
+    # KiCAD pin format: (pin passive line (at 0 3.81 270) (length 2.794) ...)
+    pin_pattern = re.compile(r'\(pin\s+\S+\s+\S+\s+\(at\s+([-\d.]+)\s+([-\d.]+)', re.DOTALL)
+    rot_rad = math.radians(rotation)
+    cos_r = math.cos(rot_rad)
+    sin_r = math.sin(rot_rad)
+    xs, ys = [], []
+    for m in pin_pattern.finditer(sym_block):
+        px_lib = float(m.group(1))
+        py_lib = float(m.group(2))
+        # Y-flip then rotate (same as _transform_pin_to_schematic)
+        px_sch = px_lib
+        py_sch = -py_lib
+        rx = px_sch * cos_r + py_sch * sin_r
+        ry = -px_sch * sin_r + py_sch * cos_r
+        xs.append(comp_x + rx)
+        ys.append(comp_y + ry)
+
+    if not xs:
+        return None
+    pad = 1.27
+    return {
+        "x_min": min(xs) - pad,
+        "x_max": max(xs) + pad,
+        "y_min": min(ys) - pad,
+        "y_max": max(ys) + pad,
+    }
+
+
+def _get_lib_field_positions(content: str, full_lib_id: str) -> dict:
+    """Extract Reference and Value field default positions from the lib_symbols section.
+
+    Symbols store field positions in symbol-local coordinates with y-UP (math convention).
+    Returns {"Reference": {"x": float, "y": float, "angle": float}, "Value": {...}} or {}.
+    """
+    lib_start = content.find("(lib_symbols")
+    if lib_start < 0:
+        return {}
+    # Find the matching close paren of (lib_symbols ...)
+    depth = 0
+    lib_end = lib_start
+    for i in range(lib_start, len(content)):
+        if content[i] == "(":
+            depth += 1
+        elif content[i] == ")":
+            depth -= 1
+            if depth == 0:
+                lib_end = i + 1
+                break
+    lib_section = content[lib_start:lib_end]
+
+    # Locate this specific symbol's block within lib_symbols
+    # Use escaped name to handle special chars like : + etc.
+    sym_marker = f'(symbol "{full_lib_id}"'
+    sym_start = lib_section.find(sym_marker)
+    if sym_start < 0:
+        return {}
+    depth = 0
+    sym_end = sym_start
+    for i in range(sym_start, len(lib_section)):
+        if lib_section[i] == "(":
+            depth += 1
+        elif lib_section[i] == ")":
+            depth -= 1
+            if depth == 0:
+                sym_end = i + 1
+                break
+    sym_block = lib_section[sym_start:sym_end]
+
+    fields = {}
+    for field_name in ("Reference", "Value"):
+        pattern = (
+            r'\(property\s+"' + re.escape(field_name) + r'"\s+"[^"]*"\s+'
+            r'\(at\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\)'
+        )
+        m = re.search(pattern, sym_block, re.DOTALL)
+        if m:
+            fields[field_name] = {
+                "x": float(m.group(1)),
+                "y": float(m.group(2)),
+                "angle": float(m.group(3)),
+            }
+    return fields
+
+
+def _transform_field_to_schematic(
+    sym_x: float, sym_y: float, sym_angle: float,
+    comp_x: float, comp_y: float, rotation: float
+) -> tuple:
+    """Transform a symbol-local field position (y-UP) to schematic-absolute (y-DOWN).
+
+    KiCAD screen rotation θ is CCW on screen (y-down). The symbol library stores coords
+    in y-UP math space. The combined transform is:
+        x_sch = comp_x + sym_x * cos(θ) + sym_y * sin(θ)
+        y_sch = comp_y + sym_x * sin(θ) - sym_y * cos(θ)
+    Text angle in screen space = (sym_angle + θ) mod 360, then normalized so text
+    is never upside-down (i.e., angle > 90 and ≤ 270 → subtract 180).
+    Returns (x_sch, y_sch, screen_angle) all snapped / rounded.
+    """
+    rot_rad = math.radians(rotation)
+    cos_r = math.cos(rot_rad)
+    sin_r = math.sin(rot_rad)
+    x_sch = comp_x + sym_x * cos_r + sym_y * sin_r
+    y_sch = comp_y + sym_x * sin_r - sym_y * cos_r
+    screen_angle = (sym_angle + rotation) % 360
+    # Normalize: keep text readable (never upside-down)
+    if 90 < screen_angle <= 270:
+        screen_angle = (screen_angle + 180) % 360
+    return _snap(x_sch), _snap(y_sch), int(screen_angle)
 
 
 def _find_project_root(start_dir: Path) -> Path:
@@ -509,13 +658,125 @@ class DynamicSymbolLoader:
         sch_uuid = sch_uuid_match.group(1) if sch_uuid_match else ""
         instance_path = f"/{sch_uuid}" if sch_uuid else "/"
 
+        # Compute field positions from library defaults (so they match KiCAD conventions
+        # per symbol and rotation), with a sensible fallback when extraction fails.
+        lib_fields = _get_lib_field_positions(content, full_lib_id)
+        rot_n = int(rotation) % 360
+
+        if "Reference" in lib_fields:
+            lf = lib_fields["Reference"]
+            ref_x, ref_y, _ = _transform_field_to_schematic(
+                lf["x"], lf["y"], lf["angle"], x, y, rotation
+            )
+        else:
+            # Fallback: rotation-aware defaults
+            # rot=0/180 (vertical body) → ref to left; rot=90/270 (horizontal) → ref above
+            if rot_n in (0, 180):
+                ref_x, ref_y = _snap(x - 2.54), y
+            else:
+                ref_x, ref_y = x, _snap(y - 2.54)
+        # Always write angle=0 so ref text is horizontal/readable regardless of symbol rotation.
+        # Rotated ref/val text is nearly always an error in practice.
+        ref_angle = 0
+
+        if "Value" in lib_fields:
+            lf = lib_fields["Value"]
+            val_x, val_y, _ = _transform_field_to_schematic(
+                lf["x"], lf["y"], lf["angle"], x, y, rotation
+            )
+        else:
+            if rot_n in (0, 180):
+                val_x, val_y = _snap(x + 2.54), y
+            else:
+                val_x, val_y = x, _snap(y + 2.54)
+        val_angle = 0  # always horizontal
+
+        # ── Field clearance enforcement ────────────────────────────────────────
+        # Strategy differs by pin count:
+        #
+        # 2-pin passives (R, C, L, Polyfuse, FerriteBead, …):
+        #   KiCAD convention places ref/val between the body and pin tips.  For
+        #   VERTICAL bodies (rot 0°/180°), these positions are intentional; don't
+        #   disturb them.  For HORIZONTAL bodies (rot 90°/270°) the transverse body
+        #   extent is only ~1.5mm, so lib-inherited offsets of ±2.54mm land too close
+        #   to the body edge → enforce ≥ 3.81mm clearance in the y-axis.
+        #
+        # Multi-pin ICs and custom symbols:
+        #   Lib field positions may be inside the pin-spread body bbox (common for
+        #   project-specific symbols).  Push fields outside the bbox with 1.5mm gap.
+
+        body_bb = _get_lib_pin_schematic_bbox(content, full_lib_id, x, y, rotation)
+        n_lib_pins = 0
+        if body_bb is not None:
+            # Count pins to decide strategy (reuse the same section we just parsed)
+            pin_pat = re.compile(r'\(pin\s+\S+\s+\S+\s+\(at\s+[-\d.]+\s+[-\d.]+')
+            lib_start = content.find("(lib_symbols")
+            sym_marker = f'(symbol "{full_lib_id}"'
+            sym_s = content.find(sym_marker, lib_start)
+            if sym_s >= 0:
+                depth = 0
+                for ci in range(sym_s, len(content)):
+                    if content[ci] == "(":
+                        depth += 1
+                    elif content[ci] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            n_lib_pins = len(pin_pat.findall(content[sym_s:ci + 1]))
+                            break
+
+        if rot_n in (90, 270) and n_lib_pins == 2:
+            # Horizontal 2-pin body: enforce minimum y-clearance from center for
+            # fields that are stacked directly above/below (same x as component).
+            MIN_INLINE = 3.81  # 3 × grid steps
+            INLINE_TOL = 0.5
+            for attr_x, attr_y, is_ref in [(ref_x, ref_y, True), (val_x, val_y, False)]:
+                new_y = attr_y
+                if abs(attr_x - x) <= INLINE_TOL and abs(attr_y - y) < MIN_INLINE:
+                    sign = -1 if attr_y <= y else 1
+                    new_y = _snap(y + sign * MIN_INLINE)
+                if is_ref:
+                    ref_y = new_y
+                else:
+                    val_y = new_y
+
+        elif n_lib_pins > 2 and body_bb is not None:
+            # Multi-pin: push fields outside the pin-spread body bbox.
+            MIN_BODY_GAP = 1.5  # mm between field anchor and bbox edge
+
+            def _push_outside_bbox(fx, fy, bb, gap):
+                """Nudge (fx, fy) outside bb + gap margin, choosing nearest edge."""
+                in_x = (bb["x_min"] - gap) <= fx <= (bb["x_max"] + gap)
+                in_y = (bb["y_min"] - gap) <= fy <= (bb["y_max"] + gap)
+                if not (in_x and in_y):
+                    return fx, fy
+                edges = [
+                    (fy - (bb["y_min"] - gap), "top"),
+                    ((bb["y_max"] + gap) - fy, "bottom"),
+                    (fx - (bb["x_min"] - gap), "left"),
+                    ((bb["x_max"] + gap) - fx, "right"),
+                ]
+                best = min(edges, key=lambda e: e[0])
+                if best[1] == "top":
+                    return fx, _snap(bb["y_min"] - gap)
+                elif best[1] == "bottom":
+                    return fx, _snap(bb["y_max"] + gap)
+                elif best[1] == "left":
+                    return _snap(bb["x_min"] - gap), fy
+                else:
+                    return _snap(bb["x_max"] + gap), fy
+
+            ref_x, ref_y = _push_outside_bbox(ref_x, ref_y, body_bb, MIN_BODY_GAP)
+            val_x, val_y = _push_outside_bbox(val_x, val_y, body_bb, MIN_BODY_GAP)
+
+        # ── End field clearance enforcement ────────────────────────────────────
+
         instance_block = f"""  (symbol (lib_id "{full_lib_id}") (at {x} {y} {int(rotation)}) (unit 1)
     (in_bom yes) (on_board yes) (dnp no)
     (uuid "{new_uuid}")
-    (property "Reference" "{reference}" (at {x} {y - 2.54} 0)
+    (property "Reference" "{reference}" (at {ref_x} {ref_y} {ref_angle})
       (effects (font (size 1.27 1.27)))
     )
-    (property "Value" "{value or symbol_name}" (at {x} {y + 2.54} 0)
+    (property "Value" "{value or symbol_name}" (at {val_x} {val_y} {val_angle})
       (effects (font (size 1.27 1.27)))
     )
     (property "Footprint" "{footprint}" (at {x} {y} 0)

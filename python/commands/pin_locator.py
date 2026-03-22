@@ -384,9 +384,17 @@ class PinLocator:
                 return None
 
             comp_x, comp_y, rotation, mirror_x, mirror_y = self._get_component_transform(symbol)
-            return self._transform_pin_angle_to_schematic(
-                pin_data.get("angle", 0), rotation, mirror_x, mirror_y
-            )
+            # Compute outward pin angle: lib_angle + component_rotation.
+            # kicad-skip returns the raw lib angle (no Y-flip); the fallback must match.
+            # The Y-flip in _transform_pin_angle_to_schematic incorrectly inverts 90°/270°
+            # angles at rotation=0, causing bottom-facing pins to get "upward" orientation.
+            lib_angle = float(pin_data.get("angle", 0))
+            angle = (lib_angle + rotation) % 360
+            if mirror_x:
+                angle = (180 - angle) % 360  # reflect about Y-axis: swaps left↔right
+            if mirror_y:
+                angle = (-angle) % 360        # reflect about X-axis: swaps up↔down
+            return angle
         except Exception:
             return None
 

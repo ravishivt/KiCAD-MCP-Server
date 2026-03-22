@@ -394,6 +394,7 @@ class KiCADInterface:
             "add_schematic_wire": self._handle_add_schematic_wire,
             "add_schematic_connection": self._handle_add_schematic_connection,
             "add_schematic_net_label": self._handle_add_schematic_net_label,
+            "set_schematic_property_position": self._handle_set_schematic_property_position,
             "add_no_connect": self._handle_add_no_connect,
             "save_schematic": self._handle_save_schematic,
             "connect_to_net": self._handle_connect_to_net,
@@ -413,6 +414,7 @@ class KiCADInterface:
             "list_schematic_libraries": self._handle_list_schematic_libraries,
             "get_schematic_view": self._handle_get_schematic_view,
             "list_schematic_components": self._handle_list_schematic_components,
+            "check_schematic_layout": self._handle_check_schematic_layout,
             "list_schematic_nets": self._handle_list_schematic_nets,
             "find_single_pin_nets": self._handle_find_single_pin_nets,
             "classify_nets": self._handle_classify_nets,
@@ -527,6 +529,42 @@ class KiCADInterface:
                 continue
             props[name] = value
         return props
+
+    @staticmethod
+    def _extract_property_position(block_text: str, property_name: str):
+        """Extract the (at x y angle) from a named property inside a symbol block.
+        Returns {"x": float, "y": float, "angle": float} or None if not found."""
+        import re
+        pat = re.compile(
+            r'\(property\s+"' + re.escape(property_name) + r'"\s+"[^"]*"\s+\(at\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\)'
+        )
+        m = pat.search(block_text)
+        if m:
+            return {"x": float(m.group(1)), "y": float(m.group(2)), "angle": float(m.group(3))}
+        return None
+
+    @staticmethod
+    def _extract_property_visible(block_text: str, property_name: str) -> bool:
+        """Return True if the named property is visible (no hide flag), False if hidden."""
+        import re
+        prop_pat = re.compile(r'\(property\s+"' + re.escape(property_name) + r'"')
+        m = prop_pat.search(block_text)
+        if not m:
+            return True
+        # Walk parens to extract the full property sub-expression
+        start = m.start()
+        depth = 0
+        i = start
+        while i < len(block_text):
+            if block_text[i] == '(':
+                depth += 1
+            elif block_text[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    prop_sub = block_text[start:i + 1]
+                    return '(hide yes)' not in prop_sub and '(hide)' not in prop_sub
+            i += 1
+        return True
 
     @staticmethod
     def _find_placed_symbol_block(content: str, reference: str):
@@ -971,6 +1009,8 @@ class KiCADInterface:
 
             schematic_path = params.get("schematicPath")
             components = params.get("components", [])
+            origin_x = params.get("origin_x", 0) or 0
+            origin_y = params.get("origin_y", 0) or 0
 
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
@@ -996,8 +1036,8 @@ class KiCADInterface:
                 value = comp.get("value", sym_name)
                 footprint = comp.get("footprint", "")
                 pos = comp.get("position", {})
-                x = pos.get("x", 0) if isinstance(pos, dict) else 0
-                y = pos.get("y", 0) if isinstance(pos, dict) else 0
+                x = (pos.get("x", 0) if isinstance(pos, dict) else 0) + origin_x
+                y = (pos.get("y", 0) if isinstance(pos, dict) else 0) + origin_y
                 rotation = comp.get("rotation", 0)
                 include_pins = comp.get("includePins", False)
 
@@ -1032,10 +1072,24 @@ class KiCADInterface:
                                 "Use search_footprints to find a valid footprint string."
                             )
 
+                    # Extract property positions and body bbox (best-effort)
+                    try:
+                        raw_content = schematic_file.read_text(encoding="utf-8")
+                        block_text, _, _ = KiCADInterface._find_placed_symbol_block(raw_content, reference)
+                        if block_text:
+                            ref_pos = KiCADInterface._extract_property_position(block_text, "Reference")
+                            val_pos = KiCADInterface._extract_property_position(block_text, "Value")
+                            if ref_pos:
+                                entry["ref_position"] = ref_pos
+                            if val_pos:
+                                entry["value_position"] = val_pos
+                    except Exception:
+                        pass
+
+                    # Always invalidate cache after placement so pin/bbox lookups are fresh
+                    locator._schematic_cache.pop(str(schematic_file), None)
+
                     if include_pins:
-                        # Invalidate the stale cached Schematic object — loader.add_component
-                        # just wrote a new version to disk, so the cached parse is out of date.
-                        locator._schematic_cache.pop(str(schematic_file), None)
                         pins_raw = locator.get_all_symbol_pins(schematic_file, reference) or {}
                         pins_def = locator.get_symbol_pins(schematic_file, symbol) or {}
                         pins = {}
@@ -1051,6 +1105,28 @@ class KiCADInterface:
                                 f"Pin extraction returned no data for {reference} ({symbol}). "
                                 "Use get_schematic_pin_locations as a follow-up if pin coordinates are needed."
                             )
+
+                    # Compute body_bbox from pin spread (best-effort), fall back to center ± 2.54mm
+                    try:
+                        pins_raw_for_bbox = (
+                            {k: (v["x"], v["y"]) for k, v in entry.get("pins", {}).items()}
+                            if include_pins and entry.get("pins")
+                            else (locator.get_all_symbol_pins(schematic_file, reference) or {})
+                        )
+                        if pins_raw_for_bbox:
+                            xs = [c[0] if isinstance(c, (list, tuple)) else c["x"] for c in pins_raw_for_bbox.values()]
+                            ys = [c[1] if isinstance(c, (list, tuple)) else c["y"] for c in pins_raw_for_bbox.values()]
+                            pad = 1.27
+                            entry["body_bbox"] = {
+                                "x_min": min(xs) - pad, "y_min": min(ys) - pad,
+                                "x_max": max(xs) + pad, "y_max": max(ys) + pad,
+                            }
+                        else:
+                            cx, cy = _snap(x), _snap(y)
+                            entry["body_bbox"] = {"x_min": cx - 2.54, "y_min": cy - 2.54, "x_max": cx + 2.54, "y_max": cy + 2.54}
+                    except Exception:
+                        cx, cy = _snap(x), _snap(y)
+                        entry["body_bbox"] = {"x_min": cx - 2.54, "y_min": cy - 2.54, "x_max": cx + 2.54, "y_max": cy + 2.54}
 
                     results.append(entry)
 
@@ -1072,12 +1148,26 @@ class KiCADInterface:
                 except Exception:
                     pass
 
+            # Compute overall placement bounding box from all placed components
+            placement_bbox = None
+            if results:
+                all_x_min = [r["body_bbox"]["x_min"] for r in results if "body_bbox" in r]
+                all_y_min = [r["body_bbox"]["y_min"] for r in results if "body_bbox" in r]
+                all_x_max = [r["body_bbox"]["x_max"] for r in results if "body_bbox" in r]
+                all_y_max = [r["body_bbox"]["y_max"] for r in results if "body_bbox" in r]
+                if all_x_min:
+                    placement_bbox = {
+                        "x_min": min(all_x_min), "y_min": min(all_y_min),
+                        "x_max": max(all_x_max), "y_max": max(all_y_max),
+                    }
+
             return {
                 "success": len(errors) == 0,
                 "added": results,
                 "errors": errors,
                 "added_count": len(results),
                 "error_count": len(errors),
+                "placement_bbox": placement_bbox,
             }
 
         except Exception as e:
@@ -1832,7 +1922,10 @@ class KiCADInterface:
             label_type = params.get(
                 "labelType", "label"
             )  # 'label', 'global_label', 'hierarchical_label'
-            orientation = params.get("orientation", 0)  # 0, 90, 180, 270
+            # Support both 'angle' (new) and 'orientation' (legacy) parameter names
+            orientation = params.get("angle", params.get("orientation", 0))  # 0, 90, 180, 270
+            # justify=None means auto-derive from angle in WireManager
+            justify = params.get("justify", None)
 
             if not all([schematic_path, net_name, position]):
                 return {"success": False, "message": "Missing required parameters"}
@@ -1844,6 +1937,7 @@ class KiCADInterface:
                 position,
                 label_type=label_type,
                 orientation=orientation,
+                justify=justify,
             )
 
             if success:
@@ -1863,6 +1957,104 @@ class KiCADInterface:
                 "message": str(e),
                 "errorDetails": traceback.format_exc(),
             }
+
+    def _handle_set_schematic_property_position(self, params):
+        """Move a symbol's Reference or Value property field to a new coordinate."""
+        import re
+        logger.info("Setting schematic property position")
+        try:
+            from pathlib import Path
+
+            schematic_path = params.get("schematicPath")
+            reference = params.get("reference")
+            property_name = params.get("property")
+            x = params.get("x")
+            y = params.get("y")
+            angle = params.get("angle", 0)
+            visible = params.get("visible", True)
+
+            if not all([schematic_path, reference, property_name, x is not None, y is not None]):
+                return {"success": False, "message": "Missing required parameters: schematicPath, reference, property, x, y"}
+            if property_name not in ("Reference", "Value"):
+                return {"success": False, "message": "property must be 'Reference' or 'Value'"}
+
+            sch_path = Path(schematic_path)
+            if not sch_path.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            with open(sch_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            block_text, block_start, block_end = KiCADInterface._find_placed_symbol_block(content, reference)
+            if block_text is None:
+                return {"success": False, "message": f"Component '{reference}' not found in schematic"}
+
+            # Record old position for reporting
+            old_pos = KiCADInterface._extract_property_position(block_text, property_name)
+
+            # Replace (at X Y ANGLE) inside the target property
+            prop_pat = re.compile(
+                r'(\(property\s+"' + re.escape(property_name) + r'"\s+"[^"]*"\s+)\(at\s+[-\d.]+\s+[-\d.]+\s+[-\d.]+\)'
+            )
+            new_at = f"(at {x} {y} {angle})"
+            new_block, n_subs = prop_pat.subn(r'\g<1>' + new_at, block_text)
+            if n_subs == 0:
+                return {"success": False, "message": f"Property '{property_name}' not found in {reference}"}
+
+            # Handle visibility: find property sub-expression and add/remove (hide yes)
+            prop_sub_m = re.search(r'\(property\s+"' + re.escape(property_name) + r'"', new_block)
+            if prop_sub_m:
+                ps = prop_sub_m.start()
+                depth = 0
+                i = ps
+                while i < len(new_block):
+                    if new_block[i] == '(':
+                        depth += 1
+                    elif new_block[i] == ')':
+                        depth -= 1
+                        if depth == 0:
+                            pe = i
+                            break
+                    i += 1
+                prop_sub = new_block[ps:pe + 1]
+                is_hidden = '(hide yes)' in prop_sub or '(hide)' in prop_sub
+                if not visible and not is_hidden:
+                    # Find (effects ...) and insert (hide yes) before its closing paren
+                    eff_m = re.search(r'\(effects', prop_sub)
+                    if eff_m:
+                        eff_start = eff_m.start()
+                        edepth = 0
+                        ei = eff_start
+                        while ei < len(prop_sub):
+                            if prop_sub[ei] == '(':
+                                edepth += 1
+                            elif prop_sub[ei] == ')':
+                                edepth -= 1
+                                if edepth == 0:
+                                    eff_end = ei
+                                    break
+                            ei += 1
+                        new_eff = prop_sub[eff_start:eff_end] + " (hide yes))"
+                        prop_sub = prop_sub[:eff_start] + new_eff + prop_sub[eff_end + 1:]
+                elif visible and is_hidden:
+                    prop_sub = prop_sub.replace(' (hide yes)', '').replace('(hide yes) ', '').replace('(hide yes)', '')
+                    prop_sub = prop_sub.replace(' (hide)', '').replace('(hide) ', '').replace('(hide)', '')
+                new_block = new_block[:ps] + prop_sub + new_block[pe + 1:]
+
+            new_content = content[:block_start] + new_block + content[block_end + 1:]
+            with open(sch_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+
+            old_str = f"({old_pos['x']}, {old_pos['y']}, {old_pos['angle']}°)" if old_pos else "unknown"
+            return {
+                "success": True,
+                "message": f"Moved {reference}.{property_name} from {old_str} to ({x}, {y}, {angle}°)",
+            }
+        except Exception as e:
+            logger.error(f"Error setting property position: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
 
     def _handle_add_no_connect(self, params):
         """Add a no-connect flag to mark an intentionally unconnected pin"""
@@ -2446,6 +2638,37 @@ class KiCADInterface:
             logger.error(f"Error in batch_list_symbol_pins: {str(e)}")
             return {"success": False, "message": str(e)}
 
+    @staticmethod
+    def _get_sheet_usable_area(schematic_path):
+        """Return (left, top, right, bottom) usable area boundaries in mm for the schematic's paper size."""
+        # KiCad border frame is approximately 12.7mm from each edge
+        paper_dims = {
+            "A4": (297.0, 210.0),
+            "A3": (420.0, 297.0),
+            "A2": (594.0, 420.0),
+            "A1": (841.0, 594.0),
+            "A0": (1189.0, 841.0),
+            "A": (279.4, 215.9),   # US Letter
+            "B": (431.8, 279.4),   # US Tabloid
+            "C": (558.8, 431.8),
+            "D": (863.6, 558.8),
+            "E": (1117.6, 863.6),
+        }
+        border = 12.7
+        width, height = 297.0, 210.0  # default A4
+        try:
+            import re
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read(4096)  # Only need the header
+            m = re.search(r'\(paper\s+"([^"]+)"', content)
+            if m:
+                paper = m.group(1).strip()
+                if paper in paper_dims:
+                    width, height = paper_dims[paper]
+        except Exception:
+            pass
+        return (border, border, width - border, height - border)
+
     def _handle_get_schematic_pin_locations(self, params):
         """Return exact pin endpoint coordinates for one or more schematic components"""
         logger.info("Getting schematic pin locations")
@@ -2474,6 +2697,11 @@ class KiCADInterface:
             sch_path = Path(schematic_path)
             components_result = {}
 
+            # Sheet boundaries for near_boundary detection
+            left_b, top_b, right_b, bottom_b = KiCADInterface._get_sheet_usable_area(schematic_path)
+            near_threshold = 20.0
+            worst_case_label_mm = 15.0  # 10 chars × ~1.5mm/char
+
             for reference in references:
                 all_pins = locator.get_all_symbol_pins(sch_path, reference)
                 if not all_pins:
@@ -2485,9 +2713,21 @@ class KiCADInterface:
 
                 pins_out = {}
                 for pin_num, coords in all_pins.items():
-                    entry = {"x": coords[0], "y": coords[1]}
+                    px, py = coords[0], coords[1]
+                    entry = {"x": px, "y": py}
                     if pin_num in pins_def:
                         entry["name"] = pins_def[pin_num].get("name", pin_num)
+                    # Near-boundary detection: check left and top boundaries
+                    near_left = px - left_b < near_threshold
+                    near_top = py - top_b < near_threshold
+                    if near_left or near_top:
+                        entry["near_boundary"] = True
+                        if near_left:
+                            # Leftward label (angle=180) extends left from pin; needs pin_x - label_len >= left_b
+                            min_pin_x = left_b + worst_case_label_mm
+                            entry["suggested_component_x_offset"] = round(max(0.0, min_pin_x - px), 2)
+                    else:
+                        entry["near_boundary"] = False
                     pins_out[pin_num] = entry
                 components_result[reference] = pins_out
 
@@ -2712,6 +2952,7 @@ class KiCADInterface:
                 }
 
                 # Extract all KiCad properties (MPN, Description, Manufacturer, etc.)
+                # and Reference/Value field positions
                 try:
                     block_text, _, _ = KiCADInterface._find_placed_symbol_block(
                         raw_content, ref
@@ -2720,6 +2961,14 @@ class KiCADInterface:
                         comp["properties"] = KiCADInterface._extract_component_properties(
                             block_text
                         )
+                        ref_pos = KiCADInterface._extract_property_position(block_text, "Reference")
+                        if ref_pos:
+                            ref_pos["visible"] = KiCADInterface._extract_property_visible(block_text, "Reference")
+                            comp["ref_field"] = ref_pos
+                        val_pos = KiCADInterface._extract_property_position(block_text, "Value")
+                        if val_pos:
+                            val_pos["visible"] = KiCADInterface._extract_property_visible(block_text, "Value")
+                            comp["value_field"] = val_pos
                 except Exception:
                     pass
 
@@ -2744,6 +2993,11 @@ class KiCADInterface:
                             xs = [p["position"]["x"] for p in pin_list]
                             ys = [p["position"]["y"] for p in pin_list]
                             comp["bounds"] = {"minX": min(xs), "maxX": max(xs), "minY": min(ys), "maxY": max(ys)}
+                            pad = 1.27
+                            comp["body_bbox"] = {
+                                "x_min": min(xs) - pad, "y_min": min(ys) - pad,
+                                "x_max": max(xs) + pad, "y_max": max(ys) + pad,
+                            }
                 except Exception:
                     pass  # Pin lookup is best-effort
 
@@ -2755,6 +3009,209 @@ class KiCADInterface:
             logger.error(f"Error listing schematic components: {e}")
             import traceback
 
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_check_schematic_layout(self, params):
+        """Analyze a schematic for layout violations: out-of-bounds, overlaps, misplaced text."""
+        logger.info("Checking schematic layout")
+        try:
+            from pathlib import Path
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            sch_file = Path(schematic_path)
+            if not sch_file.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            # Get sheet usable area
+            left_b, top_b, right_b, bottom_b = KiCADInterface._get_sheet_usable_area(schematic_path)
+
+            # Load components (re-use list handler logic)
+            comp_result = self._handle_list_schematic_components({"schematicPath": schematic_path})
+            if not comp_result.get("success"):
+                return comp_result
+            components = comp_result.get("components", [])
+
+            # Load labels for out-of-bounds label check
+            labels_result = self._handle_list_schematic_labels({"schematicPath": schematic_path})
+            labels = labels_result.get("labels", []) if labels_result.get("success") else []
+
+            violations = []
+            chars_per_mm = 1.5  # approximate mm per character
+            worst_case_chars = 10
+
+            def bbox_overlaps(a, b, margin=0.0):
+                return (a["x_min"] - margin < b["x_max"] and a["x_max"] + margin > b["x_min"] and
+                        a["y_min"] - margin < b["y_max"] and a["y_max"] + margin > b["y_min"])
+
+            def point_in_bbox(px, py, bbox):
+                return bbox["x_min"] <= px <= bbox["x_max"] and bbox["y_min"] <= py <= bbox["y_max"]
+
+            # Build index of body_bbox per component
+            comp_bboxes = {}
+            for c in components:
+                if "body_bbox" in c:
+                    comp_bboxes[c["reference"]] = c["body_bbox"]
+                else:
+                    # Fall back to position ± small pad
+                    cx, cy = c["position"]["x"], c["position"]["y"]
+                    comp_bboxes[c["reference"]] = {"x_min": cx - 2.54, "y_min": cy - 2.54, "x_max": cx + 2.54, "y_max": cy + 2.54}
+
+            # 1. Out-of-bounds components
+            for c in components:
+                bb = comp_bboxes.get(c["reference"])
+                if bb:
+                    if bb["x_min"] < left_b or bb["x_max"] > right_b or bb["y_min"] < top_b or bb["y_max"] > bottom_b:
+                        violations.append({
+                            "type": "out_of_bounds_component",
+                            "affected_refs": [c["reference"]],
+                            "position": c["position"],
+                            "description": f"{c['reference']} body bbox [{bb['x_min']:.1f},{bb['y_min']:.1f},{bb['x_max']:.1f},{bb['y_max']:.1f}] extends outside sheet usable area [{left_b},{top_b},{right_b},{bottom_b}]",
+                        })
+
+            # 2. Out-of-bounds labels (estimate text endpoint based on angle and length)
+            for lbl in labels:
+                if lbl.get("type") not in ("net", "global"):
+                    continue
+                name = lbl.get("name", "")
+                lx = lbl["position"]["x"]
+                ly = lbl["position"]["y"]
+                angle = lbl.get("angle", 0)
+                text_len = len(name) * chars_per_mm
+                import math
+                rad = math.radians(angle)
+                end_x = lx + text_len * math.cos(rad)
+                end_y = ly + text_len * math.sin(rad)
+                out = (
+                    min(lx, end_x) < left_b or max(lx, end_x) > right_b or
+                    min(ly, end_y) < top_b or max(ly, end_y) > bottom_b
+                )
+                if out:
+                    violations.append({
+                        "type": "out_of_bounds_label",
+                        "affected_refs": [name],
+                        "position": lbl["position"],
+                        "description": f"Label '{name}' at ({lx:.1f},{ly:.1f}) angle={angle} estimated endpoint ({end_x:.1f},{end_y:.1f}) extends outside sheet boundary",
+                    })
+
+            # 3. Overlapping component bodies (within 2mm)
+            ref_list = list(comp_bboxes.keys())
+            for i in range(len(ref_list)):
+                for j in range(i + 1, len(ref_list)):
+                    ra, rb = ref_list[i], ref_list[j]
+                    if bbox_overlaps(comp_bboxes[ra], comp_bboxes[rb], margin=2.0):
+                        violations.append({
+                            "type": "overlapping_components",
+                            "affected_refs": [ra, rb],
+                            "position": None,
+                            "description": f"{ra} and {rb} body bounding boxes overlap or are within 2mm of each other",
+                        })
+
+            # 4. Ref/Val text inside parent component body
+            # Device: 2-pin passives (R, C, L, FerriteBead, Polyfuse, LED, etc.) have a tiny
+            # visible body (~1mm) but pin-spread-derived body_bbox is ~±3.81mm from center.
+            # Ref/val at pin tips (±2.54mm) would be wrongly flagged, so use center ±1mm for these.
+            def get_text_check_bbox(c, default_bb):
+                lib_id = c.get("libId", "")
+                pins = c.get("pins", [])
+                if lib_id.startswith("Device:") and len(pins) == 2:
+                    cx = c["position"]["x"]
+                    cy = c["position"]["y"]
+                    return {"x_min": cx - 1.0, "y_min": cy - 1.0, "x_max": cx + 1.0, "y_max": cy + 1.0}
+                return default_bb
+
+            for c in components:
+                parent_bb = comp_bboxes.get(c["reference"])
+                if not parent_bb:
+                    continue
+                text_bb = get_text_check_bbox(c, parent_bb)
+                for field_key, label in [("ref_field", "Reference"), ("value_field", "Value")]:
+                    field = c.get(field_key)
+                    if field and point_in_bbox(field["x"], field["y"], text_bb):
+                        violations.append({
+                            "type": "text_inside_parent_body",
+                            "affected_refs": [c["reference"]],
+                            "position": {"x": field["x"], "y": field["y"]},
+                            "description": f"{c['reference']} {label} text at ({field['x']},{field['y']}) is inside its own body bbox",
+                        })
+
+            # 5. Ref/Val text overlapping another component's body
+            for c in components:
+                for field_key, label in [("ref_field", "Reference"), ("value_field", "Value")]:
+                    field = c.get(field_key)
+                    if not field:
+                        continue
+                    for other_ref, other_bb in comp_bboxes.items():
+                        if other_ref == c["reference"]:
+                            continue
+                        if point_in_bbox(field["x"], field["y"], other_bb):
+                            violations.append({
+                                "type": "text_overlaps_other_body",
+                                "affected_refs": [c["reference"], other_ref],
+                                "position": {"x": field["x"], "y": field["y"]},
+                                "description": f"{c['reference']} {label} text at ({field['x']},{field['y']}) overlaps body of {other_ref}",
+                            })
+
+            # 6. Field text bounding-box overlap between different components.
+            # Estimate text bbox: width ≈ num_chars × 0.75mm (at 1.27mm font), height = 1.5mm.
+            # Only checks Reference and Value fields (hidden fields are excluded).
+            # Uses a simple axis-aligned bbox — text angle is ignored for speed.
+            CHAR_WIDTH_MM = 0.75  # approx glyph advance for 1.27mm KiCAD font
+            TEXT_HEIGHT_MM = 1.5  # generous height including descenders
+            FIELD_OVERLAP_MARGIN = 0.5  # mm gap still triggers a warning
+
+            def field_text_bbox(fx, fy, text):
+                half_w = max(len(str(text)) * CHAR_WIDTH_MM / 2.0, 1.0)
+                half_h = TEXT_HEIGHT_MM / 2.0
+                return {
+                    "x_min": fx - half_w,
+                    "x_max": fx + half_w,
+                    "y_min": fy - half_h,
+                    "y_max": fy + half_h,
+                }
+
+            # Build flat list of (ref, field_label, text_value, x, y) for visible fields
+            all_fields = []
+            for c in components:
+                for field_key, label in [("ref_field", "Reference"), ("value_field", "Value")]:
+                    field = c.get(field_key)
+                    if not field:
+                        continue
+                    if field.get("visible") is False:
+                        continue
+                    text_val = c["reference"] if label == "Reference" else c.get("value", "")
+                    all_fields.append((c["reference"], label, text_val, field["x"], field["y"]))
+
+            for i in range(len(all_fields)):
+                ref_a, lbl_a, txt_a, fx_a, fy_a = all_fields[i]
+                bb_a = field_text_bbox(fx_a, fy_a, txt_a)
+                for j in range(i + 1, len(all_fields)):
+                    ref_b, lbl_b, txt_b, fx_b, fy_b = all_fields[j]
+                    bb_b = field_text_bbox(fx_b, fy_b, txt_b)
+                    if bbox_overlaps(bb_a, bb_b, margin=FIELD_OVERLAP_MARGIN):
+                        violations.append({
+                            "type": "field_text_overlap",
+                            "affected_refs": [ref_a, ref_b],
+                            "position": {"x": (fx_a + fx_b) / 2, "y": (fy_a + fy_b) / 2},
+                            "description": (
+                                f"{ref_a}.{lbl_a} text at ({fx_a},{fy_a}) overlaps "
+                                f"{ref_b}.{lbl_b} text at ({fx_b},{fy_b})"
+                            ),
+                        })
+
+            return {
+                "success": True,
+                "violations": violations,
+                "violation_count": len(violations),
+                "sheet_usable_area": {"left": left_b, "top": top_b, "right": right_b, "bottom": bottom_b},
+            }
+
+        except Exception as e:
+            logger.error(f"Error in check_schematic_layout: {e}")
+            import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -3323,6 +3780,7 @@ class KiCADInterface:
                                 "name": label.value,
                                 "type": "net",
                                 "position": {"x": float(pos[0]), "y": float(pos[1])},
+                                "angle": float(pos[2]) if len(pos) > 2 else 0,
                             }
                         )
 
@@ -3340,6 +3798,7 @@ class KiCADInterface:
                                 "name": label.value,
                                 "type": "global",
                                 "position": {"x": float(pos[0]), "y": float(pos[1])},
+                                "angle": float(pos[2]) if len(pos) > 2 else 0,
                             }
                         )
 

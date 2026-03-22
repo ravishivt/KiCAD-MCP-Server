@@ -136,21 +136,25 @@ export function registerSchematicTools(
   // Batch add multiple components in one call
   server.tool(
     "batch_add_components",
-    "Place multiple schematic components in a single call. Prefer this over calling add_schematic_component repeatedly — it injects all symbol definitions and creates all instances in one round-trip. Each component uses 'Library:SymbolName' format. If any component fails, the rest are still placed and errors are reported per-component. NOTE: includePins defaults to false and should stay false in almost all cases — batch_connect and connect_to_net accept pin name or number directly and never need pin coordinates. Only set includePins:true if you specifically need absolute schematic coordinates for manual wire routing.",
+    "Place multiple schematic components in a single call. Prefer this over calling add_schematic_component repeatedly — it injects all symbol definitions and creates all instances in one round-trip. Each component uses 'Library:SymbolName' format. If any component fails, the rest are still placed and errors are reported per-component. NOTE: includePins defaults to false and should stay false in almost all cases — batch_connect and connect_to_net accept pin name or number directly and never need pin coordinates. Only set includePins:true if you specifically need absolute schematic coordinates for manual wire routing.\n\noptional origin_x/origin_y: when provided, every per-component position is treated as an mm offset from this origin. Set x=0,y=0 for the anchor component and positive offsets for others. DO NOT mix with absolute coordinates from list_schematic_components — use one coordinate system per call. When not provided positions are absolute sheet coordinates. The response includes a placement_bbox covering all placed components.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      origin_x: z.number().optional().describe("X coordinate of the placement origin (mm). All per-component x values are offsets from this point. Use x=0 for the anchor component. DO NOT mix with absolute sheet coordinates."),
+      origin_y: z.number().optional().describe("Y coordinate of the placement origin (mm). All per-component y values are offsets from this point. Use y=0 for the anchor component. DO NOT mix with absolute sheet coordinates."),
       components: z.array(z.object({
         symbol: z.string().describe("Symbol in 'Library:SymbolName' format (e.g., Device:R, power:GND)"),
         reference: z.string().describe("Reference designator (e.g., R1, C3, U2)"),
         value: z.string().optional().describe("Component value (e.g., 10k, 100nF, AP63203WU-7)"),
         footprint: z.string().optional().describe("KiCAD footprint (e.g., Resistor_SMD:R_0603_1608Metric). Applied directly to the placed instance's Footprint property — no separate edit_schematic_component call needed. A footprint_warning in the response means library validation failed, NOT that the footprint was omitted."),
-        position: z.object({ x: z.number(), y: z.number() }).optional().describe("Schematic position in mm (auto-snapped to 50mil grid)"),
+        position: z.object({ x: z.number(), y: z.number() }).optional().describe("Position in mm. If origin_x/origin_y is set, this is an offset from origin; otherwise absolute sheet coordinates (auto-snapped to 50mil grid)"),
         rotation: z.number().optional().describe("Rotation in degrees CCW, multiples of 90. Use 90 for horizontal resistors/capacitors."),
         includePins: z.boolean().optional().describe("Include pin coordinates in response (default false). Set true for ICs where pin coordinate planning is needed."),
       })).describe("List of components to place"),
     },
     async (args: {
       schematicPath: string;
+      origin_x?: number;
+      origin_y?: number;
       components: Array<{
         symbol: string;
         reference: string;
@@ -173,6 +177,10 @@ export function registerSchematicTools(
           if (pinLines.length) lines.push(...pinLines);
           if (comp.footprint_warning) lines.push(`      [footprint_warning] ${comp.footprint_warning}`);
           if (comp.pins_error) lines.push(`      [pins_error] ${comp.pins_error}`);
+        }
+        if (result.placement_bbox) {
+          const bb = result.placement_bbox;
+          lines.push(`Placement bbox: x=[${bb.x_min}, ${bb.x_max}] y=[${bb.y_min}, ${bb.y_max}]`);
         }
         if (result.errors?.length) {
           lines.push("Errors:");
@@ -446,7 +454,39 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
   // Add net label
   server.tool(
     "add_schematic_net_label",
-    "Add a net label to the schematic",
+    `Add a net label to the schematic at a pin tip location.
+
+IMPORTANT — Power nets: For standard power nets (GND, +5V, +3V3, VBUS, +3.3V, etc.), strongly
+prefer using a power symbol via add_schematic_component (e.g., kicad_power:GND, kicad_power:+5V)
+rather than a net label. Power symbols always render upright and follow standard schematic
+conventions. Use net labels only for signal nets (USB_DM, BUCK_SW, SDA, etc.) that don't have
+a dedicated power symbol.
+
+Parameters:
+  net    — net name string (e.g. 'GND', '+3V3', 'BUCK_SW')
+  x, y   — exact pin tip coordinates in mm (same as the pin's connection point — no offset needed)
+  angle  — direction the label text extends FROM the pin (default: 0):
+             0   = rightward  → use for right-edge pins or horizontal rightward wires
+             90  = downward   → use for bottom-edge pins
+             180 = leftward   → use for left-edge pins
+             270 = upward     → use for top-edge pins
+  justify — text anchor (default: auto-derived from angle):
+             'left'  — text starts at connection point, extends in label direction
+             'right' — text ends at connection point (correct for angle=180)
+
+Angle/justify quick reference:
+  Left-edge pin   (wire exits ←): angle=180, justify=right
+  Right-edge pin  (wire exits →): angle=0,   justify=left
+  Top-edge pin    (wire exits ↑): angle=270, justify=left
+  Bottom-edge pin (wire exits ↓): angle=90,  justify=left
+
+NOTE: Labels with angle=90 (bottom-edge pins, text extends downward) will render with text
+rotated 90° clockwise — this is standard KiCad behavior and cannot be changed via justify.
+
+The x,y coordinates are written exactly as provided (snapped only to KiCad's 50mil grid).
+Do NOT add any wire between the component pin and the label when the label is placed directly
+at the pin tip. A label exactly coinciding with a pin tip is a valid KiCad connection. Only
+add a wire if there is a gap between the pin tip and the desired label position.`,
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       netName: z
@@ -455,12 +495,22 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
       position: z
         .array(z.number())
         .length(2)
-        .describe("Position [x, y] for the label"),
+        .describe("Position [x, y] for the label — exact pin tip coordinates in mm"),
+      angle: z
+        .number()
+        .optional()
+        .describe("Direction label extends from pin: 0=right, 90=down, 180=left, 270=up (default: 0)"),
+      justify: z
+        .enum(["left", "right", "center"])
+        .optional()
+        .describe("Text justification (default: auto-derived from angle; 180→right, others→left)"),
     },
     async (args: {
       schematicPath: string;
       netName: string;
       position: number[];
+      angle?: number;
+      justify?: string;
     }) => {
       const result = await callKicadScript("add_schematic_net_label", args);
       if (result.success) {
@@ -482,6 +532,55 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
           ],
         };
       }
+    },
+  );
+
+  // Move a symbol's Reference or Value property field
+  server.tool(
+    "set_schematic_property_position",
+    `Move a symbol's Reference or Value property field to a specific schematic coordinate.
+Use this after component placement to avoid overlapping text.
+
+Parameters:
+  schematicPath — path to the .kicad_sch file
+  reference     — component reference designator (e.g. 'F1', 'U6', 'C3')
+  property      — which field to move: 'Reference' or 'Value'
+  x, y          — new absolute schematic coordinates in mm
+  angle         — text rotation in degrees (default: 0 = horizontal/readable). Text angle
+                  should almost always be 0 regardless of the symbol's rotation. Rotated
+                  text on Reference/Value fields is nearly always an error. Only pass a
+                  non-zero angle if you have a specific reason.
+  visible       — whether the field is visible (default: true)
+
+The tool writes the new position into the matching symbol's property in the .kicad_sch file.
+It does NOT move the symbol body, only the property text field.
+It does NOT auto-save; call save_schematic after all repositioning is done.`,
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      reference: z.string().describe("Component reference designator (e.g. 'F1', 'U6', 'C3')"),
+      property: z.enum(["Reference", "Value"]).describe("Which field to move"),
+      x: z.number().describe("New X coordinate in mm"),
+      y: z.number().describe("New Y coordinate in mm"),
+      angle: z.number().optional().describe("Text rotation in degrees (default: 0 = horizontal). Almost always use 0 — rotated ref/val text is nearly always an error."),
+      visible: z.boolean().optional().describe("Whether the field is visible (default: true)"),
+    },
+    async (args: {
+      schematicPath: string;
+      reference: string;
+      property: "Reference" | "Value";
+      x: number;
+      y: number;
+      angle?: number;
+      visible?: boolean;
+    }) => {
+      const result = await callKicadScript("set_schematic_property_position", args);
+      if (result.success) {
+        return { content: [{ type: "text", text: result.message }] };
+      }
+      return {
+        content: [{ type: "text", text: `Failed to set property position: ${result.message || "Unknown error"}` }],
+        isError: true,
+      };
     },
   );
 
@@ -667,7 +766,7 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
   // Get pin locations for one or more schematic components
   server.tool(
     "get_schematic_pin_locations",
-    "Returns the exact x/y coordinates of every pin on one or more schematic components. Pass a single 'reference' or a list of 'references' to batch multiple components in one call — strongly prefer the batch form to avoid many round-trips.\n\nCoordinate convention: returned x/y are absolute schematic coordinates (Y-axis points DOWN). The Y-axis flip between symbol library space (Y-up) and schematic space (Y-down) is applied automatically by the underlying library — do NOT manually compute pin_schematic_y = component_y ± pin_symbol_y.\n\nNOTE: For components placed in the same session (not yet opened in KiCad), this tool may return empty results because the skip parser cannot always read MCP-generated files. In that case use batch_connect or connect_to_net which look up pin positions internally and do NOT require calling this tool first.",
+    "Returns the schematic coordinates of each pin's connection point — the tip of the pin stub where wires and net labels attach. These coordinates can be passed directly to add_wire, add_schematic_net_label, and add_schematic_connection without any offset.\n\nPass a single 'reference' or a list of 'references' to batch multiple components in one call — strongly prefer the batch form to avoid many round-trips.\n\nCoordinate convention: returned x/y are absolute schematic coordinates (Y-axis points DOWN). The Y-axis flip between symbol library space (Y-up) and schematic space (Y-down) is applied automatically by the underlying library — do NOT manually compute pin_schematic_y = component_y ± pin_symbol_y.\n\nEach pin includes near_boundary=true when within 20mm of the left or top sheet edge, plus suggested_component_x_offset indicating how far right to shift the component so leftward labels stay in bounds.\n\nNOTE: For components placed in the same session (not yet opened in KiCad), this tool may return empty results because the skip parser cannot always read MCP-generated files. In that case use batch_connect or connect_to_net which look up pin positions internally and do NOT require calling this tool first.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       reference: z.string().optional().describe("Single component reference (e.g. U1). Use 'references' for batch."),
@@ -694,8 +793,17 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
         const sections: string[] = [];
         for (const [ref, pins] of Object.entries(components)) {
           const lines = Object.entries(pins as Record<string, any>).map(
-            ([pinNum, data]: [string, any]) =>
-              `    Pin ${pinNum} (${data.name || pinNum}): x=${data.x}, y=${data.y}`
+            ([pinNum, data]: [string, any]) => {
+              let s = `    Pin ${pinNum} (${data.name || pinNum}): x=${data.x}, y=${data.y}`;
+              if (data.near_boundary) {
+                s += ` [NEAR_BOUNDARY`;
+                if (data.suggested_component_x_offset != null) {
+                  s += ` — move component right by ${data.suggested_component_x_offset}mm to keep labels in bounds`;
+                }
+                s += `]`;
+              }
+              return s;
+            }
           );
           sections.push(`${ref}:\n${lines.join("\n")}`);
         }
@@ -779,7 +887,7 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
   // List all components in schematic
   server.tool(
     "list_schematic_components",
-    "List all components in a schematic with their references, values, positions, and pins. Essential for inspecting what's on the schematic before making edits.",
+    "List all components in a schematic with their references, values, positions, pins, and property field positions. Essential for inspecting what's on the schematic before making edits. Each component includes ref_field and value_field with {x, y, angle, visible} for the Reference and Value text positions, and body_bbox with {x_min, y_min, x_max, y_max} for the symbol body bounding box (not including ref/val text).",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       filter: z
@@ -802,10 +910,13 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
             content: [{ type: "text", text: "No components found in schematic." }],
           };
         }
-        const lines = comps.map(
-          (c: any) =>
-            `  ${c.reference}: ${c.libId} = "${c.value}" at (${c.position.x}, ${c.position.y}) rot=${c.rotation}°${c.pins ? ` [${c.pins.length} pins]` : ""}`,
-        );
+        const lines = comps.map((c: any) => {
+          let line = `  ${c.reference}: ${c.libId} = "${c.value}" at (${c.position.x}, ${c.position.y}) rot=${c.rotation}°${c.pins ? ` [${c.pins.length} pins]` : ""}`;
+          if (c.ref_field) line += ` ref@(${c.ref_field.x},${c.ref_field.y})`;
+          if (c.value_field) line += ` val@(${c.value_field.x},${c.value_field.y})`;
+          if (c.body_bbox) line += ` bbox=[${c.body_bbox.x_min},${c.body_bbox.y_min},${c.body_bbox.x_max},${c.body_bbox.y_max}]`;
+          return line;
+        });
         return {
           content: [
             {
@@ -822,6 +933,52 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
             text: `Failed to list components: ${result.message || "Unknown error"}`,
           },
         ],
+        isError: true,
+      };
+    },
+  );
+
+  // Check schematic layout for violations
+  server.tool(
+    "check_schematic_layout",
+    `Analyze a .kicad_sch file and return a list of layout violations. Checks:
+  1. Out-of-bounds components: symbol body bbox extends outside the sheet's usable drawing area.
+  2. Out-of-bounds labels: net label text endpoint (estimated from text length × 1.5mm/char and angle) extends outside sheet border.
+  3. Overlapping component bodies: two symbols whose body bboxes overlap or are within 2mm of each other.
+  4. Ref/Val text inside parent body: Reference or Value text position falls within the parent symbol's body bbox.
+  5. Ref/Val text overlapping another component's body: Reference or Value text position falls within a different symbol's body bbox.
+  6. Field text overlap: the estimated bounding box of one component's Reference or Value text overlaps that of another component's field text (catches stacked power flags, etc.).
+
+Returns structured violations with type, affected_refs, position, and description. Zero violations means the layout is clean.
+Call this after batch_add_components or set_schematic_property_position to get programmatic feedback instead of relying on visual inspection.`,
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+    },
+    async (args: { schematicPath: string }) => {
+      const result = await callKicadScript("check_schematic_layout", args);
+      if (result.success) {
+        const violations: any[] = result.violations || [];
+        if (violations.length === 0) {
+          return {
+            content: [{ type: "text", text: "Layout check passed — no violations found." }],
+          };
+        }
+        const lines: string[] = [`Layout violations (${violations.length}):`];
+        for (const v of violations) {
+          const refs = (v.affected_refs || []).join(", ");
+          const pos = v.position ? ` @ (${v.position.x}, ${v.position.y})` : "";
+          lines.push(`  [${v.type}] ${refs}${pos}: ${v.description}`);
+        }
+        const area = result.sheet_usable_area;
+        if (area) {
+          lines.push(`Sheet usable area: x=[${area.left}, ${area.right}] y=[${area.top}, ${area.bottom}]`);
+        }
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+        };
+      }
+      return {
+        content: [{ type: "text", text: `check_schematic_layout failed: ${result.message || "Unknown error"}` }],
         isError: true,
       };
     },
@@ -923,7 +1080,7 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
         }
         const lines = labels.map(
           (l: any) =>
-            `  [${l.type}] ${l.name} at (${l.position.x}, ${l.position.y})`,
+            `  [${l.type}] ${l.name} at (${l.position.x}, ${l.position.y})${l.angle != null ? ` angle=${l.angle}` : ""}`,
         );
         return {
           content: [
@@ -1267,6 +1424,7 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
       width: z.number().optional().describe("Image width in pixels (default: 1200)"),
       height: z.number().optional().describe("Image height in pixels (default: 900)"),
       crop: z.boolean().optional().describe("Auto-crop to the bounding box of placed components with a small margin (default: false). Makes the image readable when components occupy only a small portion of the sheet. Requires Pillow (pip install Pillow)."),
+      highlight_refs: z.array(z.string()).optional().describe("Optional list of reference designators to visually highlight in the rendered image (e.g. ['F1', 'C3']). Best-effort visual aid — accepted without error even if highlighting is not applied."),
     },
     async (args: {
       schematicPath: string;
@@ -1274,6 +1432,7 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
       width?: number;
       height?: number;
       crop?: boolean;
+      highlight_refs?: string[];
     }) => {
       const result = await callKicadScript("get_schematic_view", args);
       if (result.success) {

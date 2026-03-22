@@ -202,6 +202,7 @@ class WireManager:
         position: List[float],
         label_type: str = "label",
         orientation: int = 0,
+        justify: Optional[str] = None,
     ) -> bool:
         """
         Add a net label to the schematic
@@ -209,9 +210,11 @@ class WireManager:
         Args:
             schematic_path: Path to .kicad_sch file
             text: Label text (net name)
-            position: [x, y] coordinates for label
+            position: [x, y] coordinates for label — written exactly as provided (no extra rounding)
             label_type: Type of label ('label', 'global_label', 'hierarchical_label')
             orientation: Rotation angle (0, 90, 180, 270)
+            justify: Text justification ('left', 'right', 'center'). If None, derived from
+                     orientation: 180 → 'right', all others → 'left'.
 
         Returns:
             True if successful, False otherwise
@@ -220,6 +223,14 @@ class WireManager:
             # Snap to 50mil grid before writing
             position = [_snap(position[0]), _snap(position[1])]
 
+            # Derive justify from orientation when not explicitly provided.
+            # orientation=180 (label extends left): connection at right edge → "right"
+            # orientation=270 (label extends down): connection at top edge → "right"
+            # orientation=0 (label extends right): connection at left edge → "left"
+            # orientation=90 (label extends up): connection at bottom edge → "left"
+            if justify is None:
+                justify = "right" if orientation in (180, 270) else "left"
+
             # Read schematic
             with open(schematic_path, "r", encoding="utf-8") as f:
                 sch_content = f.read()
@@ -227,7 +238,7 @@ class WireManager:
             sch_data = sexpdata.loads(sch_content)
 
             # Create label S-expression
-            # Format: (label "TEXT" (at x y angle) (effects (font (size 1.27 1.27))))
+            # Format: (label "TEXT" (at x y angle) (effects (font (size 1.27 1.27)) (justify ...)))
             label_sexp = [
                 Symbol(label_type),
                 text,
@@ -236,7 +247,7 @@ class WireManager:
                 [
                     Symbol("effects"),
                     [Symbol("font"), [Symbol("size"), 1.27, 1.27]],
-                    [Symbol("justify"), Symbol("left"), Symbol("bottom")],
+                    [Symbol("justify"), Symbol(justify)],
                 ],
                 [Symbol("uuid"), str(uuid.uuid4())],
             ]
