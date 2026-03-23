@@ -401,6 +401,7 @@ class KiCADInterface:
             "save_schematic": self._handle_save_schematic,
             "connect_to_net": self._handle_connect_to_net,
             "batch_connect": self._handle_batch_connect,
+            "batch_add_and_connect": self._handle_batch_add_and_connect,
             "connect_passthrough": self._handle_connect_passthrough,
             "get_schematic_pin_locations": self._handle_get_schematic_pin_locations,
             "get_net_connections": self._handle_get_net_connections,
@@ -2611,6 +2612,10 @@ class KiCADInterface:
 
             placed = []
             failed = []
+            # Track already-placed label positions to deduplicate pins that share
+            # the same schematic coordinate (e.g. USB-C dual-role pins like A4B9/B4A9).
+            # Key: (rounded_x, rounded_y), Value: net_name already placed there.
+            placed_positions: dict = {}
 
             for ref, pin_map in connections.items():
                 if not isinstance(pin_map, dict):
@@ -2639,6 +2644,20 @@ class KiCADInterface:
                                 })
                                 continue
 
+                        # Deduplicate: if two pins of the same component (or different
+                        # components) resolve to the exact same coordinate for the same
+                        # net, skip placing a second label there.
+                        pos_key = (round(float(position[0]), 2), round(float(position[1]), 2))
+                        if pos_key in placed_positions and placed_positions[pos_key] == net_name:
+                            placed.append({
+                                "ref": ref,
+                                "pin": str(pin_id),
+                                "net": net_name,
+                                "position": {"x": position[0], "y": position[1]},
+                                "note": "deduped: label already placed at this coordinate for this net",
+                            })
+                            continue
+
                         raw_angle = locator.get_pin_angle(sch_path, ref, resolved_pin) or 0
                         cardinal = round(raw_angle / 90) * 90 % 360
                         angle_map = {0: 180, 90: 270, 180: 0, 270: 90}
@@ -2660,6 +2679,7 @@ class KiCADInterface:
                                     "position": {"x": position[0], "y": position[1]},
                                     "note": f"wired to existing label at ({existing_pos[0]},{existing_pos[1]})",
                                 })
+                                placed_positions[pos_key] = net_name
                             else:
                                 failed.append({"ref": ref, "pin": str(pin_id), "net": net_name, "reason": "wire-to-existing-label failed"})
                             continue
@@ -2674,6 +2694,7 @@ class KiCADInterface:
                                 "net": net_name,
                                 "position": {"x": position[0], "y": position[1]},
                             })
+                            placed_positions[pos_key] = net_name
                         else:
                             failed.append({"ref": ref, "pin": str(pin_id), "net": net_name, "reason": "add_label failed"})
                     except Exception as pin_err:
@@ -2732,6 +2753,71 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error in batch_connect: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e), "errorDetails": traceback.format_exc()}
+
+    def _handle_batch_add_and_connect(self, params):
+        """Place multiple components and connect their pins in a single call."""
+        logger.info("Batch add-and-connect: placing components and wiring nets")
+        try:
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            raw_components = params.get("components", [])
+            if not raw_components:
+                return {"success": False, "message": "components list is required and must be non-empty"}
+
+            # Separate the nets field from the placement params so batch_add_components
+            # receives a clean component list (it doesn't know about "nets").
+            components_for_add = []
+            nets_per_ref: dict = {}
+            for comp in raw_components:
+                comp_copy = {k: v for k, v in comp.items() if k != "nets"}
+                components_for_add.append(comp_copy)
+                nets = comp.get("nets") or {}
+                if nets:
+                    nets_per_ref[comp.get("reference", "")] = nets
+
+            # Step 1: place all components
+            add_params = {k: v for k, v in params.items() if k != "components"}
+            add_params["components"] = components_for_add
+            add_result = self._handle_batch_add_components(add_params)
+
+            # Step 2: connect pins using the resolved pin locations
+            connect_result = {"placed": [], "failed": [], "message": "no nets specified"}
+            if nets_per_ref:
+                connect_result = self._handle_batch_connect({
+                    "schematicPath": schematic_path,
+                    "connections": nets_per_ref,
+                })
+
+            added = add_result.get("added", [])
+            add_errors = add_result.get("errors", [])
+            conn_placed = connect_result.get("placed", [])
+            conn_failed = connect_result.get("failed", [])
+
+            return {
+                "success": add_result.get("added_count", 0) > 0,
+                "message": (
+                    f"Placed {add_result.get('added_count', 0)} component(s)"
+                    f"{' (' + str(len(add_errors)) + ' failed)' if add_errors else ''}, "
+                    f"connected {len(conn_placed)} pin(s)"
+                    f"{' (' + str(len(conn_failed)) + ' failed)' if conn_failed else ''}"
+                ),
+                "added_count": add_result.get("added_count", 0),
+                "added": added,
+                "connected_count": len(conn_placed),
+                "connected": conn_placed,
+                "placement_bbox": add_result.get("placement_bbox"),
+                "errors": add_errors,
+                "failed_connections": conn_failed,
+                "warnings": connect_result.get("warnings", []),
+            }
+
+        except Exception as e:
+            logger.error(f"Error in batch_add_and_connect: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e), "errorDetails": traceback.format_exc()}
@@ -3643,7 +3729,14 @@ class KiCADInterface:
                 for j in range(i + 1, len(label_bb_list)):
                     lbl_b, bb_b = label_bb_list[j]
                     if bbox_overlaps(bb_a, bb_b, margin=LABEL_GAP_MM):
-                        violations.append({
+                        same_net = lbl_a.get("name") == lbl_b.get("name")
+                        # For exact-coordinate duplicates (same net, within 0.3mm):
+                        # suggest deleting one of the labels.
+                        _dist = ((lbl_a["position"]["x"] - lbl_b["position"]["x"]) ** 2 +
+                                 (lbl_a["position"]["y"] - lbl_b["position"]["y"]) ** 2) ** 0.5
+                        is_duplicate = same_net and _dist < 0.3
+
+                        violation: dict = {
                             "type": "label_overlap",
                             "affected_refs": [lbl_a.get("name"), lbl_b.get("name")],
                             "position": {
@@ -3657,9 +3750,20 @@ class KiCADInterface:
                                 f"label '{lbl_b['name']}' at "
                                 f"({lbl_b['position']['x']},{lbl_b['position']['y']}) "
                                 f"angle={lbl_b.get('angle',0)} — "
-                                "move the components further apart or use a shared net label"
+                                + ("exact duplicate label: delete one using delete_schematic_net_label"
+                                   if is_duplicate else
+                                   "move the components further apart or use a shared net label")
                             ),
-                        })
+                        }
+                        if is_duplicate:
+                            # Suggest deleting the second label (lbl_b)
+                            violation["suggested_delete_label"] = {
+                                "net": lbl_b.get("name"),
+                                "position": lbl_b["position"],
+                                "angle": lbl_b.get("angle", 0),
+                                "action": "delete_schematic_net_label",
+                            }
+                        violations.append(violation)
 
             autofix_applied = []
             autofix_failed = []
@@ -4343,9 +4447,13 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_move_schematic_component(self, params):
-        """Move a schematic component to a new position"""
+        """Move a schematic component to a new position, dragging net labels, Reference, and Value fields along."""
         logger.info("Moving schematic component")
         try:
+            from pathlib import Path
+            from commands.dynamic_symbol_loader import _snap
+            from commands.pin_locator import PinLocator
+
             schematic_path = params.get("schematicPath")
             reference = params.get("reference")
             position = params.get("position", {})
@@ -4363,6 +4471,21 @@ class KiCADInterface:
                     "message": "position with x and y is required",
                 }
 
+            sch_path = Path(schematic_path)
+            locator = PinLocator()
+
+            # Capture old pin tip positions BEFORE the move
+            old_pins = locator.get_all_symbol_pins(sch_path, reference) or {}
+
+            # Capture old Reference/Value field positions BEFORE the move.
+            # These are absolute coordinates in the file — they do NOT move
+            # automatically when the symbol body is repositioned.
+            with open(sch_path, "r", encoding="utf-8") as _f:
+                _raw = _f.read()
+            _block_text, _, _ = KiCADInterface._find_placed_symbol_block(_raw, reference)
+            old_ref_field = KiCADInterface._extract_property_position(_block_text, "Reference") if _block_text else None
+            old_val_field = KiCADInterface._extract_property_position(_block_text, "Value") if _block_text else None
+
             schematic = SchematicManager.load_schematic(schematic_path)
             if not schematic:
                 return {"success": False, "message": "Failed to load schematic"}
@@ -4376,7 +4499,6 @@ class KiCADInterface:
                     old_position = {"x": float(old_pos[0]), "y": float(old_pos[1])}
 
                     # Snap to 50mil grid so pins land on-grid
-                    from commands.dynamic_symbol_loader import _snap
                     snapped_x = _snap(new_x)
                     snapped_y = _snap(new_y)
 
@@ -4384,11 +4506,73 @@ class KiCADInterface:
                     rotation = float(old_pos[2]) if len(old_pos) > 2 else 0
                     symbol.at.value = [snapped_x, snapped_y, rotation]
 
+                    # Compute movement delta
+                    delta_x = snapped_x - old_position["x"]
+                    delta_y = snapped_y - old_position["y"]
+
+                    # Drag attached net labels: find any label whose position
+                    # matches an old pin tip (within 0.2mm tolerance) and move it.
+                    TOL = 0.2
+                    labels_moved = []
+                    for label_collection_name in ("label", "global_label"):
+                        label_collection = getattr(schematic, label_collection_name, None)
+                        if not label_collection:
+                            continue
+                        for lbl in label_collection:
+                            if not (hasattr(lbl, "at") and hasattr(lbl.at, "value")):
+                                continue
+                            lpos = list(lbl.at.value)
+                            lx, ly = float(lpos[0]), float(lpos[1])
+                            for _pin_coords in old_pins.values():
+                                px = float(_pin_coords[0]) if isinstance(_pin_coords, (list, tuple)) else float(_pin_coords["x"])
+                                py = float(_pin_coords[1]) if isinstance(_pin_coords, (list, tuple)) else float(_pin_coords["y"])
+                                if abs(lx - px) < TOL and abs(ly - py) < TOL:
+                                    new_lx = round(lx + delta_x, 4)
+                                    new_ly = round(ly + delta_y, 4)
+                                    lpos[0] = new_lx
+                                    lpos[1] = new_ly
+                                    lbl.at.value = lpos
+                                    net_name = lbl.value if hasattr(lbl, "value") else "?"
+                                    labels_moved.append({
+                                        "net": net_name,
+                                        "from": {"x": lx, "y": ly},
+                                        "to": {"x": new_lx, "y": new_ly},
+                                    })
+                                    break
+
                     SchematicManager.save_schematic(schematic, schematic_path)
+
+                    # Shift Reference and Value property fields by the same delta.
+                    # They store absolute coordinates and are NOT moved by the skip
+                    # library when the symbol body is repositioned.
+                    field_updates = []
+                    if old_ref_field and (delta_x != 0 or delta_y != 0):
+                        field_updates.append({
+                            "reference": reference,
+                            "property": "Reference",
+                            "x": round(old_ref_field["x"] + delta_x, 4),
+                            "y": round(old_ref_field["y"] + delta_y, 4),
+                            "angle": old_ref_field.get("angle", 0),
+                        })
+                    if old_val_field and (delta_x != 0 or delta_y != 0):
+                        field_updates.append({
+                            "reference": reference,
+                            "property": "Value",
+                            "x": round(old_val_field["x"] + delta_x, 4),
+                            "y": round(old_val_field["y"] + delta_y, 4),
+                            "angle": old_val_field.get("angle", 0),
+                        })
+                    if field_updates:
+                        self._handle_batch_set_schematic_property_positions({
+                            "schematicPath": schematic_path,
+                            "updates": field_updates,
+                        })
+
                     return {
                         "success": True,
                         "oldPosition": old_position,
                         "newPosition": {"x": snapped_x, "y": snapped_y},
+                        "labels_moved": labels_moved,
                     }
 
             return {"success": False, "message": f"Component {reference} not found"}
@@ -5368,7 +5552,50 @@ class KiCADInterface:
                         "affected library files to resolve."
                     )
 
-                return {
+                # Build PWR_FLAG suggestions for pin_not_driven violations.
+                # Each undriven power pin needs a PWR_FLAG placed at its coordinate
+                # on the same net.  The ERC violation items contain the pin position.
+                pwr_flag_suggestions = []
+                try:
+                    _seen_pwr_nets: set = set()
+                    for v in violations:
+                        if v.get("type") != "pin_not_driven":
+                            continue
+                        msg = v.get("message", "")
+                        loc = v.get("location", {})
+                        if not loc:
+                            continue
+                        # Extract net name from violation message (KiCAD format:
+                        # "Pin ... of ... is not driven" — net name appears in items)
+                        net_name = None
+                        for item in v.get("items", []):
+                            desc = item.get("description", "")
+                            # Typical desc: "Pin ~ of PWR_FLAG, net VBUS"
+                            import re as _re2
+                            m = _re2.search(r'\bnet\s+(\S+)', desc, _re2.IGNORECASE)
+                            if m:
+                                net_name = m.group(1).rstrip(".,;")
+                                break
+                        if not net_name:
+                            # Fallback: parse from violation message
+                            m = _re2.search(r'net\s+["\']?(\S+?)["\']?[\s,.]', msg, _re2.IGNORECASE)
+                            net_name = m.group(1) if m else f"net_at_{loc.get('x',0):.1f}_{loc.get('y',0):.1f}"
+
+                        if net_name in _seen_pwr_nets:
+                            continue
+                        _seen_pwr_nets.add(net_name)
+                        pwr_flag_suggestions.append({
+                            "net": net_name,
+                            "suggested_position": {"x": loc.get("x", 0), "y": loc.get("y", 0)},
+                            "action": (
+                                f"Place a PWR_FLAG (power:PWR_FLAG) near ({loc.get('x',0):.2f}, {loc.get('y',0):.2f}) "
+                                f"and connect it to net '{net_name}' using batch_add_and_connect or batch_add_components + batch_connect"
+                            ),
+                        })
+                except Exception as _pwr_err:
+                    logger.warning(f"PWR_FLAG suggestion generation failed: {_pwr_err}")
+
+                result_dict = {
                     "success": True,
                     "message": f"ERC complete: {len(violations)} violation(s)",
                     "coordinate_units": "mm",
@@ -5382,6 +5609,9 @@ class KiCADInterface:
                     },
                     "violations": violations,
                 }
+                if pwr_flag_suggestions:
+                    result_dict["pwr_flag_suggestions"] = pwr_flag_suggestions
+                return result_dict
 
             finally:
                 if os.path.exists(json_output):

@@ -198,6 +198,78 @@ export function registerSchematicTools(
     },
   );
 
+  // Combined place + connect in one call
+  server.tool(
+    "batch_add_and_connect",
+    `Place multiple schematic components AND assign their net labels in a single round-trip.
+
+This is the preferred tool for subcircuit placement — it replaces the common two-step pattern of batch_add_components followed by batch_connect. Each component accepts an optional \"nets\" field mapping pin numbers/names to net names.
+
+Components without a \"nets\" field are placed but not connected (useful for passive components you plan to connect later, or power symbols).
+
+The response includes placed component positions, connected pin coordinates, and any warnings (e.g. PWR_FLAG suggestions).`,
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      origin_x: z.number().optional().describe("X coordinate of the placement origin (mm). All per-component x values are offsets from this point."),
+      origin_y: z.number().optional().describe("Y coordinate of the placement origin (mm). All per-component y values are offsets from this point."),
+      components: z.array(z.object({
+        symbol: z.string().describe("Symbol in 'Library:SymbolName' format (e.g., Device:R, power:GND)"),
+        reference: z.string().describe("Reference designator (e.g., R1, C3, U2)"),
+        value: z.string().optional().describe("Component value (e.g., 10k, 100nF)"),
+        footprint: z.string().optional().describe("KiCAD footprint string (e.g., Resistor_SMD:R_0603_1608Metric)"),
+        position: z.object({ x: z.number(), y: z.number() }).optional().describe("Position in mm (offset from origin if origin_x/y set, otherwise absolute)"),
+        rotation: z.number().optional().describe("Rotation in degrees CCW, multiples of 90"),
+        nets: z.record(z.string()).optional().describe("Map of pinNumber/pinName → netName for this component. E.g. {\"1\": \"+5V\", \"2\": \"GND\"}. Omit if not connecting now."),
+      })).describe("Components to place and optionally connect"),
+    },
+    async (args: {
+      schematicPath: string;
+      origin_x?: number;
+      origin_y?: number;
+      components: Array<{
+        symbol: string;
+        reference: string;
+        value?: string;
+        footprint?: string;
+        position?: { x: number; y: number };
+        rotation?: number;
+        nets?: Record<string, string>;
+      }>;
+    }) => {
+      const result = await callKicadScript("batch_add_and_connect", args);
+      const lines: string[] = [result.message || ""];
+      for (const comp of (result.added || [])) {
+        const pos = comp.snapped_position;
+        lines.push(`  ${comp.reference} (${comp.symbol}) @ (${pos?.x}, ${pos?.y})`);
+        if (comp.footprint_warning) lines.push(`    [footprint_warning] ${comp.footprint_warning}`);
+      }
+      if ((result.connected || []).length > 0) {
+        lines.push(`Connected pins (${result.connected_count}):`);
+        for (const p of (result.connected || [])) {
+          const note = p.note ? ` [${p.note}]` : "";
+          lines.push(`  ${p.ref}/${p.pin} → ${p.net} @ (${p.position?.x}, ${p.position?.y})${note}`);
+        }
+      }
+      if ((result.errors || []).length > 0) {
+        lines.push(`Placement errors:`);
+        (result.errors as any[]).forEach((e: any) => lines.push(`  ${e.reference}: ${e.error}`));
+      }
+      if ((result.failed_connections || []).length > 0) {
+        lines.push(`Connection failures:`);
+        (result.failed_connections as any[]).forEach((f: any) => lines.push(`  ${f.ref}/${f.pin}: ${f.reason}`));
+      }
+      if ((result.warnings || []).length > 0) {
+        lines.push(`Warnings:`);
+        (result.warnings as string[]).forEach((w: string) => lines.push(`  ${w}`));
+      }
+      if (result.placement_bbox) {
+        const bb = result.placement_bbox;
+        lines.push(`Placement bbox: x=[${bb.x_min}, ${bb.x_max}] y=[${bb.y_min}, ${bb.y_max}]`);
+      }
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    },
+  );
+
   // Delete component from schematic
   server.tool(
     "delete_schematic_component",
@@ -978,7 +1050,10 @@ Set autofix=true to automatically apply all fixable violations (text_inside_pare
           const refs = (v.affected_refs || []).join(", ");
           const pos = v.position ? ` @ (${v.position.x}, ${v.position.y})` : "";
           const fix = v.suggested_fix ? ` [fix: move ${v.suggested_fix.reference}.${v.suggested_fix.property} to (${v.suggested_fix.x},${v.suggested_fix.y})]` : "";
-          lines.push(`  [${v.type}] ${refs}${pos}: ${v.description}${fix}`);
+          const del_ = v.suggested_delete_label
+            ? ` [fix: delete_schematic_net_label net='${v.suggested_delete_label.net}' @ (${v.suggested_delete_label.position.x},${v.suggested_delete_label.position.y})]`
+            : "";
+          lines.push(`  [${v.type}] ${refs}${pos}: ${v.description}${fix}${del_}`);
         }
         const area = result.sheet_usable_area;
         if (area) {
@@ -1114,7 +1189,7 @@ Set autofix=true to automatically apply all fixable violations (text_inside_pare
   // Move schematic component
   server.tool(
     "move_schematic_component",
-    "Move a placed symbol to a new position in the schematic. The position is auto-snapped to the KiCAD 50mil (1.27mm) grid; the response shows the actual snapped position.",
+    "Move a placed symbol to a new position in the schematic. The position is auto-snapped to the KiCAD 50mil (1.27mm) grid. Net labels attached to the component's pin tips are automatically moved along with the component — no separate delete/reconnect round-trips needed.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       reference: z.string().describe("Reference designator (e.g., R1, U1)"),
@@ -1132,11 +1207,15 @@ Set autofix=true to automatically apply all fixable violations (text_inside_pare
     }) => {
       const result = await callKicadScript("move_schematic_component", args);
       if (result.success) {
+        const labelsMoved: any[] = result.labels_moved || [];
+        const labelNote = labelsMoved.length > 0
+          ? `\n  Dragged ${labelsMoved.length} net label(s): ${labelsMoved.map((l: any) => `${l.net} → (${l.to.x},${l.to.y})`).join(", ")}`
+          : "";
         return {
           content: [
             {
               type: "text",
-              text: `Moved ${args.reference} from (${result.oldPosition.x}, ${result.oldPosition.y}) to (${result.newPosition.x}, ${result.newPosition.y})`,
+              text: `Moved ${args.reference} from (${result.oldPosition.x}, ${result.oldPosition.y}) to (${result.newPosition.x}, ${result.newPosition.y})${labelNote}`,
             },
           ],
         };
@@ -1560,6 +1639,16 @@ Set autofix=true to automatically apply all fixable violations (text_inside_pare
             if (group.length > 20) lines.push(`  ... and ${group.length - 20} more`);
             lines.push("");
           }
+        }
+        // Surface PWR_FLAG suggestions so the agent can act immediately
+        const pwrSuggestions: any[] = result.pwr_flag_suggestions || [];
+        if (pwrSuggestions.length > 0) {
+          lines.push(`PWR_FLAG suggestions (${pwrSuggestions.length} net(s) need a PWR_FLAG):`);
+          for (const s of pwrSuggestions) {
+            const pos = s.suggested_position;
+            lines.push(`  net '${s.net}': place PWR_FLAG near (${pos.x.toFixed(2)}, ${pos.y.toFixed(2)}) mm`);
+          }
+          lines.push("  → Use batch_add_and_connect with symbol=power:PWR_FLAG to fix in one call.");
         }
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } else {
