@@ -919,19 +919,27 @@ class DynamicSymbolLoader:
     def list_symbol_pins(self, library_name: str, symbol_name: str) -> list:
         """
         Return pin data for a symbol directly from the library file (no schematic needed).
-        Each entry: {"number": "1", "name": "VCC", "type": "power_in"}
+        Each entry: {"number": "1", "name": "VCC", "type": "power_in", "x": 0.0, "y": 3.81, "angle": 270}
+        x/y are pin-endpoint coordinates in symbol-local space (Y increases upward, per KiCAD lib convention).
         Raises ValueError (with .suggestions) if the symbol is not found.
         """
         block = self.extract_symbol_from_library(library_name, symbol_name)
         pins = []
         # Pins live in sub-symbols (Name_1_1, Name_0_1, etc.)
-        # Pattern: (pin <type> <shape> ... (name "NAME" ...) (number "NUM" ...))
+        # Pattern: (pin <type> <shape> (at X Y angle) ... (name "NAME" ...) (number "NUM" ...))
         for m in re.finditer(
-            r'\(pin\s+(\S+)\s+\S+.*?\(name\s+"([^"]*)".*?\(number\s+"([^"]*)"',
+            r'\(pin\s+(\S+)\s+\S+\s+\(at\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\).*?\(name\s+"([^"]*)".*?\(number\s+"([^"]*)"',
             block,
             re.DOTALL,
         ):
-            pins.append({"number": m.group(3), "name": m.group(2), "type": m.group(1)})
+            pins.append({
+                "number": m.group(6),
+                "name": m.group(5),
+                "type": m.group(1),
+                "x": float(m.group(2)),
+                "y": float(m.group(3)),
+                "angle": float(m.group(4)),
+            })
         return sorted(pins, key=lambda p: (len(p["number"]), p["number"]))
 
 

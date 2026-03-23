@@ -1806,7 +1806,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "batch_list_symbol_pins",
         "title": "Batch List Symbol Pins",
-        "description": "Returns pin names, numbers, and types for multiple symbols in a single call. Prefer this over calling list_symbol_pins repeatedly. Returns a map of symbol -> {pins, pin_count}.",
+        "description": "Returns pin names, numbers, types, and symbol-local coordinates for multiple symbols in a single call. Prefer this over calling list_symbol_pins repeatedly. Returns a map of symbol -> {pins, pin_count, body_bbox}. body_bbox gives the symbol body extent in local coordinates (pin envelope ±1.27mm) with width/height fields — use these to plan component spacing before placement.",
         "inputSchema": {
             "type": "object",
             "properties": {

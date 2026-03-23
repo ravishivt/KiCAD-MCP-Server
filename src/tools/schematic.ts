@@ -951,24 +951,34 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
   7. Label overlap: two net labels whose estimated text bounding boxes overlap or are within 0.5mm of each other — indicates components placed too close on a shared bus, or opposing labels on adjacent pin tips that need more separation.
 
 Returns structured violations with type, affected_refs, position, and description. Zero violations means the layout is clean.
-Call this after batch_add_components or set_schematic_property_position to get programmatic feedback instead of relying on visual inspection.`,
+Call this after batch_add_components or set_schematic_property_position to get programmatic feedback instead of relying on visual inspection.
+
+Set autofix=true to automatically apply all fixable violations (text_inside_parent_body, field_text_overlap) in a single batch operation — eliminates the check→fix loop entirely.`,
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      autofix: z.boolean().optional().describe("If true, automatically apply all violations that have a suggested_fix (text_inside_parent_body, field_text_overlap) in one batch call. Returns autofix_applied_count and remaining violations."),
     },
-    async (args: { schematicPath: string }) => {
+    async (args: { schematicPath: string; autofix?: boolean }) => {
       const result = await callKicadScript("check_schematic_layout", args);
       if (result.success) {
         const violations: any[] = result.violations || [];
-        if (violations.length === 0) {
-          return {
-            content: [{ type: "text", text: "Layout check passed — no violations found." }],
-          };
+        const lines: string[] = [];
+        if (args.autofix && (result.autofix_applied_count ?? 0) > 0) {
+          lines.push(`Auto-fixed ${result.autofix_applied_count} violation(s).`);
+          if ((result.autofix_failed_count ?? 0) > 0) {
+            lines.push(`  (${result.autofix_failed_count} fix(es) failed)`);
+          }
         }
-        const lines: string[] = [`Layout violations (${violations.length}):`];
+        if (violations.length === 0) {
+          lines.push("Layout check passed — no violations found.");
+          return { content: [{ type: "text", text: lines.join("\n") }] };
+        }
+        lines.push(`Layout violations (${violations.length}):`);
         for (const v of violations) {
           const refs = (v.affected_refs || []).join(", ");
           const pos = v.position ? ` @ (${v.position.x}, ${v.position.y})` : "";
-          lines.push(`  [${v.type}] ${refs}${pos}: ${v.description}`);
+          const fix = v.suggested_fix ? ` [fix: move ${v.suggested_fix.reference}.${v.suggested_fix.property} to (${v.suggested_fix.x},${v.suggested_fix.y})]` : "";
+          lines.push(`  [${v.type}] ${refs}${pos}: ${v.description}${fix}`);
         }
         const area = result.sheet_usable_area;
         if (area) {

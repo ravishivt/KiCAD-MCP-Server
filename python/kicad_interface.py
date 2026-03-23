@@ -2879,7 +2879,23 @@ class KiCADInterface:
                 library_name, symbol_name = symbol_spec.split(":", 1)
                 try:
                     pins = loader.list_symbol_pins(library_name, symbol_name)
-                    results[symbol_spec] = {"pins": pins, "pin_count": len(pins)}
+                    # Compute body_bbox from pin positions in symbol-local coords (Y up, per lib convention).
+                    # Expand pin envelope by 1.27mm (50mil) on each side — same padding batch_add_components uses.
+                    pin_coords = [(p["x"], p["y"]) for p in pins if "x" in p]
+                    body_bbox = None
+                    if pin_coords:
+                        _pad = 1.27
+                        _xs = [c[0] for c in pin_coords]
+                        _ys = [c[1] for c in pin_coords]
+                        body_bbox = {
+                            "x_min": round(min(_xs) - _pad, 4),
+                            "y_min": round(min(_ys) - _pad, 4),
+                            "x_max": round(max(_xs) + _pad, 4),
+                            "y_max": round(max(_ys) + _pad, 4),
+                            "width": round(max(_xs) - min(_xs) + 2 * _pad, 4),
+                            "height": round(max(_ys) - min(_ys) + 2 * _pad, 4),
+                        }
+                    results[symbol_spec] = {"pins": pins, "pin_count": len(pins), "body_bbox": body_bbox}
                 except ValueError as e:
                     suggestions = getattr(e, "suggestions", [])
                     errors[symbol_spec] = {"message": str(e), "suggestions": suggestions}
@@ -3275,6 +3291,7 @@ class KiCADInterface:
             from pathlib import Path
 
             schematic_path = params.get("schematicPath")
+            autofix = params.get("autofix", False)
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
 
@@ -3544,12 +3561,37 @@ class KiCADInterface:
                             ),
                         })
 
-            return {
+            autofix_applied = []
+            autofix_failed = []
+            if autofix:
+                fixable = [v["suggested_fix"] for v in violations if "suggested_fix" in v]
+                if fixable:
+                    fix_result = self._handle_batch_set_schematic_property_positions({
+                        "schematicPath": schematic_path,
+                        "updates": fixable,
+                    })
+                    autofix_applied = fix_result.get("applied", [])
+                    autofix_failed = fix_result.get("failed", [])
+                    # Remove violations whose fix was applied
+                    applied_keys = {(a["reference"], a["property"]) for a in autofix_applied}
+                    violations = [
+                        v for v in violations
+                        if "suggested_fix" not in v or
+                        (v["suggested_fix"]["reference"], v["suggested_fix"]["property"]) not in applied_keys
+                    ]
+
+            result = {
                 "success": True,
                 "violations": violations,
                 "violation_count": len(violations),
                 "sheet_usable_area": {"left": left_b, "top": top_b, "right": right_b, "bottom": bottom_b},
             }
+            if autofix:
+                result["autofix_applied_count"] = len(autofix_applied)
+                result["autofix_failed_count"] = len(autofix_failed)
+                if autofix_failed:
+                    result["autofix_failed"] = autofix_failed
+            return result
 
         except Exception as e:
             logger.error(f"Error in check_schematic_layout: {e}")

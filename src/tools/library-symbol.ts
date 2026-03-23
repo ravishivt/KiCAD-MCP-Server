@@ -228,7 +228,7 @@ Returns symbol references that can be used directly in schematics.`,
   // List pins for multiple symbols in one call
   server.tool(
     "batch_list_symbol_pins",
-    "Return pin names, numbers, and types for multiple symbols in a single call. Use instead of calling list_symbol_pins repeatedly when placing a subcircuit — saves 5–10 round-trips. Each result has the same shape as list_symbol_pins. Pass schematicPath to resolve project-local symbols.",
+    "Return pin names, numbers, types, and symbol-local coordinates for multiple symbols in a single call. Use instead of calling list_symbol_pins repeatedly when placing a subcircuit — saves 5–10 round-trips. Each result includes pins (with x/y/angle in symbol-local coords, Y-up per KiCAD lib convention) and body_bbox (bounding box of pin envelope ±1.27mm, in symbol-local coords). Use body_bbox.width/height to plan component spacing before placement — no guesswork needed. Pass schematicPath to resolve project-local symbols.",
     {
       symbols: z.array(z.string())
         .describe("Array of symbols in 'Library:SymbolName' format (e.g., ['Device:R', 'Device:C', 'Device:FerriteBead'])"),
@@ -241,8 +241,13 @@ Returns symbol references that can be used directly in schematics.`,
         const lines: string[] = [];
         for (const [sym, data] of Object.entries(result.symbols || {})) {
           const d = data as any;
-          const pinLines = (d.pins || []).map((p: any) => `    Pin ${p.number} (${p.name}) — type: ${p.type}`);
-          lines.push(`${sym} — ${d.pin_count} pin(s):`);
+          const pinLines = (d.pins || []).map((p: any) => {
+            const coords = (p.x !== undefined) ? ` at (${p.x},${p.y}) angle=${p.angle}` : "";
+            return `    Pin ${p.number} (${p.name}) — type: ${p.type}${coords}`;
+          });
+          const bb = d.body_bbox;
+          const bboxStr = bb ? ` | body ${bb.width.toFixed(2)}×${bb.height.toFixed(2)}mm` : "";
+          lines.push(`${sym} — ${d.pin_count} pin(s)${bboxStr}:`);
           lines.push(...pinLines);
         }
         if (result.errors && Object.keys(result.errors).length > 0) {
