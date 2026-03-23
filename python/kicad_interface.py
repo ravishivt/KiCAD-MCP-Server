@@ -418,6 +418,7 @@ class KiCADInterface:
             "get_schematic_view": self._handle_get_schematic_view,
             "list_schematic_components": self._handle_list_schematic_components,
             "check_schematic_layout": self._handle_check_schematic_layout,
+            "autoplace_schematic_fields": self._handle_autoplace_schematic_fields,
             "list_schematic_nets": self._handle_list_schematic_nets,
             "find_single_pin_nets": self._handle_find_single_pin_nets,
             "classify_nets": self._handle_classify_nets,
@@ -3991,6 +3992,265 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error in check_schematic_layout: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_autoplace_schematic_fields(self, params):
+        """Re-position Reference and Value fields so they sit outside the component body
+        AND outside any net labels hanging off its pins.
+
+        Algorithm for each component:
+        1. Compute the 'extended body bbox' = body_bbox union the bboxes of all net labels
+           whose connection point (at) is within 0.5 mm of a pin tip.
+        2. For 2-pin components: use pin-axis direction (same heuristic as batch_add_components).
+           For multi-pin: prefer above/below; if that collides with another component's
+           extended bbox, try left/right.
+        3. Field centres are placed at extended_bbox_edge + CLEARANCE, snapped to the 50-mil grid.
+        """
+        logger.info("Auto-placing schematic fields")
+        try:
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+
+            _GRID = 1.27  # 50-mil KiCad schematic grid (mm)
+            def _snap(val: float) -> float:
+                return round(round(val / _GRID) * _GRID, 4)
+
+            schematic_path = params.get("schematicPath")
+            references_filter = params.get("references")  # optional list of refs to limit scope
+            clearance = float(params.get("clearance", _GRID))  # mm gap between ext bbox edge and field text; default one grid unit
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            sch_path = Path(schematic_path)
+            if not sch_path.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            # --- helpers ---
+            CHARS_PER_MM = 1.5      # conservative label extent per character
+            TEXT_HEIGHT = 1.27      # mm — KiCad default font height
+
+            def _label_bbox(lx, ly, angle, name):
+                """Estimate the bounding box of a net label's text."""
+                length = max(len(name), 1) * CHARS_PER_MM
+                # Add a small stub/chevron allowance (≈ 1 mm)
+                length += 1.0
+                half_h = TEXT_HEIGHT / 2.0
+                a = round(angle / 90) * 90 % 360
+                if a == 0:    # extends right
+                    return {"x_min": lx, "y_min": ly - half_h, "x_max": lx + length, "y_max": ly + half_h}
+                elif a == 90:  # extends up (smaller Y)
+                    return {"x_min": lx - half_h, "y_min": ly - length, "x_max": lx + half_h, "y_max": ly}
+                elif a == 180: # extends left
+                    return {"x_min": lx - length, "y_min": ly - half_h, "x_max": lx, "y_max": ly + half_h}
+                else:          # 270 — extends down (larger Y)
+                    return {"x_min": lx - half_h, "y_min": ly, "x_max": lx + half_h, "y_max": ly + length}
+
+            def _union(bb, other):
+                return {
+                    "x_min": min(bb["x_min"], other["x_min"]),
+                    "y_min": min(bb["y_min"], other["y_min"]),
+                    "x_max": max(bb["x_max"], other["x_max"]),
+                    "y_max": max(bb["y_max"], other["y_max"]),
+                }
+
+            def _overlaps(bb_a, bb_b, margin=0.0):
+                return (bb_a["x_min"] - margin < bb_b["x_max"] and
+                        bb_a["x_max"] + margin > bb_b["x_min"] and
+                        bb_a["y_min"] - margin < bb_b["y_max"] and
+                        bb_a["y_max"] + margin > bb_b["y_min"])
+
+            def _field_bbox(fx, fy, text):
+                half_w = max(len(str(text)), 1) * 0.75 / 2.0
+                half_h = TEXT_HEIGHT / 2.0
+                return {"x_min": fx - half_w, "y_min": fy - half_h,
+                        "x_max": fx + half_w, "y_max": fy + half_h}
+
+            # --- load data ---
+            comp_result = self._handle_list_schematic_components({"schematicPath": schematic_path})
+            if not comp_result.get("success"):
+                return comp_result
+            components = comp_result.get("components", [])
+            if references_filter:
+                components = [c for c in components if c["reference"] in references_filter]
+
+            labels_result = self._handle_list_schematic_labels({"schematicPath": schematic_path})
+            all_labels = labels_result.get("labels", []) if labels_result.get("success") else []
+            # Only consider net and global labels (not power symbols)
+            net_labels = [l for l in all_labels if l.get("type") in ("net", "global")]
+
+            locator = PinLocator()
+
+            # --- build extended bboxes ---
+            comp_ext_bboxes = {}   # ref -> extended bbox (body + label extents)
+            comp_body_bboxes = {}  # ref -> body bbox only (for collision avoidance)
+            comp_pin_map = {}      # ref -> {pin_num: [x, y]}
+
+            for comp in components:
+                ref = comp["reference"]
+                cx = comp["position"]["x"]
+                cy = comp["position"]["y"]
+                body_bb = comp.get("body_bbox") or {
+                    "x_min": cx - 2.54, "y_min": cy - 2.54,
+                    "x_max": cx + 2.54, "y_max": cy + 2.54
+                }
+                comp_body_bboxes[ref] = body_bb
+                ext_bb = dict(body_bb)
+
+                # Get pin positions (from cached list result if available, else locator)
+                pin_list = comp.get("pins", [])
+                all_pins = {}
+                if pin_list:
+                    for p in pin_list:
+                        pnum = str(p.get("number", p.get("name", "")))
+                        px = p.get("x", p.get("position", {}).get("x", cx))
+                        py = p.get("y", p.get("position", {}).get("y", cy))
+                        all_pins[pnum] = [float(px), float(py)]
+                else:
+                    all_pins = locator.get_all_symbol_pins(sch_path, ref) or {}
+
+                comp_pin_map[ref] = all_pins
+
+                # Expand ext_bb with each net label that sits at one of this component's pins
+                for lbl in net_labels:
+                    lx = lbl["position"]["x"]
+                    ly = lbl["position"]["y"]
+                    langle = lbl.get("angle", 0)
+                    lname = lbl.get("name", "")
+                    for pin_coords in all_pins.values():
+                        px = pin_coords[0] if isinstance(pin_coords, (list, tuple)) else pin_coords["x"]
+                        py = pin_coords[1] if isinstance(pin_coords, (list, tuple)) else pin_coords["y"]
+                        if abs(lx - px) < 0.6 and abs(ly - py) < 0.6:
+                            lb = _label_bbox(lx, ly, langle, lname)
+                            ext_bb = _union(ext_bb, lb)
+                            break
+
+                comp_ext_bboxes[ref] = ext_bb
+
+            # --- compute field positions ---
+            updates = []
+            # Track bboxes of fields already committed, so later components avoid them.
+            placed_field_bboxes = []
+
+            def _has_collision(ref_bb, val_bb, exclude_ref):
+                """Return True if ref_bb or val_bb overlaps any other component body or
+                any already-placed field (with a full text-height buffer between fields)."""
+                for other_ref, other_body in comp_body_bboxes.items():
+                    if other_ref == exclude_ref:
+                        continue
+                    if _overlaps(ref_bb, other_body, 0.75) or _overlaps(val_bb, other_body, 0.75):
+                        return True
+                for fb in placed_field_bboxes:
+                    # Require at least one full text height of separation between fields
+                    if _overlaps(ref_bb, fb, TEXT_HEIGHT) or _overlaps(val_bb, fb, TEXT_HEIGHT):
+                        return True
+                return False
+
+            for comp in components:
+                ref = comp["reference"]
+                lib_id = comp.get("libId", "")
+                # Skip internal power net symbols (hidden by design)
+                if ref.startswith("#") or ref.startswith("_TEMPLATE"):
+                    continue
+
+                cx = comp["position"]["x"]
+                cy = comp["position"]["y"]
+                val_text = comp.get("value", ref)
+
+                # kicad_power symbols (PWR_FLAG, GND, VCC, etc.) have tiny bodies and
+                # no visible net labels. Reset their fields to just above/below the body
+                # without any collision logic — they sit in otherwise-empty space.
+                if lib_id.startswith("kicad_power:") or lib_id.startswith("power:"):
+                    body_bb = comp.get("body_bbox") or {
+                        "x_min": cx - 1.27, "y_min": cy - 1.27,
+                        "x_max": cx + 1.27, "y_max": cy + 1.27
+                    }
+                    ref_y = _snap(body_bb["y_min"] - TEXT_HEIGHT / 2.0 - clearance)
+                    val_y = _snap(body_bb["y_max"] + TEXT_HEIGHT / 2.0 + clearance)
+                    updates.append({"reference": ref, "property": "Reference", "x": cx, "y": ref_y, "angle": 0})
+                    updates.append({"reference": ref, "property": "Value",     "x": cx, "y": val_y, "angle": 0})
+                    continue
+
+                ext_bb = comp_ext_bboxes[ref]
+                all_pins = comp_pin_map[ref]
+                val_text = comp.get("value", ref)
+                num_pins = len(all_pins)
+
+                # Determine preferred placement axis (same logic as batch_add_components)
+                prefer_above_below = True  # default: above/below
+                if num_pins == 2:
+                    coords = list(all_pins.values())
+                    p1x = float(coords[0][0]) if isinstance(coords[0], (list, tuple)) else float(coords[0]["x"])
+                    p1y = float(coords[0][1]) if isinstance(coords[0], (list, tuple)) else float(coords[0]["y"])
+                    p2x = float(coords[1][0]) if isinstance(coords[1], (list, tuple)) else float(coords[1]["x"])
+                    p2y = float(coords[1][1]) if isinstance(coords[1], (list, tuple)) else float(coords[1]["y"])
+                    if abs(p1y - p2y) > abs(p1x - p2x):
+                        # Vertical pin axis → prefer left/right
+                        prefer_above_below = False
+
+                # Try candidate positions.  Try preferred first, then alternate.
+                def _try_positions(prefer_above_below):
+                    half_ref_h = TEXT_HEIGHT / 2.0
+                    half_val_h = TEXT_HEIGHT / 2.0
+                    half_ref_w = max(len(ref), 1) * 0.75 / 2.0
+                    half_val_w = max(len(val_text), 1) * 0.75 / 2.0
+
+                    if prefer_above_below:
+                        # Reference above, Value below
+                        ref_x = cx
+                        ref_y = _snap(ext_bb["y_min"] - half_ref_h - clearance)
+                        val_x = cx
+                        val_y = _snap(ext_bb["y_max"] + half_val_h + clearance)
+                    else:
+                        # Reference left, Value right
+                        ref_x = _snap(ext_bb["x_min"] - half_ref_w - clearance)
+                        ref_y = cy
+                        val_x = _snap(ext_bb["x_max"] + half_val_w + clearance)
+                        val_y = cy
+                    return ref_x, ref_y, val_x, val_y
+
+                ref_x, ref_y, val_x, val_y = _try_positions(prefer_above_below)
+                ref_bb = _field_bbox(ref_x, ref_y, ref)
+                val_bb = _field_bbox(val_x, val_y, val_text)
+
+                if _has_collision(ref_bb, val_bb, ref):
+                    # Try alternate axis
+                    alt_x, alt_y, alt_vx, alt_vy = _try_positions(not prefer_above_below)
+                    alt_ref_bb = _field_bbox(alt_x, alt_y, ref)
+                    alt_val_bb = _field_bbox(alt_vx, alt_vy, val_text)
+                    if not _has_collision(alt_ref_bb, alt_val_bb, ref):
+                        ref_x, ref_y, val_x, val_y = alt_x, alt_y, alt_vx, alt_vy
+                        ref_bb, val_bb = alt_ref_bb, alt_val_bb
+
+                # Commit these positions — future components will avoid them.
+                placed_field_bboxes.append(ref_bb)
+                placed_field_bboxes.append(val_bb)
+
+                updates.append({"reference": ref, "property": "Reference", "x": ref_x, "y": ref_y, "angle": 0})
+                updates.append({"reference": ref, "property": "Value",     "x": val_x, "y": val_y, "angle": 0})
+
+            if not updates:
+                return {"success": True, "message": "No components to update.", "updated_count": 0}
+
+            batch_result = self._handle_batch_set_schematic_property_positions({
+                "schematicPath": schematic_path,
+                "updates": updates,
+            })
+
+            applied = batch_result.get("applied_count", 0)
+            failed = batch_result.get("failed_count", 0)
+            return {
+                "success": batch_result.get("success", False),
+                "message": f"Auto-placed fields for {applied // 2} component(s) ({applied} fields updated{', ' + str(failed) + ' failed' if failed else ''}).",
+                "updated_count": applied,
+                "failed_count": failed,
+                "failed": batch_result.get("failed", []),
+            }
+
+        except Exception as e:
+            logger.error(f"Error in autoplace_schematic_fields: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}

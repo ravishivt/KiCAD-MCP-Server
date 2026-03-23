@@ -537,11 +537,11 @@ a dedicated power symbol.
 Parameters:
   net    — net name string (e.g. 'GND', '+3V3', 'BUCK_SW')
   x, y   — exact pin tip coordinates in mm (same as the pin's connection point — no offset needed)
-  angle  — direction the label text extends FROM the pin (default: 0):
-             0   = rightward  → use for right-edge pins or horizontal rightward wires
-             90  = downward   → use for bottom-edge pins
-             180 = leftward   → use for left-edge pins
-             270 = upward     → use for top-edge pins
+  angle  — direction the label text extends FROM the pin tip (default: 0):
+             0   = rightward  → use for right-edge pins (pin stub exits →)
+             90  = upward     → use for top-edge pins (pin stub exits ↑)
+             180 = leftward   → use for left-edge pins (pin stub exits ←)
+             270 = downward   → use for bottom-edge pins (pin stub exits ↓)
   justify — text anchor (default: auto-derived from angle):
              'left'  — text starts at connection point, extends in label direction
              'right' — text ends at connection point (correct for angle=180)
@@ -549,11 +549,14 @@ Parameters:
 Angle/justify quick reference:
   Left-edge pin   (wire exits ←): angle=180, justify=right
   Right-edge pin  (wire exits →): angle=0,   justify=left
-  Top-edge pin    (wire exits ↑): angle=270, justify=left
-  Bottom-edge pin (wire exits ↓): angle=90,  justify=left
+  Top-edge pin    (wire exits ↑): angle=90,  justify=left
+  Bottom-edge pin (wire exits ↓): angle=270, justify=left
 
-NOTE: Labels with angle=90 (bottom-edge pins, text extends downward) will render with text
-rotated 90° clockwise — this is standard KiCad behavior and cannot be changed via justify.
+NOTE: Labels with angle=90/270 (top/bottom-edge pins) render with text rotated — this is
+standard KiCad behavior and cannot be changed via justify.
+
+PREFER connect_to_net or batch_connect: these tools auto-derive angle from the pin direction
+so you never need to look up the table above.
 
 The x,y coordinates are written exactly as provided (snapped only to KiCad's 50mil grid).
 Do NOT add any wire between the component pin and the label when the label is placed directly
@@ -1027,7 +1030,9 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
 Returns structured violations with type, affected_refs, position, and description. Zero violations means the layout is clean.
 Call this after batch_add_components or set_schematic_property_position to get programmatic feedback instead of relying on visual inspection.
 
-Set autofix=true to automatically apply all fixable violations (text_inside_parent_body, field_text_overlap) in a single batch operation — eliminates the check→fix loop entirely.`,
+Set autofix=true to automatically apply all fixable violations (text_inside_parent_body, field_text_overlap) in a single batch operation — eliminates the check→fix loop entirely.
+
+PREFERRED: call autoplace_schematic_fields after all net labels are placed — it handles all field positioning in one pass and accounts for net label extents, which autofix does not.`,
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       autofix: z.boolean().optional().describe("If true, automatically apply all violations that have a suggested_fix (text_inside_parent_body, field_text_overlap) in one batch call. Returns autofix_applied_count and remaining violations."),
@@ -1067,6 +1072,48 @@ Set autofix=true to automatically apply all fixable violations (text_inside_pare
       }
       return {
         content: [{ type: "text", text: `check_schematic_layout failed: ${result.message || "Unknown error"}` }],
+        isError: true,
+      };
+    },
+  );
+
+  // Auto-place Reference/Value fields outside body and labels
+  server.tool(
+    "autoplace_schematic_fields",
+    `Reposition Reference and Value fields for all (or selected) components so they sit outside:
+  1. The component's body bounding box.
+  2. Any net labels whose connection point is at one of the component's pin tips.
+
+Call this AFTER all net labels have been connected (i.e., after batch_connect, connect_to_net,
+or batch_add_and_connect). Do NOT call it before nets are assigned — it needs the labels to be
+present to avoid them.
+
+The tool uses KiCad's 50-mil grid for all positions and writes one file update for all
+components in a single pass. Prefer this over manually calling set_schematic_property_position
+or batch_set_schematic_property_positions after placement.
+
+Parameters:
+  schematicPath — path to the .kicad_sch file
+  references    — optional list of reference designators to limit scope (default: all components)
+  clearance     — minimum gap in mm between the component's occupied zone and the field text
+                  (default: 1.0 mm)`,
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      references: z.array(z.string()).optional().describe("Limit to these component references (default: all components)"),
+      clearance: z.number().optional().describe("Gap in mm between occupied zone and field text centre (default: 1.0)"),
+    },
+    async (args: { schematicPath: string; references?: string[]; clearance?: number }) => {
+      const result = await callKicadScript("autoplace_schematic_fields", args);
+      if (result.success) {
+        const lines = [result.message || "Fields auto-placed."];
+        if ((result.failed || []).length > 0) {
+          lines.push("Failed updates:");
+          (result.failed as any[]).forEach((f: any) => lines.push(`  ${f.reference}.${f.property}: ${f.reason}`));
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+      return {
+        content: [{ type: "text", text: `autoplace_schematic_fields failed: ${result.message || "Unknown error"}` }],
         isError: true,
       };
     },
