@@ -2585,6 +2585,7 @@ class KiCADInterface:
 
             schematic_path = params.get("schematicPath")
             connections = params.get("connections")  # {ref: {pin: netName}}
+            replace = bool(params.get("replace", False))
 
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
@@ -2683,6 +2684,38 @@ class KiCADInterface:
                             else:
                                 failed.append({"ref": ref, "pin": str(pin_id), "net": net_name, "reason": "wire-to-existing-label failed"})
                             continue
+
+                        # replace=True: delete any existing label at this pin tip
+                        # before placing the new one, so wrong-net labels are cleared.
+                        if replace:
+                            WireManager.delete_label(sch_path, net_name, list(position), tolerance=0.5)
+                            # Also delete any label with a different net at the same position
+                            try:
+                                import sexpdata as _sd
+                                from sexpdata import Symbol as _Sym
+                                with open(sch_path, "r", encoding="utf-8") as _rf:
+                                    _rd = _sd.loads(_rf.read())
+                                changed = False
+                                new_rd = []
+                                for _item in _rd:
+                                    if (isinstance(_item, list) and len(_item) > 0
+                                            and _item[0] == _Sym("label")):
+                                        _at = next(
+                                            (p for p in _item[1:] if isinstance(p, list)
+                                             and len(p) >= 3 and p[0] == _Sym("at")),
+                                            None,
+                                        )
+                                        if _at:
+                                            _lx, _ly = float(_at[1]), float(_at[2])
+                                            if abs(_lx - position[0]) < 0.5 and abs(_ly - position[1]) < 0.5:
+                                                changed = True
+                                                continue  # drop this label
+                                    new_rd.append(_item)
+                                if changed:
+                                    with open(sch_path, "w", encoding="utf-8") as _wf:
+                                        _wf.write(_sd.dumps(new_rd))
+                            except Exception as _re:
+                                logger.warning(f"replace cleanup failed: {_re}")
 
                         ok = WireManager.add_label(
                             sch_path, net_name, position, label_type="label", orientation=orientation
@@ -3045,9 +3078,19 @@ class KiCADInterface:
 
             symbols = params.get("symbols", [])
             schematic_path = params.get("schematicPath")
+            compact = bool(params.get("compact", False))
 
             if not symbols:
                 return {"success": False, "message": "symbols list is required"}
+
+            # Standard 2-pin symmetric passives that qualify for compact mode
+            COMPACT_SYMBOLS = {
+                "Device:R", "Device:R_Small", "Device:R_US",
+                "Device:C", "Device:C_Small", "Device:C_Polarized", "Device:C_Polarized_Small",
+                "Device:L", "Device:L_Small",
+                "Device:LED", "Device:D", "Device:D_Zener", "Device:D_Schottky",
+                "Device:Ferrite_Bead",
+            }
 
             project_path = None
             if schematic_path:
@@ -3080,7 +3123,23 @@ class KiCADInterface:
                             "width": round(max(_xs) - min(_xs) + 2 * _pad, 4),
                             "height": round(max(_ys) - min(_ys) + 2 * _pad, 4),
                         }
-                    results[symbol_spec] = {"pins": pins, "pin_count": len(pins), "body_bbox": body_bbox}
+                    # Compact mode: omit per-pin detail for standard symmetric 2-pin passives
+                    is_symmetric_2pin = (
+                        len(pins) == 2 and
+                        (symbol_spec in COMPACT_SYMBOLS or
+                         (len(set(p.get("type", "") for p in pins)) == 1 and
+                          all(p.get("type", "") == "passive" for p in pins)))
+                    )
+                    if compact and is_symmetric_2pin:
+                        results[symbol_spec] = {
+                            "pin_count": len(pins),
+                            "body_bbox": body_bbox,
+                            "is_symmetric": True,
+                            "compact": True,
+                            "note": "Pin detail omitted (compact mode, symmetric 2-pin passive). Set compact=false to see individual pin coords.",
+                        }
+                    else:
+                        results[symbol_spec] = {"pins": pins, "pin_count": len(pins), "body_bbox": body_bbox}
                 except ValueError as e:
                     suggestions = getattr(e, "suggestions", [])
                     errors[symbol_spec] = {"message": str(e), "suggestions": suggestions}
@@ -3765,6 +3824,139 @@ class KiCADInterface:
                             }
                         violations.append(violation)
 
+            # 8. Stray wire detection.
+            # Parse all wire segments from the schematic; collect every endpoint.
+            # A wire endpoint is "dangling" if no other wire endpoint, pin tip, net
+            # label, junction, or no_connect marker sits within tolerance of it.
+            # An isolated wire (both endpoints dangling) is reported as stray_wire.
+            try:
+                import sexpdata as _swd
+                from sexpdata import Symbol as _SwSym
+                with open(schematic_path, "r", encoding="utf-8") as _wf:
+                    _sch_sexp = _swd.loads(_wf.read())
+
+                _WIRE_TOL = 0.3  # mm — snap-grid tolerance
+
+                # Collect wire endpoints: list of (x, y) tuples
+                wire_segments = []  # [(x1,y1,x2,y2), ...]
+                wire_endpoints = []
+                for _item in _sch_sexp:
+                    if not (isinstance(_item, list) and len(_item) > 0
+                            and _item[0] == _SwSym("wire")):
+                        continue
+                    _pts = next(
+                        (p for p in _item if isinstance(p, list) and len(p) > 0
+                         and p[0] == _SwSym("pts")), None
+                    )
+                    if not _pts:
+                        continue
+                    xy_items = [p for p in _pts if isinstance(p, list) and len(p) >= 3
+                                and p[0] == _SwSym("xy")]
+                    if len(xy_items) >= 2:
+                        x1, y1 = float(xy_items[0][1]), float(xy_items[0][2])
+                        x2, y2 = float(xy_items[1][1]), float(xy_items[1][2])
+                        wire_segments.append((x1, y1, x2, y2))
+                        wire_endpoints.append((x1, y1))
+                        wire_endpoints.append((x2, y2))
+
+                if wire_segments:
+                    # Build connected-point set: all pin tips + label positions + junctions
+                    connected_pts: set = set()
+
+                    # Pin tips for all placed components
+                    try:
+                        from commands.pin_locator import PinLocator as _SPL
+                        _sl = _SPL()
+                        for _sc in schematic.symbol:
+                            if not hasattr(_sc.property, "Reference"):
+                                continue
+                            _sref = _sc.property.Reference.value
+                            if _sref.startswith("_TEMPLATE") or _sref.startswith("#"):
+                                continue
+                            _spins = _sl.get_all_symbol_pins(sch_path, _sref) or {}
+                            for _sp in _spins.values():
+                                _spx = float(_sp[0]) if isinstance(_sp, (list, tuple)) else float(_sp["x"])
+                                _spy = float(_sp[1]) if isinstance(_sp, (list, tuple)) else float(_sp["y"])
+                                connected_pts.add((round(_spx, 2), round(_spy, 2)))
+                    except Exception as _pe:
+                        logger.warning(f"Stray wire: pin collection failed: {_pe}")
+
+                    # Label positions
+                    for _lbl in labels:
+                        connected_pts.add((
+                            round(_lbl["position"]["x"], 2),
+                            round(_lbl["position"]["y"], 2),
+                        ))
+
+                    # Junctions
+                    for _item in _sch_sexp:
+                        if (isinstance(_item, list) and len(_item) > 0
+                                and _item[0] == _SwSym("junction")):
+                            _at = next(
+                                (p for p in _item if isinstance(p, list) and len(p) >= 3
+                                 and p[0] == _SwSym("at")), None
+                            )
+                            if _at:
+                                connected_pts.add((round(float(_at[1]), 2), round(float(_at[2]), 2)))
+
+                    # All other wire endpoints are also valid connection points
+                    all_wire_pt_keys = {(round(x, 2), round(y, 2)) for x, y in wire_endpoints}
+
+                    def _is_connected(ex, ey):
+                        """True if (ex, ey) has any connection other than just being a wire endpoint."""
+                        ex_r, ey_r = round(ex, 2), round(ey, 2)
+                        # Check against pins and labels
+                        for cx, cy in connected_pts:
+                            if abs(ex_r - cx) <= _WIRE_TOL and abs(ey_r - cy) <= _WIRE_TOL:
+                                return True
+                        # Count how many wire endpoints share this coordinate
+                        count = sum(
+                            1 for (wx, wy) in wire_endpoints
+                            if abs(round(wx, 2) - ex_r) <= _WIRE_TOL
+                            and abs(round(wy, 2) - ey_r) <= _WIRE_TOL
+                        )
+                        # Connected if 2+ wire endpoints share this point (T/cross junction)
+                        return count >= 2
+
+                    for x1, y1, x2, y2 in wire_segments:
+                        d1 = _is_connected(x1, y1)
+                        d2 = _is_connected(x2, y2)
+                        if not d1 and not d2:
+                            violations.append({
+                                "type": "stray_wire",
+                                "affected_refs": [],
+                                "position": {"x": (x1 + x2) / 2, "y": (y1 + y2) / 2},
+                                "description": (
+                                    f"Isolated wire from ({x1:.2f},{y1:.2f}) to ({x2:.2f},{y2:.2f}) "
+                                    "has no connection at either endpoint — likely a leftover from a deleted component. "
+                                    "Delete it with delete_schematic_wire."
+                                ),
+                            })
+                        elif not d1:
+                            violations.append({
+                                "type": "stray_wire",
+                                "affected_refs": [],
+                                "position": {"x": x1, "y": y1},
+                                "description": (
+                                    f"Wire endpoint at ({x1:.2f},{y1:.2f}) has no connection "
+                                    "(no pin, label, junction, or other wire). "
+                                    "Delete the wire or extend it to connect to a pin."
+                                ),
+                            })
+                        elif not d2:
+                            violations.append({
+                                "type": "stray_wire",
+                                "affected_refs": [],
+                                "position": {"x": x2, "y": y2},
+                                "description": (
+                                    f"Wire endpoint at ({x2:.2f},{y2:.2f}) has no connection "
+                                    "(no pin, label, junction, or other wire). "
+                                    "Delete the wire or extend it to connect to a pin."
+                                ),
+                            })
+            except Exception as _we:
+                logger.warning(f"Stray wire check failed: {_we}")
+
             autofix_applied = []
             autofix_failed = []
             if autofix:
@@ -4347,6 +4539,10 @@ class KiCADInterface:
             schematic_path = params.get("schematicPath")
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
+            filter_params = params.get("filter") or {}
+            filter_net_name = filter_params.get("netName")
+            filter_comp_ref = filter_params.get("componentRef")
+            filter_bbox = filter_params.get("boundingBox")  # {x_min,y_min,x_max,y_max}
 
             schematic = SchematicManager.load_schematic(schematic_path)
             if not schematic:
@@ -4437,6 +4633,44 @@ class KiCADInterface:
             except Exception as _e:
                 logger.warning(f"Could not parse no_connect markers: {_e}")
 
+            # Apply filters
+            if filter_net_name:
+                labels = [l for l in labels if l.get("name") == filter_net_name]
+
+            if filter_bbox:
+                x_min = float(filter_bbox.get("x_min", float("-inf")))
+                y_min = float(filter_bbox.get("y_min", float("-inf")))
+                x_max = float(filter_bbox.get("x_max", float("inf")))
+                y_max = float(filter_bbox.get("y_max", float("inf")))
+                labels = [
+                    l for l in labels
+                    if x_min <= l["position"]["x"] <= x_max
+                    and y_min <= l["position"]["y"] <= y_max
+                ]
+
+            if filter_comp_ref:
+                # Keep only labels near the pin tips of the specified component
+                try:
+                    from pathlib import Path as _Path2
+                    from commands.pin_locator import PinLocator as _PL2
+                    _loc2 = _PL2()
+                    _comp_pins = _loc2.get_all_symbol_pins(_Path2(schematic_path), filter_comp_ref) or {}
+                    _pin_tips = [
+                        (float(v[0]) if isinstance(v, (list, tuple)) else float(v["x"]),
+                         float(v[1]) if isinstance(v, (list, tuple)) else float(v["y"]))
+                        for v in _comp_pins.values()
+                    ]
+                    _LABEL_TOL = 1.0  # mm — generous to catch slightly-offset labels
+                    def _near_any_pin(lbl):
+                        lx, ly = lbl["position"]["x"], lbl["position"]["y"]
+                        return any(
+                            abs(lx - px) < _LABEL_TOL and abs(ly - py) < _LABEL_TOL
+                            for px, py in _pin_tips
+                        )
+                    labels = [l for l in labels if _near_any_pin(l)]
+                except Exception as _fe:
+                    logger.warning(f"componentRef filter failed: {_fe}")
+
             return {"success": True, "labels": labels, "count": len(labels)}
 
         except Exception as e:
@@ -4512,8 +4746,31 @@ class KiCADInterface:
 
                     # Drag attached net labels: find any label whose position
                     # matches an old pin tip (within 0.2mm tolerance) and move it.
+                    # Safety: only drag a label if its position does NOT also coincide
+                    # with a pin tip of a different component — that would indicate the
+                    # label belongs to the other component, not to the one being moved.
                     TOL = 0.2
+
+                    # Build set of pin tips from all OTHER components so we can guard
+                    # against accidentally dragging their labels.
+                    other_pin_tips: set = set()
+                    try:
+                        for _other_sym in schematic.symbol:
+                            if not hasattr(_other_sym.property, "Reference"):
+                                continue
+                            _other_ref = _other_sym.property.Reference.value
+                            if _other_ref == reference:
+                                continue  # skip the component being moved
+                            _other_pins = locator.get_all_symbol_pins(sch_path, _other_ref) or {}
+                            for _opc in _other_pins.values():
+                                _opx = float(_opc[0]) if isinstance(_opc, (list, tuple)) else float(_opc["x"])
+                                _opy = float(_opc[1]) if isinstance(_opc, (list, tuple)) else float(_opc["y"])
+                                other_pin_tips.add((round(_opx, 2), round(_opy, 2)))
+                    except Exception as _oe:
+                        logger.warning(f"Could not build other-component pin set: {_oe}")
+
                     labels_moved = []
+                    labels_skipped = []
                     for label_collection_name in ("label", "global_label"):
                         label_collection = getattr(schematic, label_collection_name, None)
                         if not label_collection:
@@ -4527,6 +4784,17 @@ class KiCADInterface:
                                 px = float(_pin_coords[0]) if isinstance(_pin_coords, (list, tuple)) else float(_pin_coords["x"])
                                 py = float(_pin_coords[1]) if isinstance(_pin_coords, (list, tuple)) else float(_pin_coords["y"])
                                 if abs(lx - px) < TOL and abs(ly - py) < TOL:
+                                    # Guard: skip if this position is also a pin tip of
+                                    # another component — that label belongs to them.
+                                    pos_key = (round(lx, 2), round(ly, 2))
+                                    if pos_key in other_pin_tips:
+                                        net_name = lbl.value if hasattr(lbl, "value") else "?"
+                                        labels_skipped.append({
+                                            "net": net_name,
+                                            "position": {"x": lx, "y": ly},
+                                            "reason": "coincides with another component's pin — not dragged",
+                                        })
+                                        break
                                     new_lx = round(lx + delta_x, 4)
                                     new_ly = round(ly + delta_y, 4)
                                     lpos[0] = new_lx
@@ -4573,6 +4841,7 @@ class KiCADInterface:
                         "oldPosition": old_position,
                         "newPosition": {"x": snapped_x, "y": snapped_y},
                         "labels_moved": labels_moved,
+                        "labels_skipped": labels_skipped if labels_skipped else None,
                     }
 
             return {"success": False, "message": f"Component {reference} not found"}
@@ -5103,20 +5372,73 @@ class KiCADInterface:
                     "notFound": result["notFound"],
                 }
 
-            # Mode 3: single netName (original behaviour)
+            # Mode 3: componentRef + pinName — resolve pin tip via PinLocator
+            comp_ref = params.get("componentRef")
+            pin_name = params.get("pinName")
+            tolerance_mm = float(params.get("tolerance_mm", 0.5))
+            if comp_ref and pin_name:
+                from commands.pin_locator import PinLocator as _PL
+                _loc = _PL()
+                _pin_pos = _loc.get_pin_location(sch_path, comp_ref, str(pin_name))
+                if not _pin_pos:
+                    # Fallback: single-pin component
+                    _all = _loc.get_all_symbol_pins(sch_path, comp_ref) or {}
+                    if len(_all) == 1:
+                        _pin_pos = next(iter(_all.values()))
+                if not _pin_pos:
+                    return {
+                        "success": False,
+                        "message": f"Could not locate pin '{pin_name}' on {comp_ref}",
+                    }
+                # Delete whatever label sits at this pin tip (any net name)
+                try:
+                    import sexpdata as _sd2
+                    from sexpdata import Symbol as _Sym2
+                    with open(sch_path, "r", encoding="utf-8") as _rf2:
+                        _rd2 = _sd2.loads(_rf2.read())
+                    deleted_count = 0
+                    new_rd2 = []
+                    for _item2 in _rd2:
+                        if (isinstance(_item2, list) and len(_item2) > 0
+                                and _item2[0] == _Sym2("label")):
+                            _at2 = next(
+                                (p for p in _item2[1:] if isinstance(p, list)
+                                 and len(p) >= 3 and p[0] == _Sym2("at")),
+                                None,
+                            )
+                            if _at2:
+                                _lx2, _ly2 = float(_at2[1]), float(_at2[2])
+                                if (abs(_lx2 - float(_pin_pos[0])) < tolerance_mm
+                                        and abs(_ly2 - float(_pin_pos[1])) < tolerance_mm):
+                                    deleted_count += 1
+                                    continue
+                        new_rd2.append(_item2)
+                    if deleted_count:
+                        with open(sch_path, "w", encoding="utf-8") as _wf2:
+                            _wf2.write(_sd2.dumps(new_rd2))
+                        return {"success": True, "deleted": deleted_count}
+                    else:
+                        return {
+                            "success": False,
+                            "message": f"No label found at pin '{pin_name}' of {comp_ref} (pos={_pin_pos})",
+                        }
+                except Exception as _ce:
+                    return {"success": False, "message": f"componentRef delete failed: {_ce}"}
+
+            # Mode 4: single netName (original behaviour)
             net_name = params.get("netName")
             position = params.get("position")
             if not net_name:
                 return {
                     "success": False,
-                    "message": "Provide netName, deleteAll, or positions",
+                    "message": "Provide netName, componentRef+pinName, deleteAll, or positions",
                 }
 
             pos_list = None
             if position:
                 pos_list = [position.get("x", 0), position.get("y", 0)]
 
-            deleted = WireManager.delete_label(sch_path, net_name, pos_list)
+            deleted = WireManager.delete_label(sch_path, net_name, pos_list, tolerance=tolerance_mm)
             if deleted:
                 return {"success": True}
             else:

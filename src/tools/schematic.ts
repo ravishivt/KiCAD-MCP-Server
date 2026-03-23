@@ -899,7 +899,7 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
   // Batch connect: place net labels on multiple pins in one call
   server.tool(
     "batch_connect",
-    "Place net labels on multiple component pins in a single call. Accepts a map of {componentRef: {pinNumber: netName}} and places all labels in one round-trip. Use this instead of calling connect_to_net repeatedly — it is dramatically more token-efficient for wiring many pins at once.",
+    "Place net labels on multiple component pins in a single call. Accepts a map of {componentRef: {pinNumber: netName}} and places all labels in one round-trip. Use this instead of calling connect_to_net repeatedly — it is dramatically more token-efficient for wiring many pins at once. Set replace=true to atomically replace any existing label at each pin tip (useful when correcting wrong-net assignments without a separate delete step).",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       connections: z
@@ -910,8 +910,9 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
           "Map of componentRef -> {pinNumber: netName}. " +
           "Example: {\"J1\": {\"1\": \"VCC\", \"2\": \"GND\"}, \"U1\": {\"VDD\": \"VCC\"}}"
         ),
+      replace: z.boolean().optional().describe("If true, delete any existing net label at each pin tip before placing the new one. Use when correcting wrong-net assignments — eliminates the separate delete_schematic_net_label step."),
     },
-    async (args: { schematicPath: string; connections: Record<string, Record<string, string>> }) => {
+    async (args: { schematicPath: string; connections: Record<string, Record<string, string>>; replace?: boolean }) => {
       const result = await callKicadScript("batch_connect", args);
       const placed: any[] = result.placed || [];
       const failed: any[] = result.failed || [];
@@ -1021,6 +1022,7 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
   5. Ref/Val text overlapping another component's body: Reference or Value text position falls within a different symbol's body bbox.
   6. Field text overlap: the estimated bounding box of one component's Reference or Value text overlaps that of another component's field text (catches stacked power flags, etc.).
   7. Label overlap: two net labels whose estimated text bounding boxes overlap or are within 0.5mm of each other — indicates components placed too close on a shared bus, or opposing labels on adjacent pin tips that need more separation.
+  8. Stray wire: a wire segment whose endpoint(s) have no connection (no pin, label, junction, or other wire) — typically left over after deleting a component.
 
 Returns structured violations with type, affected_refs, position, and description. Zero violations means the layout is clean.
 Call this after batch_add_components or set_schematic_property_position to get programmatic feedback instead of relying on visual inspection.
@@ -1151,11 +1153,19 @@ Set autofix=true to automatically apply all fixable violations (text_inside_pare
   // List all labels in schematic
   server.tool(
     "list_schematic_labels",
-    "List all net labels, global labels, power flags, and no-connect markers in the schematic. Types returned: [net] = local net label, [global] = global label, [power] = power symbol instance (e.g. PWR_FLAG, not a net label), [no_connect] = unconnected pin marker.",
+    "List all net labels, global labels, power flags, and no-connect markers in the schematic. Types returned: [net] = local net label, [global] = global label, [power] = power symbol instance (e.g. PWR_FLAG, not a net label), [no_connect] = unconnected pin marker. Use filter.componentRef to see only labels near a specific component's pins — avoids the full 50+ label dump when debugging one component.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      filter: z.object({
+        netName: z.string().optional().describe("Return only labels whose name exactly matches this net name"),
+        componentRef: z.string().optional().describe("Return only labels near the pin tips of this component (within 1mm). Most efficient way to inspect one component's connections."),
+        boundingBox: z.object({
+          x_min: z.number(), y_min: z.number(),
+          x_max: z.number(), y_max: z.number(),
+        }).optional().describe("Return only labels whose position falls within this bounding box (mm)"),
+      }).optional().describe("Optional filters to narrow results"),
     },
-    async (args: { schematicPath: string }) => {
+    async (args: { schematicPath: string; filter?: { netName?: string; componentRef?: string; boundingBox?: { x_min: number; y_min: number; x_max: number; y_max: number } } }) => {
       const result = await callKicadScript("list_schematic_labels", args);
       if (result.success) {
         const labels = result.labels || [];
@@ -1208,14 +1218,18 @@ Set autofix=true to automatically apply all fixable violations (text_inside_pare
       const result = await callKicadScript("move_schematic_component", args);
       if (result.success) {
         const labelsMoved: any[] = result.labels_moved || [];
+        const labelsSkipped: any[] = result.labels_skipped || [];
         const labelNote = labelsMoved.length > 0
           ? `\n  Dragged ${labelsMoved.length} net label(s): ${labelsMoved.map((l: any) => `${l.net} → (${l.to.x},${l.to.y})`).join(", ")}`
+          : "";
+        const skipNote = labelsSkipped.length > 0
+          ? `\n  Skipped ${labelsSkipped.length} label(s) shared with other components: ${labelsSkipped.map((l: any) => `${l.net} @ (${l.position.x},${l.position.y})`).join(", ")}`
           : "";
         return {
           content: [
             {
               type: "text",
-              text: `Moved ${args.reference} from (${result.oldPosition.x}, ${result.oldPosition.y}) to (${result.newPosition.x}, ${result.newPosition.y})${labelNote}`,
+              text: `Moved ${args.reference} from (${result.oldPosition.x}, ${result.oldPosition.y}) to (${result.newPosition.x}, ${result.newPosition.y})${labelNote}${skipNote}`,
             },
           ],
         };
@@ -1364,14 +1378,17 @@ Set autofix=true to automatically apply all fixable violations (text_inside_pare
   // Delete net label from schematic
   server.tool(
     "delete_schematic_net_label",
-    "Remove net label(s) from the schematic. Three modes: (1) single label by netName + optional position, (2) deleteAll=true to remove every label at once, (3) positions array for batch deletion in one call.",
+    "Remove net label(s) from the schematic. Four modes: (1) componentRef+pinName to delete whatever label sits at that pin tip — no coordinate lookup needed, (2) single label by netName + optional position, (3) deleteAll=true to remove every label at once, (4) positions array for batch deletion in one call. tolerance_mm (default 0.5) controls the coordinate match radius for modes 1 and 2.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      componentRef: z.string().optional().describe("Component reference (e.g. R1) — use with pinName to delete the label at that pin tip without knowing its coordinates"),
+      pinName: z.string().optional().describe("Pin number or name (e.g. '1', 'VDD') — use with componentRef"),
       netName: z.string().optional().describe("Name of the net label to remove (single-delete mode)"),
       position: z
         .object({ x: z.number(), y: z.number() })
         .optional()
         .describe("Position to disambiguate if multiple labels with same name (single-delete mode)"),
+      tolerance_mm: z.number().optional().describe("Search radius in mm for coordinate-based matching (default 0.5). Increase to 1.0+ when the label may be slightly offset from the pin tip."),
       deleteAll: z
         .boolean()
         .optional()
@@ -1391,8 +1408,11 @@ Set autofix=true to automatically apply all fixable violations (text_inside_pare
     },
     async (args: {
       schematicPath: string;
+      componentRef?: string;
+      pinName?: string;
       netName?: string;
       position?: { x: number; y: number };
+      tolerance_mm?: number;
       deleteAll?: boolean;
       positions?: Array<{ netName: string; position?: { x: number; y: number } }>;
     }) => {

@@ -228,27 +228,33 @@ Returns symbol references that can be used directly in schematics.`,
   // List pins for multiple symbols in one call
   server.tool(
     "batch_list_symbol_pins",
-    "Return pin names, numbers, types, and symbol-local coordinates for multiple symbols in a single call. Use instead of calling list_symbol_pins repeatedly when placing a subcircuit — saves 5–10 round-trips. Each result includes pins (with x/y/angle in symbol-local coords, Y-up per KiCAD lib convention) and body_bbox (bounding box of pin envelope ±1.27mm, in symbol-local coords). Use body_bbox.width/height to plan component spacing before placement — no guesswork needed. Pass schematicPath to resolve project-local symbols.",
+    "Return pin names, numbers, types, and symbol-local coordinates for multiple symbols in a single call. Use instead of calling list_symbol_pins repeatedly when placing a subcircuit — saves 5–10 round-trips. Each result includes pins (with x/y/angle in symbol-local coords, Y-up per KiCAD lib convention) and body_bbox (bounding box of pin envelope ±1.27mm, in symbol-local coords). IMPORTANT: coordinates are symbol-local (Y-up, pre-rotation). After placement, use get_schematic_pin_locations with the placed reference to get post-rotation schematic coordinates — or rely on batch_add_components which returns pin positions directly. Use body_bbox.width/height to plan component spacing before placement. Set compact=true for simple 2-pin passives (Device:R/C/L) to get just pin_count, body_bbox, and is_symmetric without per-pin detail — reduces response size ~60%.",
     {
       symbols: z.array(z.string())
         .describe("Array of symbols in 'Library:SymbolName' format (e.g., ['Device:R', 'Device:C', 'Device:FerriteBead'])"),
       schematicPath: z.string().optional()
         .describe("Path to .kicad_sch — enables project-local sym-lib-table lookup for project-specific symbols"),
+      compact: z.boolean().optional()
+        .describe("If true, omit per-pin detail for standard 2-pin symmetric passives (Device:R, Device:C, Device:L, etc.) — returns only pin_count, body_bbox, and is_symmetric:true. Reduces response noise for simple placement workflows."),
     },
-    async (args: { symbols: string[]; schematicPath?: string }) => {
+    async (args: { symbols: string[]; schematicPath?: string; compact?: boolean }) => {
       const result = await callKicadScript("batch_list_symbol_pins", args);
       if (result.success !== false || (result.symbols && Object.keys(result.symbols).length > 0)) {
         const lines: string[] = [];
         for (const [sym, data] of Object.entries(result.symbols || {})) {
           const d = data as any;
-          const pinLines = (d.pins || []).map((p: any) => {
-            const coords = (p.x !== undefined) ? ` at (${p.x},${p.y}) angle=${p.angle}` : "";
-            return `    Pin ${p.number} (${p.name}) — type: ${p.type}${coords}`;
-          });
           const bb = d.body_bbox;
           const bboxStr = bb ? ` | body ${bb.width.toFixed(2)}×${bb.height.toFixed(2)}mm` : "";
-          lines.push(`${sym} — ${d.pin_count} pin(s)${bboxStr}:`);
-          lines.push(...pinLines);
+          if (d.is_symmetric && d.compact) {
+            lines.push(`${sym} — ${d.pin_count} pin(s), symmetric${bboxStr}`);
+          } else {
+            const pinLines = (d.pins || []).map((p: any) => {
+              const coords = (p.x !== undefined) ? ` at (${p.x},${p.y}) angle=${p.angle}` : "";
+              return `    Pin ${p.number} (${p.name}) — type: ${p.type}${coords}`;
+            });
+            lines.push(`${sym} — ${d.pin_count} pin(s)${bboxStr}:`);
+            lines.push(...pinLines);
+          }
         }
         if (result.errors && Object.keys(result.errors).length > 0) {
           lines.push("\nErrors:");
