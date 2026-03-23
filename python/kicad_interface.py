@@ -3202,6 +3202,67 @@ class KiCADInterface:
                             ),
                         })
 
+            # 7. Net label proximity / overlap.
+            # Estimate the text bounding box for each net/global label based on its
+            # position, text length, and angle.  Flag pairs whose text boxes overlap
+            # or are within LABEL_GAP_MM of each other — these render as illegible
+            # clutter (e.g. two "VBUS" labels facing each other on adjacent pin tips).
+            LABEL_CHAR_WIDTH = 1.27   # mm per character at KiCad default 1.27mm font
+            LABEL_HALF_HEIGHT = 0.7   # half the label text height (generous)
+            LABEL_GAP_MM = 0.5        # minimum required gap between label text boxes
+
+            def label_text_bbox(lx, ly, name, angle):
+                tw = max(len(name), 1) * LABEL_CHAR_WIDTH
+                hh = LABEL_HALF_HEIGHT
+                a = int(round(angle)) % 360
+                if a == 0:    # text extends right
+                    return {"x_min": lx,      "y_min": ly - hh, "x_max": lx + tw,  "y_max": ly + hh}
+                if a == 180:  # text extends left
+                    return {"x_min": lx - tw, "y_min": ly - hh, "x_max": lx,       "y_max": ly + hh}
+                if a == 90:   # text extends upward (smaller y)
+                    return {"x_min": lx - hh, "y_min": ly - tw, "x_max": lx + hh,  "y_max": ly}
+                if a == 270:  # text extends downward (larger y)
+                    return {"x_min": lx - hh, "y_min": ly,      "x_max": lx + hh,  "y_max": ly + tw}
+                # Arbitrary angle: use a square approximation
+                import math
+                rad = math.radians(angle)
+                ex = lx + tw * math.cos(rad)
+                ey = ly + tw * math.sin(rad)
+                return {
+                    "x_min": min(lx, ex) - hh, "y_min": min(ly, ey) - hh,
+                    "x_max": max(lx, ex) + hh, "y_max": max(ly, ey) + hh,
+                }
+
+            net_labels_for_check = [l for l in labels if l.get("type") in ("net", "global")]
+            label_bb_list = [
+                (lbl, label_text_bbox(
+                    lbl["position"]["x"], lbl["position"]["y"],
+                    lbl.get("name", ""), lbl.get("angle", 0)))
+                for lbl in net_labels_for_check
+            ]
+            for i in range(len(label_bb_list)):
+                lbl_a, bb_a = label_bb_list[i]
+                for j in range(i + 1, len(label_bb_list)):
+                    lbl_b, bb_b = label_bb_list[j]
+                    if bbox_overlaps(bb_a, bb_b, margin=LABEL_GAP_MM):
+                        violations.append({
+                            "type": "label_overlap",
+                            "affected_refs": [lbl_a.get("name"), lbl_b.get("name")],
+                            "position": {
+                                "x": (lbl_a["position"]["x"] + lbl_b["position"]["x"]) / 2,
+                                "y": (lbl_a["position"]["y"] + lbl_b["position"]["y"]) / 2,
+                            },
+                            "description": (
+                                f"Label '{lbl_a['name']}' at "
+                                f"({lbl_a['position']['x']},{lbl_a['position']['y']}) "
+                                f"angle={lbl_a.get('angle',0)} overlaps or is too close to "
+                                f"label '{lbl_b['name']}' at "
+                                f"({lbl_b['position']['x']},{lbl_b['position']['y']}) "
+                                f"angle={lbl_b.get('angle',0)} — "
+                                "move the components further apart or use a shared net label"
+                            ),
+                        })
+
             return {
                 "success": True,
                 "violations": violations,

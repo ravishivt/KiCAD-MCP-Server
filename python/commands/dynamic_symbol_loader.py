@@ -692,18 +692,28 @@ class DynamicSymbolLoader:
         val_angle = 0  # always horizontal
 
         # ── Field clearance enforcement ────────────────────────────────────────
-        # Strategy differs by pin count:
+        # Use the pin-spread body bbox to position ref/val outside the component.
         #
-        # 2-pin passives (R, C, L, Polyfuse, FerriteBead, …):
-        #   KiCAD convention places ref/val between the body and pin tips.  For
-        #   VERTICAL bodies (rot 0°/180°), these positions are intentional; don't
-        #   disturb them.  For HORIZONTAL bodies (rot 90°/270°) the transverse body
-        #   extent is only ~1.5mm, so lib-inherited offsets of ±2.54mm land too close
-        #   to the body edge → enforce ≥ 3.81mm clearance in the y-axis.
+        # Core principle: place ref/val PERPENDICULAR to the major pin axis so
+        # they cannot overlap with net labels placed at pin tips.
+        #
+        # 2-pin passives (R, C, L, Polyfuse, FerriteBead, LED, …):
+        #   Determine the pin axis from the bbox span (pins extend in the larger
+        #   dimension).  Place ref/val along the perpendicular axis, 2mm outside
+        #   the bbox edge.  This avoids collisions with pin labels regardless of
+        #   component rotation.
+        #     • Horizontal body (bb_x_span ≥ bb_y_span, e.g. rot=90 resistor):
+        #         ref above (y_min−2mm), val below (y_max+2mm), both at center_x
+        #     • Vertical body (bb_y_span > bb_x_span, e.g. rot=90 LED/diode):
+        #         ref left (x_min−2mm), val right (x_max+2mm), both at center_y
         #
         # Multi-pin ICs and custom symbols:
-        #   Lib field positions may be inside the pin-spread body bbox (common for
-        #   project-specific symbols).  Push fields outside the bbox with 1.5mm gap.
+        #   Preserve lib-derived positions when they are already close to the
+        #   bbox edge (within MAX_EXT_GAP=3mm).  Fix in two cases:
+        #   (a) position is inside the bbox (with 1.5mm margin) → push out
+        #   (b) position is more than MAX_EXT_GAP outside → pull in to 2mm
+        #   Direction: respect the lib's intended side (ref above → stay above,
+        #   ref below → stay below), with major-axis fallback for ambiguous cases.
 
         body_bb = _get_lib_pin_schematic_bbox(content, full_lib_id, x, y, rotation)
         n_lib_pins = 0
@@ -724,49 +734,76 @@ class DynamicSymbolLoader:
                             n_lib_pins = len(pin_pat.findall(content[sym_s:ci + 1]))
                             break
 
-        if rot_n in (90, 270) and n_lib_pins == 2:
-            # Horizontal 2-pin body: enforce minimum y-clearance from center for
-            # fields that are stacked directly above/below (same x as component).
-            MIN_INLINE = 3.81  # 3 × grid steps
-            INLINE_TOL = 0.5
-            for attr_x, attr_y, is_ref in [(ref_x, ref_y, True), (val_x, val_y, False)]:
-                new_y = attr_y
-                if abs(attr_x - x) <= INLINE_TOL and abs(attr_y - y) < MIN_INLINE:
-                    sign = -1 if attr_y <= y else 1
-                    new_y = _snap(y + sign * MIN_INLINE)
-                if is_ref:
-                    ref_y = new_y
-                else:
-                    val_y = new_y
+        if body_bb is not None:
+            PAD = 1.27  # padding used when building body_bb
+            bb_x_span = (body_bb["x_max"] - body_bb["x_min"]) - 2 * PAD
+            bb_y_span = (body_bb["y_max"] - body_bb["y_min"]) - 2 * PAD
+            FIELD_CLEARANCE = 2.0  # mm clearance from bbox edge
 
-        elif n_lib_pins > 2 and body_bb is not None:
-            # Multi-pin: push fields outside the pin-spread body bbox.
-            MIN_BODY_GAP = 1.5  # mm between field anchor and bbox edge
-
-            def _push_outside_bbox(fx, fy, bb, gap):
-                """Nudge (fx, fy) outside bb + gap margin, choosing nearest edge."""
-                in_x = (bb["x_min"] - gap) <= fx <= (bb["x_max"] + gap)
-                in_y = (bb["y_min"] - gap) <= fy <= (bb["y_max"] + gap)
-                if not (in_x and in_y):
-                    return fx, fy
-                edges = [
-                    (fy - (bb["y_min"] - gap), "top"),
-                    ((bb["y_max"] + gap) - fy, "bottom"),
-                    (fx - (bb["x_min"] - gap), "left"),
-                    ((bb["x_max"] + gap) - fx, "right"),
-                ]
-                best = min(edges, key=lambda e: e[0])
-                if best[1] == "top":
-                    return fx, _snap(bb["y_min"] - gap)
-                elif best[1] == "bottom":
-                    return fx, _snap(bb["y_max"] + gap)
-                elif best[1] == "left":
-                    return _snap(bb["x_min"] - gap), fy
+            if n_lib_pins == 2:
+                # 2-pin: always override with pin-axis-perpendicular placement.
+                # Lib-derived positions frequently land at or between pin tips
+                # (same coordinate as the net label), causing visual overlap.
+                if bb_x_span >= bb_y_span:
+                    # Horizontal body — pins in X → ref above, val below
+                    ref_x = x
+                    ref_y = _snap(body_bb["y_min"] - FIELD_CLEARANCE)
+                    val_x = x
+                    val_y = _snap(body_bb["y_max"] + FIELD_CLEARANCE)
                 else:
+                    # Vertical body — pins in Y → ref left, val right
+                    ref_x = _snap(body_bb["x_min"] - FIELD_CLEARANCE)
+                    ref_y = y
+                    val_x = _snap(body_bb["x_max"] + FIELD_CLEARANCE)
+                    val_y = y
+
+            elif n_lib_pins > 2:
+                # Multi-pin: fix only when necessary (inside bbox or too far out).
+                MARGIN = 0.5       # consider "inside" when within this margin of edge
+                MAX_EXT_GAP = 3.0  # if farther than this outside bbox, pull it in
+
+                def _field_needs_fix(fx, fy, bb, margin, max_gap):
+                    """True if field is inside bbox (with margin) or too far outside."""
+                    inside = (bb["x_min"] - margin <= fx <= bb["x_max"] + margin and
+                              bb["y_min"] - margin <= fy <= bb["y_max"] + margin)
+                    if inside:
+                        return True
+                    gap = max(
+                        max(bb["x_min"] - fx, fx - bb["x_max"], 0),
+                        max(bb["y_min"] - fy, fy - bb["y_max"], 0),
+                    )
+                    return gap > max_gap
+
+                def _push_field(fx, fy, bb, gap, comp_cx, comp_cy, bb_xs, bb_ys, is_ref):
+                    """Move field to a clean position outside the bbox.
+
+                    Direction is chosen by the lib's intended side (above/below/left/right
+                    relative to component centre), with a major-axis fallback when the
+                    field sits near centre.  ref → preferred smaller coord; val → larger.
+                    """
+                    above = fy < comp_cy - 0.5
+                    below = fy > comp_cy + 0.5
+                    left  = fx < comp_cx - 0.5
+                    right = fx > comp_cx + 0.5
+                    if above or (not below and is_ref and bb_xs >= bb_ys):
+                        return fx, _snap(bb["y_min"] - gap)
+                    if below or (not above and not is_ref and bb_xs >= bb_ys):
+                        return fx, _snap(bb["y_max"] + gap)
+                    if left or (not right and is_ref):
+                        return _snap(bb["x_min"] - gap), fy
                     return _snap(bb["x_max"] + gap), fy
 
-            ref_x, ref_y = _push_outside_bbox(ref_x, ref_y, body_bb, MIN_BODY_GAP)
-            val_x, val_y = _push_outside_bbox(val_x, val_y, body_bb, MIN_BODY_GAP)
+                for is_ref in (True, False):
+                    fx, fy = (ref_x, ref_y) if is_ref else (val_x, val_y)
+                    if _field_needs_fix(fx, fy, body_bb, MARGIN, MAX_EXT_GAP):
+                        fx, fy = _push_field(
+                            fx, fy, body_bb, FIELD_CLEARANCE,
+                            x, y, bb_x_span, bb_y_span, is_ref,
+                        )
+                    if is_ref:
+                        ref_x, ref_y = fx, fy
+                    else:
+                        val_x, val_y = fx, fy
 
         # ── End field clearance enforcement ────────────────────────────────────
 

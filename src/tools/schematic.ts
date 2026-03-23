@@ -948,6 +948,7 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
   4. Ref/Val text inside parent body: Reference or Value text position falls within the parent symbol's body bbox.
   5. Ref/Val text overlapping another component's body: Reference or Value text position falls within a different symbol's body bbox.
   6. Field text overlap: the estimated bounding box of one component's Reference or Value text overlaps that of another component's field text (catches stacked power flags, etc.).
+  7. Label overlap: two net labels whose estimated text bounding boxes overlap or are within 0.5mm of each other — indicates components placed too close on a shared bus, or opposing labels on adjacent pin tips that need more separation.
 
 Returns structured violations with type, affected_refs, position, and description. Zero violations means the layout is clean.
 Call this after batch_add_components or set_schematic_property_position to get programmatic feedback instead of relying on visual inspection.`,
