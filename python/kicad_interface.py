@@ -1077,26 +1077,57 @@ class KiCADInterface:
                                 "Use search_footprints to find a valid footprint string."
                             )
 
-                    # Extract property positions and body bbox (best-effort)
-                    try:
-                        raw_content = schematic_file.read_text(encoding="utf-8")
-                        block_text, block_start, block_end = KiCADInterface._find_placed_symbol_block(raw_content, reference)
-                        if block_text:
-                            # Auto-position ref/value based on component rotation
-                            if auto_position_fields:
-                                rot_norm = int(round(rotation % 360 / 90)) * 90 % 360
-                                cx, cy = _snap(x), _snap(y)
-                                _OFF = 2.54
-                                if rot_norm in (0, 180):  # horizontal body → labels above/below
-                                    _field_positions = [
-                                        ("Reference", cx, round(cy - _OFF, 4), 0),
-                                        ("Value",     cx, round(cy + _OFF, 4), 0),
-                                    ]
-                                else:  # 90, 270 — vertical body → labels left/right
-                                    _field_positions = [
-                                        ("Reference", round(cx - _OFF, 4), cy, 90),
-                                        ("Value",     round(cx + _OFF, 4), cy, 90),
-                                    ]
+                    # Invalidate cache immediately so fresh pin lookups see the just-placed symbol
+                    locator._schematic_cache.pop(str(schematic_file), None)
+
+                    # Fetch all pins once — reused for field positioning, includePins, and body_bbox
+                    _all_pins = locator.get_all_symbol_pins(schematic_file, reference) or {}
+
+                    # Auto-position ref/value fields using actual pin axis direction.
+                    # Rules (always angle=0 for readable horizontal text):
+                    #   2-pin: axis is vertical (dy>dx) → labels left/right of body
+                    #          axis is horizontal (dx>dy) → labels above/below body
+                    #   multi-pin: labels above the topmost pin and below the bottommost pin
+                    block_text = None
+                    if auto_position_fields:
+                        cx, cy = _snap(x), _snap(y)
+                        _OFF = 2.54
+                        _num_pins = len(_all_pins)
+                        if _num_pins == 2:
+                            _coords = list(_all_pins.values())
+                            _p1x = float(_coords[0][0]) if isinstance(_coords[0], (list, tuple)) else float(_coords[0]["x"])
+                            _p1y = float(_coords[0][1]) if isinstance(_coords[0], (list, tuple)) else float(_coords[0]["y"])
+                            _p2x = float(_coords[1][0]) if isinstance(_coords[1], (list, tuple)) else float(_coords[1]["x"])
+                            _p2y = float(_coords[1][1]) if isinstance(_coords[1], (list, tuple)) else float(_coords[1]["y"])
+                            if abs(_p1y - _p2y) > abs(_p1x - _p2x):
+                                # Vertical pin axis (pins top/bottom) → labels left/right
+                                _field_positions = [
+                                    ("Reference", round(cx - _OFF, 4), cy, 0),
+                                    ("Value",     round(cx + _OFF, 4), cy, 0),
+                                ]
+                            else:
+                                # Horizontal pin axis (pins left/right) → labels above/below
+                                _field_positions = [
+                                    ("Reference", cx, round(cy - _OFF, 4), 0),
+                                    ("Value",     cx, round(cy + _OFF, 4), 0),
+                                ]
+                        elif _all_pins:
+                            # Multi-pin: above the topmost pin tip, below the bottommost pin tip
+                            _pin_ys = [float(c[1]) if isinstance(c, (list, tuple)) else float(c["y"]) for c in _all_pins.values()]
+                            _field_positions = [
+                                ("Reference", cx, round(min(_pin_ys) - _OFF, 4), 0),
+                                ("Value",     cx, round(max(_pin_ys) + _OFF, 4), 0),
+                            ]
+                        else:
+                            # No pins found — fallback to above/below center
+                            _field_positions = [
+                                ("Reference", cx, round(cy - _OFF, 4), 0),
+                                ("Value",     cx, round(cy + _OFF, 4), 0),
+                            ]
+                        try:
+                            raw_content = schematic_file.read_text(encoding="utf-8")
+                            block_text, block_start, block_end = KiCADInterface._find_placed_symbol_block(raw_content, reference)
+                            if block_text:
                                 new_block = block_text
                                 for _prop, _px, _py, _pa in _field_positions:
                                     _pat = _re.compile(
@@ -1110,23 +1141,28 @@ class KiCADInterface:
                                     raw_content = raw_content[:block_start] + new_block + raw_content[block_end + 1:]
                                     schematic_file.write_text(raw_content, encoding="utf-8")
                                     block_text = new_block
-                            ref_pos = KiCADInterface._extract_property_position(block_text, "Reference")
-                            val_pos = KiCADInterface._extract_property_position(block_text, "Value")
-                            if ref_pos:
-                                entry["ref_position"] = ref_pos
-                            if val_pos:
-                                entry["value_position"] = val_pos
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
+                    else:
+                        # Read block_text for property position extraction only
+                        try:
+                            raw_content = schematic_file.read_text(encoding="utf-8")
+                            block_text, _, _ = KiCADInterface._find_placed_symbol_block(raw_content, reference)
+                        except Exception:
+                            pass
 
-                    # Always invalidate cache after placement so pin/bbox lookups are fresh
-                    locator._schematic_cache.pop(str(schematic_file), None)
+                    if block_text:
+                        ref_pos = KiCADInterface._extract_property_position(block_text, "Reference")
+                        val_pos = KiCADInterface._extract_property_position(block_text, "Value")
+                        if ref_pos:
+                            entry["ref_position"] = ref_pos
+                        if val_pos:
+                            entry["value_position"] = val_pos
 
                     if include_pins:
-                        pins_raw = locator.get_all_symbol_pins(schematic_file, reference) or {}
                         pins_def = locator.get_symbol_pins(schematic_file, symbol) or {}
                         pins = {}
-                        for pin_num, coords in pins_raw.items():
+                        for pin_num, coords in _all_pins.items():
                             pins[pin_num] = {
                                 "x": coords[0],
                                 "y": coords[1],
@@ -1141,14 +1177,9 @@ class KiCADInterface:
 
                     # Compute body_bbox from pin spread (best-effort), fall back to center ± 2.54mm
                     try:
-                        pins_raw_for_bbox = (
-                            {k: (v["x"], v["y"]) for k, v in entry.get("pins", {}).items()}
-                            if include_pins and entry.get("pins")
-                            else (locator.get_all_symbol_pins(schematic_file, reference) or {})
-                        )
-                        if pins_raw_for_bbox:
-                            xs = [c[0] if isinstance(c, (list, tuple)) else c["x"] for c in pins_raw_for_bbox.values()]
-                            ys = [c[1] if isinstance(c, (list, tuple)) else c["y"] for c in pins_raw_for_bbox.values()]
+                        if _all_pins:
+                            xs = [c[0] if isinstance(c, (list, tuple)) else c["x"] for c in _all_pins.values()]
+                            ys = [c[1] if isinstance(c, (list, tuple)) else c["y"] for c in _all_pins.values()]
                             pad = 1.27
                             entry["body_bbox"] = {
                                 "x_min": min(xs) - pad, "y_min": min(ys) - pad,
@@ -2423,6 +2454,38 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
+    @staticmethod
+    def _find_facing_label(sch_path, net_name: str, position, orientation: int, proximity_mm: float = 14.0):
+        """
+        Scan the schematic for an existing label with *net_name* that:
+          - is within *proximity_mm* of *position*
+          - has an orientation 180° opposite to *orientation* (i.e. the two labels face each other)
+
+        Returns [lx, ly] of the existing label if found, else None.
+        Used to detect when two components on the same net have adjacent facing pins —
+        in that case, a single wire between them is cleaner than two overlapping labels.
+        """
+        import re as _re
+        import math as _math
+        try:
+            content = sch_path.read_text(encoding="utf-8")
+            pat = _re.compile(r'\(label\s+"([^"]+)"\s+\(at\s+([-\d.]+)\s+([-\d.]+)\s+([\d.]+)\)')
+            px, py = float(position[0]), float(position[1])
+            orient_norm = int(round(orientation)) % 360
+            facing = (orient_norm + 180) % 360
+            for m in pat.finditer(content):
+                lname = m.group(1)
+                if lname != net_name:
+                    continue
+                lx, ly, la = float(m.group(2)), float(m.group(3)), float(m.group(4))
+                if _math.hypot(lx - px, ly - py) > proximity_mm:
+                    continue
+                if int(round(la)) % 360 == facing:
+                    return [lx, ly]
+        except Exception:
+            pass
+        return None
+
     def _handle_place_net_label_at_pin(self, params):
         """Place a net label at the exact endpoint of a component pin (no wire stub)"""
         logger.info("Placing net label at pin")
@@ -2472,6 +2535,22 @@ class KiCADInterface:
             # Map pin angle to label orientation: label text should extend outward
             angle_map = {0: 180, 90: 270, 180: 0, 270: 90}
             orientation = angle_map.get(cardinal, 0)
+
+            # If an existing label with the same net name is nearby and facing this one,
+            # add a wire to it instead of placing a duplicate — prevents overlapping labels
+            # between adjacent components on the same net (e.g. D1-VBUS ↔ F1-VBUS).
+            existing_pos = KiCADInterface._find_facing_label(sch_path, net_name, position, orientation)
+            if existing_pos:
+                wire_ok = WireManager.add_wire(sch_path, list(position), existing_pos)
+                return {
+                    "success": wire_ok,
+                    "reference": reference,
+                    "pinNumber": pin_number,
+                    "netName": net_name,
+                    "position": {"x": position[0], "y": position[1]},
+                    "labelOrientation": orientation,
+                    "note": f"Wired to existing '{net_name}' label at ({existing_pos[0]},{existing_pos[1]}) instead of placing duplicate",
+                }
 
             success = WireManager.add_label(
                 sch_path, net_name, position, label_type="label", orientation=orientation
@@ -2564,6 +2643,26 @@ class KiCADInterface:
                         cardinal = round(raw_angle / 90) * 90 % 360
                         angle_map = {0: 180, 90: 270, 180: 0, 270: 90}
                         orientation = angle_map.get(cardinal, 0)
+
+                        # If a facing label with the same net name is nearby, wire to it
+                        # rather than placing a duplicate — avoids overlapping labels between
+                        # adjacent components on the same net (e.g. bus segments).
+                        existing_pos = KiCADInterface._find_facing_label(
+                            sch_path, net_name, position, orientation
+                        )
+                        if existing_pos:
+                            ok = WireManager.add_wire(sch_path, list(position), existing_pos)
+                            if ok:
+                                placed.append({
+                                    "ref": ref,
+                                    "pin": str(pin_id),
+                                    "net": net_name,
+                                    "position": {"x": position[0], "y": position[1]},
+                                    "note": f"wired to existing label at ({existing_pos[0]},{existing_pos[1]})",
+                                })
+                            else:
+                                failed.append({"ref": ref, "pin": str(pin_id), "net": net_name, "reason": "wire-to-existing-label failed"})
+                            continue
 
                         ok = WireManager.add_label(
                             sch_path, net_name, position, label_type="label", orientation=orientation
@@ -3383,40 +3482,41 @@ class KiCADInterface:
                             "description": f"{ra} and {rb} body bounding boxes overlap or are within 2mm of each other",
                         })
 
-            # 4. Ref/Val text inside parent component body
-            # Device: 2-pin passives (R, C, L, FerriteBead, Polyfuse, LED, etc.) have a tiny
-            # visible body (~1mm) but pin-spread-derived body_bbox is ~±3.81mm from center.
-            # Ref/val at pin tips (±2.54mm) would be wrongly flagged, so use center ±1mm for these.
-            def get_text_check_bbox(c, default_bb):
-                lib_id = c.get("libId", "")
-                pins = c.get("pins", [])
-                if lib_id.startswith("Device:") and len(pins) == 2:
-                    cx = c["position"]["x"]
-                    cy = c["position"]["y"]
-                    return {"x_min": cx - 1.0, "y_min": cy - 1.0, "x_max": cx + 1.0, "y_max": cy + 1.0}
-                return default_bb
-
+            # 4. Ref/Val text inside parent component body.
+            # For all components, use the actual body_bbox (derived from pin extents).
+            # The suggested_fix mirrors the auto_position_fields logic: perpendicular to pin
+            # axis for 2-pin components; above/below body extent for multi-pin components.
             for c in components:
                 parent_bb = comp_bboxes.get(c["reference"])
                 if not parent_bb:
                     continue
-                text_bb = get_text_check_bbox(c, parent_bb)
                 cx_c = c["position"]["x"]
                 cy_c = c["position"]["y"]
-                rot_c = int(round(c.get("rotation", 0) % 360 / 90)) * 90 % 360
+                _OFF = 2.54
+                _num_pins_c = len(c.get("pins", []))
+                # Determine suggested fix direction: same logic as auto_position_fields.
+                # 2-pin: check pin axis via bbox aspect ratio; multi-pin: above/below.
+                _bb_width = parent_bb["x_max"] - parent_bb["x_min"]
+                _bb_height = parent_bb["y_max"] - parent_bb["y_min"]
+                _vertical_axis = _bb_height > _bb_width  # True → pins top/bottom → labels left/right
                 for field_key, label in [("ref_field", "Reference"), ("value_field", "Value")]:
                     field = c.get(field_key)
-                    if field and point_in_bbox(field["x"], field["y"], text_bb):
-                        # Compute suggested position outside the body
-                        _OFF = 2.54
-                        if rot_c in (0, 180):
+                    if field and point_in_bbox(field["x"], field["y"], parent_bb):
+                        if _num_pins_c == 2 and _vertical_axis:
+                            # Vertical pin axis → labels left/right at angle=0
+                            _fix_x = round(cx_c - _OFF, 4) if label == "Reference" else round(cx_c + _OFF, 4)
+                            _fix_y = cy_c
+                            _fix_angle = 0
+                        elif _num_pins_c == 2 and not _vertical_axis:
+                            # Horizontal pin axis → labels above/below at angle=0
                             _fix_x = cx_c
                             _fix_y = round(cy_c - _OFF, 4) if label == "Reference" else round(cy_c + _OFF, 4)
                             _fix_angle = 0
                         else:
-                            _fix_x = round(cx_c - _OFF, 4) if label == "Reference" else round(cx_c + _OFF, 4)
-                            _fix_y = cy_c
-                            _fix_angle = 90
+                            # Multi-pin: above topmost / below bottommost
+                            _fix_x = cx_c
+                            _fix_y = round(parent_bb["y_min"] - _OFF, 4) if label == "Reference" else round(parent_bb["y_max"] + _OFF, 4)
+                            _fix_angle = 0
                         violations.append({
                             "type": "text_inside_parent_body",
                             "affected_refs": [c["reference"]],
