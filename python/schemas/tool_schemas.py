@@ -1427,7 +1427,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "batch_add_components",
         "title": "Batch Add Components to Schematic",
-        "description": "Places multiple symbols on the schematic in a single call. Prefer this over repeated add_schematic_component calls. All symbols must be specified as Library:SymbolName. Returns snapped positions; set includePins: true only when planning add_wire routing.",
+        "description": "Places multiple symbols on the schematic in a single call. Prefer this over repeated add_schematic_component calls. All symbols must be specified as Library:SymbolName. Returns snapped positions. By default (auto_position_fields=true) automatically positions Reference and Value fields outside the component body based on rotation: rot=0/180 → labels above/below center; rot=90/270 → labels left/right of center. Set includePins: true only when planning add_wire routing; batch_connect does not need coordinates.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1477,9 +1477,64 @@ SCHEMATIC_TOOLS = [
                         },
                         "required": ["symbol", "reference", "position"]
                     }
+                },
+                "auto_position_fields": {
+                    "type": "boolean",
+                    "description": "Automatically position Reference and Value fields outside the component body based on rotation. Default true. Set false only when you want to position fields manually with batch_set_schematic_property_positions."
                 }
             },
             "required": ["schematicPath", "components"]
+        }
+    },
+    {
+        "name": "batch_set_schematic_property_positions",
+        "title": "Batch Set Property Positions",
+        "description": "Move Reference and/or Value property fields for multiple components in a single call (one file read/write). Use this after batch_add_components when auto-positioning is insufficient (e.g., for ICs, connectors, or PWR_FLAGs with non-standard layouts). Replaces 22+ individual set_schematic_property_position calls with 1.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                },
+                "updates": {
+                    "type": "array",
+                    "description": "List of property position updates to apply",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "reference": {
+                                "type": "string",
+                                "description": "Component reference designator (e.g., R1, U3)"
+                            },
+                            "property": {
+                                "type": "string",
+                                "enum": ["Reference", "Value"],
+                                "description": "Which property field to move"
+                            },
+                            "x": {
+                                "type": "number",
+                                "description": "New X coordinate in mm"
+                            },
+                            "y": {
+                                "type": "number",
+                                "description": "New Y coordinate in mm"
+                            },
+                            "angle": {
+                                "type": "number",
+                                "description": "Text rotation angle in degrees (0=horizontal, 90=vertical). Default 0."
+                            },
+                            "visible": {
+                                "type": "boolean",
+                                "description": "Whether the field should be visible. Default true."
+                            }
+                        },
+                        "required": ["reference", "property", "x", "y"]
+                    },
+                    "minItems": 1
+                }
+            },
+            "required": ["schematicPath", "updates"]
         }
     },
     {
@@ -1660,21 +1715,6 @@ SCHEMATIC_TOOLS = [
                 }
             },
             "required": ["schematicPath", "sourceRef", "targetRef"]
-        }
-    },
-    {
-        "name": "run_erc",
-        "title": "Run Electrical Rules Check (ERC)",
-        "description": "Runs the KiCAD Electrical Rules Check (ERC) on a schematic via kicad-cli and returns all violations. Each violation includes type, severity, message, location (x/y coordinates), and an 'items' array where each item has a 'description' field identifying the specific component/pin (e.g. 'Pin 1 [Passive] of R1') and its position. Annotate the schematic first (annotate_schematic) for best results.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                }
-            },
-            "required": ["schematicPath"]
         }
     },
     {
@@ -1955,15 +1995,57 @@ SCHEMATIC_TOOLS = [
                     "type": "string",
                     "description": "Path to the .kicad_sch schematic file"
                 },
+                "componentRef": {
+                    "type": "string",
+                    "description": "Component reference designator (e.g., U1). Use with pinName to auto-resolve the pin position."
+                },
+                "pinName": {
+                    "type": "string",
+                    "description": "Pin number or name on the component (e.g., '3', 'NC'). Used with componentRef to auto-resolve position."
+                },
                 "position": {
                     "type": "array",
-                    "description": "Pin endpoint coordinates [x, y] in mm where the no-connect flag should be placed. Must match the pin endpoint exactly.",
+                    "description": "Pin endpoint coordinates [x, y] in mm. Alternative to componentRef+pinName; must match the pin endpoint exactly.",
                     "items": {"type": "number"},
                     "minItems": 2,
                     "maxItems": 2
                 }
             },
-            "required": ["schematicPath", "position"]
+            "required": ["schematicPath"]
+        }
+    },
+    {
+        "name": "batch_add_no_connects",
+        "title": "Batch Add No-Connect Flags",
+        "description": "Adds no-connect (X) markers to multiple pins in a single call. Each entry auto-resolves the pin position from the schematic. Use this to suppress ERC 'Pin not connected' errors for intentionally unconnected pins (NC/DNP pins, unused GPIO, SBU pins on USB-C). Replaces multiple individual add_no_connect calls.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                },
+                "pins": {
+                    "type": "array",
+                    "description": "List of pins to mark as no-connect",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "componentRef": {
+                                "type": "string",
+                                "description": "Component reference designator (e.g., U1, J2)"
+                            },
+                            "pinName": {
+                                "type": "string",
+                                "description": "Pin number or name (e.g., '3', 'NC', 'SBU1')"
+                            }
+                        },
+                        "required": ["componentRef", "pinName"]
+                    },
+                    "minItems": 1
+                }
+            },
+            "required": ["schematicPath", "pins"]
         }
     },
     {
@@ -2044,6 +2126,68 @@ SCHEMATIC_TOOLS = [
                 }
             },
             "required": ["schematicPath"]
+        }
+    },
+    {
+        "name": "run_erc",
+        "title": "Run Electrical Rules Check (ERC)",
+        "description": "Runs the KiCAD Electrical Rules Check (ERC) on a schematic via kicad-cli and returns all violations. Each violation includes type, severity, message, location (x/y coordinates), and an 'items' array where each item has a 'description' field identifying the specific component/pin (e.g. 'Pin 1 [Passive] of R1') and its position. Annotate the schematic first (annotate_schematic) for best results. Set hierarchical=true to run ERC on every .kicad_sch in the project directory and get per-sheet violations.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file"
+                },
+                "hierarchical": {
+                    "type": "boolean",
+                    "description": "Run ERC on all .kicad_sch files in the project directory (root + sub-sheets) and return violations grouped by sheet. Default false (single sheet only)."
+                }
+            },
+            "required": ["schematicPath"]
+        }
+    },
+    {
+        "name": "create_hierarchical_subsheet",
+        "title": "Create Hierarchical Sub-Sheet",
+        "description": "Creates a new blank sub-sheet schematic file and links it into a parent schematic in one call. Replaces the 3-step workflow of: (1) create_schematic for sub-sheet, (2) create_schematic for root if needed, (3) add_hierarchical_sheet to link them. Returns the sub-sheet file path, its UUID, the sheet block UUID in the parent, and the page number assigned.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "parentSchematicPath": {
+                    "type": "string",
+                    "description": "Path to the existing parent .kicad_sch file that will contain the sheet reference block"
+                },
+                "subsheetPath": {
+                    "type": "string",
+                    "description": "Path for the new sub-sheet .kicad_sch file to create (must not already exist)"
+                },
+                "sheetName": {
+                    "type": "string",
+                    "description": "Display name for the sheet block in the parent schematic (e.g., 'Power', 'USB Interface'). Default 'Sheet'."
+                },
+                "position": {
+                    "type": "object",
+                    "description": "Position of the sheet block in the parent schematic (mm). Default {x:50, y:50}.",
+                    "properties": {
+                        "x": {"type": "number"},
+                        "y": {"type": "number"}
+                    }
+                },
+                "size": {
+                    "type": "object",
+                    "description": "Size of the sheet block rectangle (mm). Default {width:80, height:50}.",
+                    "properties": {
+                        "width": {"type": "number"},
+                        "height": {"type": "number"}
+                    }
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "Optional metadata for the new sub-sheet schematic (title block, revision, etc.)"
+                }
+            },
+            "required": ["parentSchematicPath", "subsheetPath"]
         }
     }
 ]
