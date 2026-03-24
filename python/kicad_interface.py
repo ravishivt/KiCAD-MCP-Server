@@ -4235,16 +4235,15 @@ class KiCADInterface:
             placed_field_bboxes = []
 
             def _has_collision(ref_bb, val_bb, exclude_ref):
-                """Return True if ref_bb or val_bb overlaps any other component body or
-                any already-placed field (with a full text-height buffer between fields)."""
-                for other_ref, other_body in comp_body_bboxes.items():
+                """Return True if ref_bb or val_bb overlaps any other component extended
+                bbox (body + attached labels) or any already-placed field."""
+                for other_ref, other_ext in comp_ext_bboxes.items():
                     if other_ref == exclude_ref:
                         continue
-                    if _overlaps(ref_bb, other_body, 0.75) or _overlaps(val_bb, other_body, 0.75):
+                    if _overlaps(ref_bb, other_ext, 0.3) or _overlaps(val_bb, other_ext, 0.3):
                         return True
                 for fb in placed_field_bboxes:
-                    # Require at least one full text height of separation between fields
-                    if _overlaps(ref_bb, fb, TEXT_HEIGHT) or _overlaps(val_bb, fb, TEXT_HEIGHT):
+                    if _overlaps(ref_bb, fb, 0.2) or _overlaps(val_bb, fb, 0.2):
                         return True
                 return False
 
@@ -4275,8 +4274,10 @@ class KiCADInterface:
                     all_pins = comp_pin_map[ref]
                     num_pins = len(all_pins)
 
-                # Determine preferred placement axis (same logic as batch_add_components)
-                prefer_above_below = True  # default: above/below
+                # Determine priority order of sides to try.
+                # Both ref and val are placed on the SAME side, stacked (like KiCAD's built-in).
+                # 2-pin components: prefer the axis perpendicular to the pin axis so fields
+                # don't overlap the wires.  Multi-pin / power: prefer above/below.
                 if num_pins == 2:
                     coords = list(all_pins.values())
                     p1x = float(coords[0][0]) if isinstance(coords[0], (list, tuple)) else float(coords[0]["x"])
@@ -4284,42 +4285,63 @@ class KiCADInterface:
                     p2x = float(coords[1][0]) if isinstance(coords[1], (list, tuple)) else float(coords[1]["x"])
                     p2y = float(coords[1][1]) if isinstance(coords[1], (list, tuple)) else float(coords[1]["y"])
                     if abs(p1y - p2y) > abs(p1x - p2x):
-                        # Vertical pin axis → prefer left/right
-                        prefer_above_below = False
+                        # Vertical pin axis → prefer right/left (fields beside the component)
+                        sides = ["right", "left", "above", "below"]
+                    else:
+                        # Horizontal pin axis → prefer above/below
+                        sides = ["above", "below", "right", "left"]
+                else:
+                    sides = ["above", "below", "right", "left"]
 
-                # Try candidate positions.  Try preferred first, then alternate.
-                def _try_positions(prefer_above_below):
+                # Place both fields on the same side, stacked.
+                # For above/below: both centered at cx, ref closer to body, val further out.
+                # For right/left: both at same x offset, stacked around cy (ref above, val below).
+                def _try_side(side):
                     half_ref_h = TEXT_HEIGHT / 2.0
-                    half_val_h = TEXT_HEIGHT / 2.0
                     half_ref_w = max(len(ref), 1) * 0.75 / 2.0
-                    half_val_w = max(len(val_text), 1) * 0.75 / 2.0
+                    half_val_w = max(len(str(val_text)), 1) * 0.75 / 2.0
+                    # center-to-center distance between stacked fields
+                    stack = TEXT_HEIGHT
 
-                    if prefer_above_below:
-                        # Reference above, Value below
+                    if side == "above":
                         ref_x = cx
                         ref_y = _snap(ext_bb["y_min"] - half_ref_h - clearance)
                         val_x = cx
-                        val_y = _snap(ext_bb["y_max"] + half_val_h + clearance)
-                    else:
-                        # Reference left, Value right
-                        ref_x = _snap(ext_bb["x_min"] - half_ref_w - clearance)
-                        ref_y = cy
-                        val_x = _snap(ext_bb["x_max"] + half_val_w + clearance)
-                        val_y = cy
+                        val_y = ref_y - stack      # exactly one stack-unit above ref
+                    elif side == "below":
+                        ref_x = cx
+                        ref_y = _snap(ext_bb["y_max"] + half_ref_h + clearance)
+                        val_x = cx
+                        val_y = ref_y + stack      # exactly one stack-unit below ref
+                    elif side == "right":
+                        x0 = ext_bb["x_max"] + clearance
+                        ref_x = _snap(x0 + half_ref_w)
+                        ref_y = _snap(cy)          # snap to grid at component centre
+                        val_x = _snap(x0 + half_val_w)
+                        val_y = ref_y + stack      # exactly one stack-unit below (both on grid)
+                    else:  # left
+                        x0 = ext_bb["x_min"] - clearance
+                        ref_x = _snap(x0 - half_ref_w)
+                        ref_y = _snap(cy)
+                        val_x = _snap(x0 - half_val_w)
+                        val_y = ref_y + stack
                     return ref_x, ref_y, val_x, val_y
 
-                ref_x, ref_y, val_x, val_y = _try_positions(prefer_above_below)
-                ref_bb = _field_bbox(ref_x, ref_y, ref)
-                val_bb = _field_bbox(val_x, val_y, val_text)
-
-                if _has_collision(ref_bb, val_bb, ref):
-                    # Try alternate axis
-                    alt_x, alt_y, alt_vx, alt_vy = _try_positions(not prefer_above_below)
-                    alt_ref_bb = _field_bbox(alt_x, alt_y, ref)
-                    alt_val_bb = _field_bbox(alt_vx, alt_vy, val_text)
-                    if not _has_collision(alt_ref_bb, alt_val_bb, ref):
-                        ref_x, ref_y, val_x, val_y = alt_x, alt_y, alt_vx, alt_vy
-                        ref_bb, val_bb = alt_ref_bb, alt_val_bb
+                # Try sides in priority order; take the first collision-free one.
+                ref_x = ref_y = val_x = val_y = ref_bb = val_bb = None
+                for side in sides:
+                    rx, ry, vx, vy = _try_side(side)
+                    rb = _field_bbox(rx, ry, ref)
+                    vb = _field_bbox(vx, vy, val_text)
+                    if not _has_collision(rb, vb, ref):
+                        ref_x, ref_y, val_x, val_y = rx, ry, vx, vy
+                        ref_bb, val_bb = rb, vb
+                        break
+                if ref_x is None:
+                    # Fall back to preferred side even with collision
+                    ref_x, ref_y, val_x, val_y = _try_side(sides[0])
+                    ref_bb = _field_bbox(ref_x, ref_y, ref)
+                    val_bb = _field_bbox(val_x, val_y, val_text)
 
                 # Commit these positions — future components will avoid them.
                 placed_field_bboxes.append(ref_bb)
