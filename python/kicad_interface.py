@@ -4194,24 +4194,21 @@ class KiCADInterface:
                 cy = comp["position"]["y"]
                 val_text = comp.get("value", ref)
 
-                # kicad_power symbols (PWR_FLAG, GND, VCC, etc.) have tiny bodies and
-                # no visible net labels. Reset their fields to just above/below the body
-                # without any collision logic — they sit in otherwise-empty space.
-                if lib_id.startswith("kicad_power:") or lib_id.startswith("power:"):
-                    body_bb = comp.get("body_bbox") or {
+                # Determine effective bounding box and pin count.
+                # Power symbols have no net labels and tiny bodies — use body_bb directly.
+                # Regular components use the pre-computed ext_bb (body + adjacent label extents).
+                is_power = lib_id.startswith("kicad_power:") or lib_id.startswith("power:")
+                if is_power:
+                    pwr_body = comp.get("body_bbox") or {
                         "x_min": cx - 1.27, "y_min": cy - 1.27,
                         "x_max": cx + 1.27, "y_max": cy + 1.27
                     }
-                    ref_y = _snap(body_bb["y_min"] - TEXT_HEIGHT / 2.0 - clearance)
-                    val_y = _snap(body_bb["y_max"] + TEXT_HEIGHT / 2.0 + clearance)
-                    updates.append({"reference": ref, "property": "Reference", "x": cx, "y": ref_y, "angle": 0})
-                    updates.append({"reference": ref, "property": "Value",     "x": cx, "y": val_y, "angle": 0})
-                    continue
-
-                ext_bb = comp_ext_bboxes[ref]
-                all_pins = comp_pin_map[ref]
-                val_text = comp.get("value", ref)
-                num_pins = len(all_pins)
+                    ext_bb = dict(pwr_body)
+                    num_pins = 0  # no pin axis to consider; default to above/below
+                else:
+                    ext_bb = comp_ext_bboxes[ref]
+                    all_pins = comp_pin_map[ref]
+                    num_pins = len(all_pins)
 
                 # Determine preferred placement axis (same logic as batch_add_components)
                 prefer_above_below = True  # default: above/below
