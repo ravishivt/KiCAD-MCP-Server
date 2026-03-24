@@ -3280,11 +3280,34 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_get_schematic_view(self, params):
-        """Get a rasterised image of the schematic (SVG export → optional PNG conversion)"""
+        """Get a rasterised image of the schematic (SVG export → PNG conversion).
+
+        Always renders on a white background so the image is immediately readable.
+        """
         logger.info("Getting schematic view")
         import subprocess
         import tempfile
         import base64
+        import re as _re
+
+        # Target pixels-per-mm for auto-sizing.  10 px/mm ≈ 254 DPI on a standard
+        # schematic — sharp enough to read labels without being excessively large.
+        _PX_PER_MM = 10
+
+        def _inject_white_background(svg_text):
+            """Insert a white <rect> covering the full viewBox as the first drawn element.
+            Returns (modified_svg_text, viewbox_width_mm, viewbox_height_mm)."""
+            vb_w = vb_h = None
+            m = _re.search(r'viewBox="([^"]+)"', svg_text)
+            if m:
+                parts = m.group(1).split()
+                try:
+                    vb_w, vb_h = float(parts[2]), float(parts[3])
+                    rect = f'<rect x="0" y="0" width="{vb_w}" height="{vb_h}" fill="white"/>'
+                    svg_text = _re.sub(r'(<(?:g|path|text|circle|rect|line|polyline|polygon)[^>]*>)', rect + r'\1', svg_text, count=1)
+                except (IndexError, ValueError):
+                    pass
+            return svg_text, vb_w, vb_h
 
         try:
             schematic_path = params.get("schematicPath")
@@ -3295,13 +3318,13 @@ class KiCADInterface:
                 }
 
             fmt = params.get("format", "png")
-            width = params.get("width", 1200)
-            height = params.get("height", 900)
+            # width/height are optional — if omitted, auto-sized from the SVG viewBox
+            explicit_width = params.get("width")
+            explicit_height = params.get("height")
             crop = params.get("crop", False)
 
-            # Step 1: Export schematic to SVG via kicad-cli
+            # Step 1: Export schematic to SVG via kicad-cli (transparent background)
             with tempfile.TemporaryDirectory() as tmpdir:
-                svg_path = os.path.join(tmpdir, "schematic.svg")
                 cmd = [
                     "kicad-cli",
                     "sch",
@@ -3320,9 +3343,7 @@ class KiCADInterface:
                         "message": f"kicad-cli SVG export failed: {result.stderr}",
                     }
 
-                # kicad-cli may name the file after the schematic, find it
                 import glob
-
                 svg_files = glob.glob(os.path.join(tmpdir, "*.svg"))
                 if not svg_files:
                     return {
@@ -3331,30 +3352,44 @@ class KiCADInterface:
                     }
                 svg_path = svg_files[0]
 
+                with open(svg_path, "r", encoding="utf-8") as f:
+                    svg_data = f.read()
+
+                # Inject white background so the SVG is readable (transparent → black in cairosvg)
+                svg_data_white, vb_w, vb_h = _inject_white_background(svg_data)
+
                 if fmt == "svg":
-                    with open(svg_path, "r", encoding="utf-8") as f:
-                        svg_data = f.read()
-                    return {"success": True, "imageData": svg_data, "format": "svg"}
+                    return {"success": True, "imageData": svg_data_white, "format": "svg"}
 
                 # Step 2: Convert SVG to PNG using cairosvg
                 try:
                     from cairosvg import svg2png
                 except ImportError:
-                    # Fallback: return SVG data with a note
-                    with open(svg_path, "r", encoding="utf-8") as f:
-                        svg_data = f.read()
                     return {
                         "success": True,
-                        "imageData": svg_data,
+                        "imageData": svg_data_white,
                         "format": "svg",
                         "message": "cairosvg not installed — returning SVG instead of PNG. Install with: pip install cairosvg",
                     }
 
+                # Auto-size: scale so 1 mm = _PX_PER_MM pixels, preserving aspect ratio.
+                # Explicit width/height override this.
+                if explicit_width or explicit_height:
+                    width = int(explicit_width) if explicit_width else None
+                    height = int(explicit_height) if explicit_height else None
+                elif vb_w and vb_h:
+                    width = int(round(vb_w * _PX_PER_MM))
+                    height = int(round(vb_h * _PX_PER_MM))
+                else:
+                    width, height = 2400, 1800  # safe fallback
+
                 png_data = svg2png(
-                    url=svg_path, output_width=width, output_height=height
+                    bytestring=svg_data_white.encode("utf-8"),
+                    output_width=width,
+                    output_height=height,
                 )
 
-                # Crop to component bounding box if requested (IMPROVEMENT-3)
+                # Crop to component bounding box if requested
                 if crop:
                     try:
                         from PIL import Image, ImageChops
@@ -5747,6 +5782,7 @@ class KiCADInterface:
                 "sch",
                 "export",
                 "svg",
+                "--no-background-color",
                 schematic_path,
                 "-o",
                 output_dir,
