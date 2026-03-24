@@ -3309,6 +3309,61 @@ class KiCADInterface:
                     pass
             return svg_text, vb_w, vb_h
 
+        def _crop_svg_to_content(svg_text, schematic_path_str, margin_mm=10.0):
+            """Rewrite the SVG viewBox/width/height to tightly fit schematic content.
+
+            Derives the content bounding box from component body_bboxes, component
+            positions, and label positions — which are reliable and exclude the
+            page-border frame drawn by KiCAD.  Falls back to the original SVG if
+            data cannot be obtained.
+            Returns (modified_svg, new_w_mm, new_h_mm) or the original string on failure.
+            """
+            xs, ys = [], []
+            try:
+                comp_result = self._handle_list_schematic_components({"schematicPath": schematic_path_str})
+                for comp in comp_result.get("components", []):
+                    ref = comp.get("reference", "")
+                    if ref.startswith("#") or ref.startswith("_"):
+                        continue
+                    bb = comp.get("body_bbox")
+                    if bb:
+                        xs += [bb["x_min"], bb["x_max"]]
+                        ys += [bb["y_min"], bb["y_max"]]
+                    else:
+                        px, py = comp["position"]["x"], comp["position"]["y"]
+                        xs.append(px); ys.append(py)
+                    # Include field text positions
+                    for fkey in ("ref_field", "value_field"):
+                        f = comp.get(fkey, {})
+                        if f.get("x") is not None:
+                            xs.append(f["x"]); ys.append(f["y"])
+
+                lbl_result = self._handle_list_schematic_labels({"schematicPath": schematic_path_str})
+                for lbl in lbl_result.get("labels", []):
+                    pos = lbl.get("position", {})
+                    if pos.get("x") is not None:
+                        xs.append(pos["x"]); ys.append(pos["y"])
+            except Exception:
+                pass
+
+            if not xs or not ys:
+                return svg_text
+
+            x_min = min(xs) - margin_mm
+            y_min = min(ys) - margin_mm
+            new_w = round(max(xs) - min(xs) + 2 * margin_mm, 4)
+            new_h = round(max(ys) - min(ys) + 2 * margin_mm, 4)
+
+            svg_text = _re.sub(r'viewBox="[^"]+"', f'viewBox="{x_min:.4f} {y_min:.4f} {new_w:.4f} {new_h:.4f}"', svg_text, count=1)
+            svg_text = _re.sub(r'(<svg[^>]*\s)width="[^"]+"', rf'\1width="{new_w:.4f}mm"', svg_text, count=1)
+            svg_text = _re.sub(r'(<svg[^>]*\s)height="[^"]+"', rf'\1height="{new_h:.4f}mm"', svg_text, count=1)
+            svg_text = _re.sub(
+                r'<rect x="[^"]*" y="[^"]*" width="[^"]*" height="[^"]*" fill="white"/>',
+                f'<rect x="{x_min:.4f}" y="{y_min:.4f}" width="{new_w:.4f}" height="{new_h:.4f}" fill="white"/>',
+                svg_text, count=1,
+            )
+            return svg_text, new_w, new_h
+
         try:
             schematic_path = params.get("schematicPath")
             if not schematic_path or not os.path.exists(schematic_path):
@@ -3321,7 +3376,8 @@ class KiCADInterface:
             # width/height are optional — if omitted, auto-sized from the SVG viewBox
             explicit_width = params.get("width")
             explicit_height = params.get("height")
-            crop = params.get("crop", False)
+            # crop=True by default: trim the A4/letter page whitespace down to content
+            crop = params.get("crop", True)
 
             # Step 1: Export schematic to SVG via kicad-cli (transparent background)
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -3357,6 +3413,15 @@ class KiCADInterface:
 
                 # Inject white background so the SVG is readable (transparent → black in cairosvg)
                 svg_data_white, vb_w, vb_h = _inject_white_background(svg_data)
+
+                # Crop SVG viewBox to content bounds (trims A4/letter page whitespace)
+                if crop:
+                    try:
+                        result_crop = _crop_svg_to_content(svg_data_white, schematic_path)
+                        if isinstance(result_crop, tuple):
+                            svg_data_white, vb_w, vb_h = result_crop
+                    except Exception as crop_svg_err:
+                        logger.warning(f"SVG crop failed: {crop_svg_err}")
 
                 if fmt == "svg":
                     return {"success": True, "imageData": svg_data_white, "format": "svg"}
