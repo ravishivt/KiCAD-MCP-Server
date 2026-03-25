@@ -654,7 +654,7 @@ class DynamicSymbolLoader:
         # Extract the schematic's own UUID so we can build the correct instance path.
         # KiCAD 8+ requires (path "/<schematic-uuid>" ...) in the instances block —
         # using just "/" causes all references to display as "R?", "C?", etc. in the UI.
-        sch_uuid_match = re.search(r'\(uuid\s+([0-9a-fA-F-]+)\)', content)
+        sch_uuid_match = re.search(r'\(uuid\s+"([0-9a-fA-F-]+)"\)', content)
         sch_uuid = sch_uuid_match.group(1) if sch_uuid_match else ""
         instance_path = f"/{sch_uuid}" if sch_uuid else "/"
 
