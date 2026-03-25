@@ -6218,9 +6218,12 @@ class KiCADInterface:
                     for item in items:
                         item_info = {}
                         if "pos" in item:
+                            # kicad-cli ERC JSON outputs positions in 1/100 mm
+                            # (KiCad internal schematic units). Multiply by 100
+                            # to convert to mm.
                             item_info["pos"] = {
-                                "x": item["pos"].get("x", 0),
-                                "y": item["pos"].get("y", 0),
+                                "x": item["pos"].get("x", 0) * 100,
+                                "y": item["pos"].get("y", 0) * 100,
                             }
                         if "description" in item:
                             item_info["description"] = item["description"]

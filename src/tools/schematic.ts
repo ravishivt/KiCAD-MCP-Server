@@ -466,10 +466,10 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
         .describe("End position"),
     },
     async (args: { schematicPath: string; start: { x: number; y: number }; end: { x: number; y: number } }) => {
-      const result = await callKicadScript("add_wire", {
+      const result = await callKicadScript("add_schematic_wire", {
         schematicPath: args.schematicPath,
-        startPoint: args.start,
-        endPoint: args.end,
+        startPoint: [args.start.x, args.start.y],
+        endPoint: [args.end.x, args.end.y],
       });
       if (result.success) {
         return { content: [{ type: "text", text: "Wire added successfully" }] };
@@ -1137,7 +1137,11 @@ Parameters:
         }
         const lines = nets.map((n: any) => {
           const conns = (n.connections || [])
-            .map((c: any) => `${c.component}/${c.pin}`)
+            .map((c: any) => {
+              const pinNum = String(c.pin);
+              const pinLabel = c.pinName && c.pinName !== pinNum ? `${pinNum}(${c.pinName})` : pinNum;
+              return `${c.component}/${pinLabel}`;
+            })
             .join(", ");
           return `  ${n.name}: ${conns || "(no connections)"}`;
         });
