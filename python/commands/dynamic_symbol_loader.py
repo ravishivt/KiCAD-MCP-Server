@@ -647,16 +647,41 @@ class DynamicSymbolLoader:
         # so omitting this block causes all symbols to show as "R?", "C?", etc.
         pro_files = list(_find_project_root(schematic_path.parent).glob("*.kicad_pro"))
         project_name = pro_files[0].stem if pro_files else schematic_path.stem
+        # Standalone project name for the sub-sheet (used as fallback by KiCad when the
+        # hierarchical path under project_name cannot be resolved — e.g. when the schematic
+        # is opened as a standalone file or before the root ERC annotates it).
+        standalone_project_name = schematic_path.stem
 
         with open(schematic_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        # Extract the schematic's own UUID so we can build the correct instance path.
-        # KiCAD 8+ requires (path "/<schematic-uuid>" ...) in the instances block —
-        # using just "/" causes all references to display as "R?", "C?", etc. in the UI.
-        sch_uuid_match = re.search(r'\(uuid\s+"([0-9a-fA-F-]+)"\)', content)
+        # Extract the schematic's own UUID (handles both quoted and unquoted KiCad formats).
+        # Used as the standalone-project path and as a fallback for the root-project path.
+        sch_uuid_match = re.search(r'\(uuid\s+"?([0-9a-fA-F-]+)"?\)', content)
         sch_uuid = sch_uuid_match.group(1) if sch_uuid_match else ""
+
+        # Build the instance path for the root-project (kicad-main-pcb) entry.
+        # For a sub-sheet, KiCad requires the HIERARCHICAL path /{root-uuid}/{sheet-sym-uuid},
+        # NOT the flat /{sub-sheet-uuid}. Using the flat path causes KiCad to fail resolution
+        # and reset all references to "R?", "C?", etc. on every open/save cycle.
         instance_path = f"/{sch_uuid}" if sch_uuid else "/"
+        if project_name != standalone_project_name:
+            # Look up root schematic to build the correct hierarchical path
+            root_sch = _find_project_root(schematic_path.parent) / f"{project_name}.kicad_sch"
+            if root_sch.exists():
+                with open(root_sch, "r", encoding="utf-8") as _rf:
+                    root_content = _rf.read()
+                # Root UUID may be unquoted (MCP-generated) or quoted (KiCad-saved)
+                _root_uuid_m = re.search(r'\(uuid\s+"?([0-9a-fA-F-]+)"?\)', root_content)
+                # Find the sheet symbol UUID that references this sub-sheet file.
+                # Look backwards from the "Sheet file" property to find the nearest (uuid "...")
+                _file_pos = root_content.find(f'"Sheet file" "{schematic_path.name}"')
+                if _file_pos > 0 and _root_uuid_m:
+                    _uuid_matches = list(re.finditer(
+                        r'\(uuid\s+"([0-9a-fA-F-]+)"\)', root_content[:_file_pos]
+                    ))
+                    if _uuid_matches:
+                        instance_path = f"/{_root_uuid_m.group(1)}/{_uuid_matches[-1].group(1)}"
 
         # Compute field positions from library defaults (so they match KiCAD conventions
         # per symbol and rotation), with a sensible fallback when extraction fails.
@@ -807,6 +832,19 @@ class DynamicSymbolLoader:
 
         # ── End field clearance enforcement ────────────────────────────────────
 
+        # When the schematic is a sub-sheet, also write a standalone-project entry using the
+        # sub-sheet's own flat path /{sch_uuid}. KiCad uses this when the file is opened
+        # outside the root project context (e.g. standalone or before root ERC runs).
+        standalone_path = f"/{sch_uuid}" if sch_uuid else "/"
+        if project_name != standalone_project_name and sch_uuid:
+            standalone_block = (
+                f'      (project "{standalone_project_name}"\n'
+                f'        (path "{standalone_path}" (reference "{reference}") (unit 1))\n'
+                f'      )\n'
+            )
+        else:
+            standalone_block = ""
+
         instance_block = f"""  (symbol (lib_id "{full_lib_id}") (at {x} {y} {int(rotation)}) (unit 1)
     (in_bom yes) (on_board yes) (dnp no)
     (uuid "{new_uuid}")
@@ -826,7 +864,7 @@ class DynamicSymbolLoader:
       (project "{project_name}"
         (path "{instance_path}" (reference "{reference}") (unit 1))
       )
-    )
+{standalone_block}    )
   )"""
 
         # Insert before (sheet_instances using direct string search.
