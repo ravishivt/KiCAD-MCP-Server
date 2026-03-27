@@ -6767,6 +6767,7 @@ class KiCADInterface:
             sch_path_obj = Path(schematic_path)
             project_dir = sch_path_obj.parent
             expected_pro = sch_path_obj.with_suffix(".kicad_pro")
+            is_sub_sheet = not expected_pro.exists()
             tmp_pro_symlink = None
             if not expected_pro.exists():
                 existing_pros = list(project_dir.glob("*.kicad_pro"))
@@ -6835,6 +6836,59 @@ class KiCADInterface:
                     if fname:
                         sheets_checked.append(os.path.basename(fname))
 
+                import re as _re_erc
+
+                def _get_comp_footprint(ref):
+                    """Return the Footprint property value for component 'ref' in the schematic."""
+                    try:
+                        _sch_content = open(schematic_path, encoding="utf-8").read()
+                        _ref_pat = _re_erc.compile(
+                            r'\(property\s+"Reference"\s+"' + _re_erc.escape(ref) + r'"'
+                        )
+                        for _rm in _ref_pat.finditer(_sch_content):
+                            _start = _sch_content.rfind("(symbol", 0, _rm.start())
+                            if _start == -1:
+                                continue
+                            _depth, _end = 0, _start
+                            for _i, _ch in enumerate(_sch_content[_start:], _start):
+                                _depth += (_ch == "(") - (_ch == ")")
+                                if _depth == 0:
+                                    _end = _i + 1
+                                    break
+                            _sym_block = _sch_content[_start:_end]
+                            _fp_m = _re_erc.search(
+                                r'\(property\s+"Footprint"\s+"([^"]+)"', _sym_block
+                            )
+                            if _fp_m:
+                                return _fp_m.group(1)
+                    except Exception:
+                        pass
+                    return None
+
+                def _fp_file_exists(fp_ref):
+                    """Return True if fp_ref (LibName:FPName) resolves to an existing .kicad_mod via
+                    the project fp-lib-table; False if resolvable but missing; None if indeterminate."""
+                    if not fp_ref or ":" not in fp_ref:
+                        return None
+                    _lib_name, _fp_name = fp_ref.split(":", 1)
+                    _fp_name = _fp_name.replace(".kicad_mod", "")
+                    _fp_lib_table = project_dir / "fp-lib-table"
+                    if not _fp_lib_table.exists():
+                        return None
+                    try:
+                        _tbl = _fp_lib_table.read_text(encoding="utf-8")
+                        for _line in _tbl.splitlines():
+                            if f'(name "{_lib_name}")' in _line or f"(name {_lib_name})" in _line:
+                                _uri_m = _re_erc.search(r'\(uri\s+"([^"]+)"\)', _line)
+                                if _uri_m:
+                                    _uri = _uri_m.group(1).replace(
+                                        "${KIPRJMOD}", str(project_dir)
+                                    )
+                                    return (Path(_uri) / f"{_fp_name}.kicad_mod").exists()
+                    except Exception:
+                        pass
+                    return None
+
                 for v in all_violations:
                     vseverity = v.get("severity", "error")
                     items = v.get("items", [])
@@ -6872,6 +6926,55 @@ class KiCADInterface:
                             "sheet. This is expected for sub-sheets created before their peer "
                             "sheet exists."
                         )
+                    # WORKAROUND (kicad-cli v10): power_pin_not_driven fires spuriously
+                    # when ERC runs on a sub-sheet in isolation because kicad-cli cannot
+                    # see power drivers that live on other sheets without the full project
+                    # hierarchy.  Root-schematic ERC does not produce this violation.
+                    # TODO: re-evaluate and remove this workaround once kicad-cli correctly
+                    # resolves cross-sheet power drivers in sub-sheet ERC mode.
+                    # Track upstream fix at: https://gitlab.com/kicad/code/kicad/-/issues
+                    if violation_dict.get("type") == "power_pin_not_driven" and is_sub_sheet:
+                        violation_dict["benign"] = True
+                        violation_dict["note"] = (
+                            "Likely spurious (kicad-cli v10 sub-sheet isolation): power "
+                            "drivers on other sheets are not visible when ERC runs on a "
+                            "sub-sheet without the full project hierarchy. Confirm by "
+                            "running ERC on the root schematic."
+                        )
+                    # WORKAROUND (kicad-cli v10): footprint_link_issues fires spuriously
+                    # because kicad-cli v10 fails to load the project fp-lib-table
+                    # (injecting bogus entries into the table has no effect on violations,
+                    # confirming the table is not read).  We independently verify by
+                    # resolving the footprint through the fp-lib-table ourselves and
+                    # checking that the .kicad_mod file exists on disk.
+                    # TODO: re-evaluate and remove this workaround once kicad-cli correctly
+                    # loads the project fp-lib-table during ERC.
+                    # Track upstream fix at: https://gitlab.com/kicad/code/kicad/-/issues
+                    if violation_dict.get("type") == "footprint_link_issues":
+                        _v_refs = []
+                        for _v_item in violation_dict.get("items", []):
+                            _dm = _re_erc.search(
+                                r"Symbol\s+(\S+)", _v_item.get("description", "")
+                            )
+                            if _dm:
+                                _v_refs.append(_dm.group(1))
+                        _fp_ref = _get_comp_footprint(_v_refs[0]) if _v_refs else None
+                        _exists = _fp_file_exists(_fp_ref)
+                        if _exists is True:
+                            violation_dict["benign"] = True
+                            violation_dict["note"] = (
+                                f"Likely spurious: footprint '{_fp_ref}' exists on disk "
+                                "but kicad-cli v10 failed to resolve the project "
+                                "fp-lib-table (known kicad-cli v10 regression). "
+                                "Verify the footprint assignment in KiCad GUI."
+                            )
+                        elif _exists is None:
+                            violation_dict.setdefault(
+                                "note",
+                                "Could not independently verify footprint existence. "
+                                "kicad-cli v10 may have failed to load the project "
+                                "fp-lib-table; check footprint assignment in KiCad GUI.",
+                            )
                     violations.append(violation_dict)
                     if vseverity in severity_counts:
                         severity_counts[vseverity] += 1
@@ -6887,6 +6990,26 @@ class KiCADInterface:
                         "s-expression parser treats ; lines as data, not comments — "
                         "such lines corrupt the parse tree. Remove ; lines from the "
                         "affected library files to resolve."
+                    )
+                if any(
+                    v.get("benign") and v["type"] == "power_pin_not_driven"
+                    for v in violations
+                ):
+                    notes.append(
+                        "One or more power_pin_not_driven violations were marked benign: "
+                        "kicad-cli v10 cannot resolve power drivers from other sheets when "
+                        "running ERC on a sub-sheet in isolation. Run ERC on the root "
+                        "schematic to see the authoritative result for power net continuity."
+                    )
+                if any(
+                    v.get("benign") and v["type"] == "footprint_link_issues"
+                    for v in violations
+                ):
+                    notes.append(
+                        "One or more footprint_link_issues violations were marked benign: "
+                        "the footprint file was found on disk via the project fp-lib-table, "
+                        "but kicad-cli v10 failed to load that table (known regression). "
+                        "These are not real missing-footprint errors."
                     )
 
                 # Build PWR_FLAG suggestions for pin_not_driven violations.
