@@ -388,6 +388,7 @@ class KiCADInterface:
             "add_schematic_component": self._handle_add_schematic_component,
             "batch_add_components": self._handle_batch_add_components,
             "delete_schematic_component": self._handle_delete_schematic_component,
+            "replace_schematic_component": self._handle_replace_schematic_component,
             "edit_schematic_component": self._handle_edit_schematic_component,
             "batch_edit_schematic_components": self._handle_batch_edit_schematic_components,
             "get_schematic_component": self._handle_get_schematic_component,
@@ -1004,6 +1005,69 @@ class KiCADInterface:
                     }
                 response["pins"] = pins
 
+            # Check if any pin lands mid-wire (not at an endpoint of an existing wire)
+            try:
+                import math as _math
+                from commands.pin_locator import PinLocator as _PinLocator
+
+                _locator = _PinLocator()
+                _all_pins = _locator.get_all_symbol_pins(schematic_file, reference) or {}
+
+                if _all_pins:
+                    _sch2 = SchematicManager.load_schematic(schematic_path)
+                    _wires = []
+                    if _sch2 and hasattr(_sch2, "wire"):
+                        for _w in _sch2.wire:
+                            if hasattr(_w, "pts") and hasattr(_w.pts, "xy"):
+                                _pts = []
+                                for _pt in _w.pts.xy:
+                                    if hasattr(_pt, "value"):
+                                        _pts.append((float(_pt.value[0]), float(_pt.value[1])))
+                                if len(_pts) >= 2:
+                                    _wires.append((_pts[0], _pts[-1]))
+
+                    _TOL_ON = 0.05   # mm: on-wire tolerance
+                    _TOL_EP = 0.1    # mm: endpoint tolerance
+
+                    def _pt_near(p, q, tol):
+                        return _math.hypot(p[0] - q[0], p[1] - q[1]) < tol
+
+                    def _pt_on_seg(p, a, b, tol):
+                        """Return True if p lies on segment a-b within tol (parametric check)."""
+                        dx, dy = b[0] - a[0], b[1] - a[1]
+                        seg_len = _math.hypot(dx, dy)
+                        if seg_len < 1e-9:
+                            return _math.hypot(p[0] - a[0], p[1] - a[1]) < tol
+                        t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (seg_len * seg_len)
+                        if t < 0 or t > 1:
+                            return False
+                        closest = (a[0] + t * dx, a[1] + t * dy)
+                        return _math.hypot(p[0] - closest[0], p[1] - closest[1]) < tol
+
+                    _lib_id = f"{library}:{comp_type}"
+                    _pins_def = _locator.get_symbol_pins(schematic_file, _lib_id) or {}
+                    _warnings = []
+                    for _pnum, _pcoords in _all_pins.items():
+                        _px, _py = float(_pcoords[0]), float(_pcoords[1])
+                        for (_a, _b) in _wires:
+                            if _pt_near((_px, _py), _a, _TOL_EP) or _pt_near((_px, _py), _b, _TOL_EP):
+                                # Pin is at a wire endpoint — fine
+                                break
+                            if _pt_on_seg((_px, _py), _a, _b, _TOL_ON):
+                                _pname = _pins_def.get(str(_pnum), {}).get("name", str(_pnum))
+                                _warnings.append(
+                                    f"\u26a0 Pin {_pnum} ({_pname}) at ({_px:.2f}, {_py:.2f}) lands "
+                                    f"mid-wire on segment ({_a[0]:.2f},{_a[1]:.2f})\u2192({_b[0]:.2f},{_b[1]:.2f}). "
+                                    "KiCAD will not connect this pin without a wire endpoint here. "
+                                    f"Suggested fix: split the wire at ({_px:.2f}, {_py:.2f}) or move component to a wire endpoint."
+                                )
+                                break
+
+                    if _warnings:
+                        response["warnings"] = _warnings
+            except Exception as _mw_err:
+                logger.warning(f"Mid-wire pin check failed (non-fatal): {_mw_err}")
+
             return response
         except Exception as e:
             logger.error(f"Error adding component to schematic: {str(e)}")
@@ -1357,6 +1421,142 @@ class KiCADInterface:
             logger.error(f"Error deleting schematic component: {e}")
             import traceback
 
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_replace_schematic_component(self, params):
+        """Replace a placed symbol with a different symbol, preserving position and field values."""
+        logger.info("Replacing schematic component")
+        try:
+            import re
+            from pathlib import Path
+            from commands.dynamic_symbol_loader import DynamicSymbolLoader, _find_project_root, _snap
+
+            schematic_path = params.get("schematicPath")
+            reference = params.get("reference")
+            new_symbol = params.get("newSymbol")  # e.g. "Device:D_Zener"
+            new_rotation = params.get("newRotation")
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not reference:
+                return {"success": False, "message": "reference is required"}
+            if not new_symbol:
+                return {"success": False, "message": "newSymbol is required (e.g. 'Device:D_Zener')"}
+
+            if ":" not in new_symbol:
+                return {"success": False, "message": "newSymbol must be in 'Library:Symbol' format"}
+            new_library, new_type = new_symbol.split(":", 1)
+
+            sch_file = Path(schematic_path)
+            if not sch_file.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            # Step 1: Get current component info (position, rotation, fields)
+            comp_info = self._handle_get_schematic_component(
+                {"schematicPath": schematic_path, "reference": reference}
+            )
+            if not comp_info.get("success"):
+                return {"success": False, "message": f"Cannot find component '{reference}': {comp_info.get('message', '')}"}
+
+            old_pos = comp_info.get("position", {})
+            old_x = old_pos.get("x", 0)
+            old_y = old_pos.get("y", 0)
+            old_rotation = old_pos.get("angle", 0)
+            old_fields = comp_info.get("fields", {})
+
+            use_rotation = new_rotation if new_rotation is not None else old_rotation
+
+            # Step 2: Remove old symbol block from the schematic
+            with open(sch_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            block_text, block_start, block_end = KiCADInterface._find_placed_symbol_block(content, reference)
+            if block_text is None:
+                return {"success": False, "message": f"Component '{reference}' not found in schematic file"}
+
+            # Trim leading whitespace/newline before block
+            trim_start = block_start
+            while trim_start > 0 and content[trim_start - 1] in (" ", "\t"):
+                trim_start -= 1
+            if trim_start > 0 and content[trim_start - 1] == "\n":
+                trim_start -= 1
+            content = content[:trim_start] + content[block_end + 1:]
+
+            with open(sch_file, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            # Step 3: Add the new symbol at the same position
+            derived_project_path = _find_project_root(sch_file.parent)
+            loader = DynamicSymbolLoader(project_path=derived_project_path)
+
+            old_value = old_fields.get("Value", {}).get("value", new_type) if isinstance(old_fields.get("Value"), dict) else old_fields.get("Value", new_type)
+            old_footprint = old_fields.get("Footprint", {}).get("value", "") if isinstance(old_fields.get("Footprint"), dict) else old_fields.get("Footprint", "")
+
+            loader.add_component(
+                sch_file,
+                new_library,
+                new_type,
+                reference=reference,
+                value=old_value,
+                footprint=old_footprint,
+                x=old_x,
+                y=old_y,
+                rotation=use_rotation,
+                project_path=derived_project_path,
+            )
+
+            # Step 4: Restore any additional field values from old component
+            # (Reference and Value are already set; restore Footprint and any custom fields)
+            fields_to_restore = {}
+            for fname, fdata in old_fields.items():
+                if fname in ("Reference", "Value", "Footprint"):
+                    continue  # already handled above
+                if isinstance(fdata, dict):
+                    fields_to_restore[fname] = fdata.get("value", "")
+                else:
+                    fields_to_restore[fname] = str(fdata)
+
+            if fields_to_restore:
+                with open(sch_file, "r", encoding="utf-8") as f:
+                    content_after = f.read()
+                new_block, _, _ = KiCADInterface._find_placed_symbol_block(content_after, reference)
+                if new_block:
+                    for fname, fval in fields_to_restore.items():
+                        # If field already exists, update; otherwise skip (not injecting new fields here)
+                        prop_pat = re.compile(
+                            r'(\(property\s+"' + re.escape(fname) + r'"\s+)"[^"]*"'
+                        )
+                        content_after = prop_pat.sub(r'\1"' + fval.replace('"', '\\"') + '"', content_after, count=1)
+                    with open(sch_file, "w", encoding="utf-8") as f:
+                        f.write(content_after)
+
+            # Step 5: Collect new pin positions
+            from commands.pin_locator import PinLocator
+            pin_locator = PinLocator()
+            pins_raw = pin_locator.get_all_symbol_pins(sch_file, reference) or {}
+            lib_id = f"{new_library}:{new_type}"
+            pins_def = pin_locator.get_symbol_pins(sch_file, lib_id) or {}
+            pins = {}
+            for pin_num, coords in pins_raw.items():
+                pins[pin_num] = {
+                    "x": coords[0],
+                    "y": coords[1],
+                    "name": pins_def.get(str(pin_num), {}).get("name", str(pin_num)),
+                }
+
+            return {
+                "success": True,
+                "reference": reference,
+                "newSymbol": new_symbol,
+                "position": {"x": old_x, "y": old_y, "rotation": use_rotation},
+                "pins": pins,
+                "message": f"Replaced {reference} with {new_symbol} at ({old_x}, {old_y})",
+            }
+
+        except Exception as e:
+            logger.error(f"Error replacing schematic component: {e}")
+            import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -2399,9 +2599,31 @@ class KiCADInterface:
             component_ref = params.get("reference") or params.get("componentRef")
             pin_name = params.get("pinNumber") or params.get("pinName")
             net_name = params.get("netName")
+            force = params.get("force", False)
 
             if not all([schematic_path, component_ref, pin_name, net_name]):
                 return {"success": False, "message": "Missing required parameters: schematicPath, reference, pinNumber, netName"}
+
+            # Check if a global label with the same name exists; warn unless force=True
+            if not force:
+                try:
+                    schematic = SchematicManager.load_schematic(schematic_path)
+                    if schematic and hasattr(schematic, "global_label"):
+                        for gl in schematic.global_label:
+                            if hasattr(gl, "value") and gl.value == net_name:
+                                return {
+                                    "success": False,
+                                    "warning": True,
+                                    "message": (
+                                        f"Global label '{net_name}' already exists on this sheet. "
+                                        "Placing a local label with the same name will produce an ERC "
+                                        "(same_local_global_label) warning. Use add_wire to connect to "
+                                        "the existing global label net instead. "
+                                        "Pass force=true to place the local label anyway."
+                                    ),
+                                }
+                except Exception as _warn_err:
+                    logger.warning(f"Could not check global labels before connect_to_net: {_warn_err}")
 
             # Use ConnectionManager with new WireManager integration
             label_pos = ConnectionManager.connect_to_net(
@@ -4409,16 +4631,36 @@ class KiCADInterface:
             sch_path = Path(schematic_path)
             locator = PinLocator()
 
-            # Get all net names from labels and global labels
-            net_names = set()
+            # Get all net names from labels and global labels, tracking type
+            local_label_names = set()
+            global_label_names = set()
+            power_net_names = set()
             if hasattr(schematic, "label"):
                 for label in schematic.label:
                     if hasattr(label, "value"):
-                        net_names.add(label.value)
+                        local_label_names.add(label.value)
             if hasattr(schematic, "global_label"):
                 for label in schematic.global_label:
                     if hasattr(label, "value"):
-                        net_names.add(label.value)
+                        global_label_names.add(label.value)
+            if hasattr(schematic, "symbol"):
+                for sym in schematic.symbol:
+                    try:
+                        if (hasattr(sym, "property") and
+                                hasattr(sym.property, "Reference") and
+                                sym.property.Reference.value.startswith("#PWR") and
+                                hasattr(sym.property, "Value")):
+                            power_net_names.add(sym.property.Value.value)
+                    except Exception:
+                        pass
+            net_names = local_label_names | global_label_names
+
+            def _get_label_type(name):
+                if name in power_net_names:
+                    return "power"
+                if name in global_label_names:
+                    return "global"
+                return "local"
 
             nets = []
             for net_name in sorted(net_names):
@@ -4439,6 +4681,7 @@ class KiCADInterface:
                 nets.append(
                     {
                         "name": net_name,
+                        "labelType": _get_label_type(net_name),
                         "connections": connections,
                     }
                 )
@@ -4894,6 +5137,7 @@ class KiCADInterface:
                 return {"success": False, "message": "schematicPath is required"}
 
             net_name_filter = params.get("netName")
+            annotate_nets = params.get("annotate_nets", False)
 
             schematic = SchematicManager.load_schematic(schematic_path)
             if not schematic:
@@ -4921,13 +5165,32 @@ class KiCADInterface:
                                 }
                             )
 
+            TOL = 0.5
+
+            def pts_coincide(a, b):
+                return abs(a[0] - b[0]) < TOL and abs(a[1] - b[1]) < TOL
+
+            def _bfs_seeds(seed_pts, all_segs):
+                """BFS from seed_pts; return set of reachable wire indices."""
+                reachable_pts = list(seed_pts)
+                reachable_indices = set()
+                changed = True
+                while changed:
+                    changed = False
+                    for i, (x1, y1, x2, y2) in enumerate(all_segs):
+                        if i in reachable_indices:
+                            continue
+                        for rx, ry in reachable_pts:
+                            if pts_coincide((rx, ry), (x1, y1)) or pts_coincide((rx, ry), (x2, y2)):
+                                reachable_indices.add(i)
+                                new_pt = (x2, y2) if pts_coincide((rx, ry), (x1, y1)) else (x1, y1)
+                                if not any(pts_coincide(new_pt, (ex, ey)) for ex, ey in reachable_pts):
+                                    reachable_pts.append(new_pt)
+                                changed = True
+                                break
+                return reachable_indices
+
             if net_name_filter:
-                # Filter to only wires reachable from the named net's labels (BFS)
-                TOL = 0.5
-
-                def pts_coincide(a, b):
-                    return abs(a[0] - b[0]) < TOL and abs(a[1] - b[1]) < TOL
-
                 # Collect seed points from net labels and global labels
                 seeds = []
                 if hasattr(schematic, "label"):
@@ -4944,28 +5207,35 @@ class KiCADInterface:
                                 seeds.append((float(pos[0]), float(pos[1])))
 
                 if seeds:
-                    # BFS to find all reachable wire indices
                     all_segs = [(w["start"]["x"], w["start"]["y"], w["end"]["x"], w["end"]["y"]) for w in wires]
-                    reachable_pts = list(seeds)
-                    reachable_indices = set()
-
-                    changed = True
-                    while changed:
-                        changed = False
-                        for i, (x1, y1, x2, y2) in enumerate(all_segs):
-                            if i in reachable_indices:
-                                continue
-                            for rx, ry in reachable_pts:
-                                if pts_coincide((rx, ry), (x1, y1)) or pts_coincide((rx, ry), (x2, y2)):
-                                    reachable_indices.add(i)
-                                    # Add new endpoint to reachable
-                                    new_pt = (x2, y2) if pts_coincide((rx, ry), (x1, y1)) else (x1, y1)
-                                    if not any(pts_coincide(new_pt, (ex, ey)) for ex, ey in reachable_pts):
-                                        reachable_pts.append(new_pt)
-                                    changed = True
-                                    break
-
+                    reachable_indices = _bfs_seeds(seeds, all_segs)
                     wires = [wires[i] for i in sorted(reachable_indices)]
+
+            if annotate_nets:
+                # Build a label_name -> seed positions map from all labels
+                all_segs = [(w["start"]["x"], w["start"]["y"], w["end"]["x"], w["end"]["y"]) for w in wires]
+                net_seeds: dict = {}
+                for lbl_attr in ("label", "global_label"):
+                    if hasattr(schematic, lbl_attr):
+                        for lbl in getattr(schematic, lbl_attr):
+                            if hasattr(lbl, "value") and hasattr(lbl, "at") and hasattr(lbl.at, "value"):
+                                pos = lbl.at.value
+                                net_seeds.setdefault(lbl.value, []).append((float(pos[0]), float(pos[1])))
+
+                # For each net, find wire indices reachable from its seeds
+                wire_net: dict = {}  # wire index -> net name
+                for net_name_candidate, seed_pts in net_seeds.items():
+                    for idx in _bfs_seeds(seed_pts, all_segs):
+                        if idx not in wire_net:
+                            wire_net[idx] = net_name_candidate
+
+                # Annotate each wire
+                annotated_wires = []
+                for i, w in enumerate(wires):
+                    entry = dict(w)
+                    entry["net"] = wire_net.get(i, "UNKNOWN")
+                    annotated_wires.append(entry)
+                wires = annotated_wires
 
             return {"success": True, "wires": wires, "count": len(wires)}
 

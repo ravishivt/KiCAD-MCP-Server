@@ -403,6 +403,14 @@ class ConnectionManager:
                         pos = label.at.value
                         net_label_positions.append([float(pos[0]), float(pos[1])])
 
+            # Also collect positions from global labels with the same net name
+            if hasattr(schematic, "global_label"):
+                for label in schematic.global_label:
+                    if hasattr(label, "value") and label.value == net_name:
+                        if hasattr(label, "at") and hasattr(label.at, "value"):
+                            pos = label.at.value
+                            net_label_positions.append([float(pos[0]), float(pos[1])])
+
             if not net_label_positions:
                 logger.info(f"No labels found for net '{net_name}'")
                 return connections

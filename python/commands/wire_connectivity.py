@@ -91,6 +91,21 @@ def _parse_virtual_connections(schematic, schematic_path):
             except Exception as e:
                 logger.warning(f"Error parsing net label: {e}")
 
+    if hasattr(schematic, "global_label"):
+        for label in schematic.global_label:
+            try:
+                if not hasattr(label, "value"):
+                    continue
+                name = label.value
+                if not hasattr(label, "at") or not hasattr(label.at, "value"):
+                    continue
+                coords = label.at.value
+                pt = _to_iu(float(coords[0]), float(coords[1]))
+                point_to_label[pt] = name
+                label_to_points.setdefault(name, []).append(pt)
+            except Exception as e:
+                logger.warning(f"Error parsing global net label: {e}")
+
     if hasattr(schematic, "symbol"):
         locator = PinLocator()
         for symbol in schematic.symbol:

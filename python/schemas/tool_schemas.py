@@ -1573,7 +1573,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "connect_to_net",
         "title": "Connect Pin to Net",
-        "description": "Intelligently connects a component pin to a named net, automatically routing wires as needed. PREFERRED connection method. Do NOT call get_schematic_pin_locations first — pin lookup is automatic. For no-wire-stub placement, use place_net_label_at_pin instead.",
+        "description": "Intelligently connects a component pin to a named net, automatically routing wires as needed. PREFERRED connection method. Do NOT call get_schematic_pin_locations first — pin lookup is automatic. For no-wire-stub placement, use place_net_label_at_pin instead. NOTE: If a global label with the same net name already exists on the sheet, this tool will return a warning and refuse to place a conflicting local label (to avoid ERC errors). Use force=true to override, or use add_wire to connect to the existing global label instead.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1592,6 +1592,11 @@ SCHEMATIC_TOOLS = [
                 "netName": {
                     "type": "string",
                     "description": "Name of the net to connect to",
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "If true, place the local label even if a global label with the same name exists (may produce ERC warnings). Default false.",
+                    "default": False,
                 },
             },
             "required": ["schematicPath", "reference", "pinNumber", "netName"],
@@ -1894,7 +1899,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "list_schematic_nets",
         "title": "List Schematic Nets",
-        "description": "Returns all net names and their pin connections. Each connection now includes 'pinName' (semantic name, e.g. 'FB', 'EN') and 'pinType' (e.g. 'input', 'output', 'passive') in addition to the pin number. For full connectivity + component data, use generate_netlist. For a single compact view of the whole schematic, use get_schematic_summary.",
+        "description": "Returns all net names and their pin connections. Each net entry includes a 'labelType' field: 'local' (local label only), 'global' (global label, takes ERC priority), or 'power' (#PWR symbol). Each connection includes 'pinName' (semantic name, e.g. 'FB', 'EN') and 'pinType' (e.g. 'input', 'output', 'passive') in addition to the pin number. For full connectivity + component data, use generate_netlist. For a single compact view of the whole schematic, use get_schematic_summary.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2267,6 +2272,57 @@ SCHEMATIC_TOOLS = [
                 }
             },
             "required": ["parentSchematicPath", "subsheetPath"]
+        }
+    },
+    {
+        "name": "list_schematic_wires",
+        "title": "List Schematic Wires",
+        "description": "List wire segments in a schematic. Optionally filter by net name (returns only wires reachable from that net's labels via BFS). Set annotate_nets=true to include net membership for each wire segment.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to .kicad_sch file"
+                },
+                "netName": {
+                    "type": "string",
+                    "description": "If provided, return only wires on this net"
+                },
+                "annotate_nets": {
+                    "type": "boolean",
+                    "description": "If true, annotate each wire with its net name",
+                    "default": False
+                }
+            },
+            "required": ["schematicPath"]
+        }
+    },
+    {
+        "name": "replace_schematic_component",
+        "title": "Replace Schematic Component",
+        "description": "Replace a placed symbol with a different symbol from the library while preserving its position, rotation, and field values (Reference, Value, Footprint). Returns the new pin coordinates.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to .kicad_sch file"
+                },
+                "reference": {
+                    "type": "string",
+                    "description": "Reference designator of the component to replace (e.g. D1, U3)"
+                },
+                "newSymbol": {
+                    "type": "string",
+                    "description": "New symbol in 'Library:Symbol' format (e.g. 'Device:D_Zener')"
+                },
+                "newRotation": {
+                    "type": "number",
+                    "description": "Optional rotation angle in degrees for the new symbol. If omitted, the original rotation is preserved."
+                }
+            },
+            "required": ["schematicPath", "reference", "newSymbol"]
         }
     }
 ]
