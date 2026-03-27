@@ -426,6 +426,8 @@ class KiCADInterface:
             "get_schematic_summary": self._handle_get_schematic_summary,
             "list_schematic_wires": self._handle_list_schematic_wires,
             "list_schematic_labels": self._handle_list_schematic_labels,
+            "get_net_topology": self._handle_get_net_topology,
+            "get_component_pin_positions": self._handle_get_component_pin_positions,
             "move_schematic_component": self._handle_move_schematic_component,
             "rotate_schematic_component": self._handle_rotate_schematic_component,
             "annotate_schematic": self._handle_annotate_schematic,
@@ -3521,10 +3523,11 @@ class KiCADInterface:
             with open(sch_file, "r", encoding="utf-8") as f:
                 raw_content = f.read()
 
-            # Optional filters
+            # Optional filters and display options
             filter_params = params.get("filter", {})
             lib_id_filter = filter_params.get("libId", "")
             ref_prefix_filter = filter_params.get("referencePrefix", "")
+            compact = bool(params.get("compact", False))
 
             locator = PinLocator()
             components = []
@@ -3568,26 +3571,27 @@ class KiCADInterface:
                     "uuid": str(uuid_val),
                 }
 
-                # Extract all KiCad properties (MPN, Description, Manufacturer, etc.)
-                # and Reference/Value field positions
-                try:
-                    block_text, _, _ = KiCADInterface._find_placed_symbol_block(
-                        raw_content, ref
-                    )
-                    if block_text:
-                        comp["properties"] = KiCADInterface._extract_component_properties(
-                            block_text
+                if not compact:
+                    # Extract all KiCad properties (MPN, Description, Manufacturer, etc.)
+                    # and Reference/Value field positions
+                    try:
+                        block_text, _, _ = KiCADInterface._find_placed_symbol_block(
+                            raw_content, ref
                         )
-                        ref_pos = KiCADInterface._extract_property_position(block_text, "Reference")
-                        if ref_pos:
-                            ref_pos["visible"] = KiCADInterface._extract_property_visible(block_text, "Reference")
-                            comp["ref_field"] = ref_pos
-                        val_pos = KiCADInterface._extract_property_position(block_text, "Value")
-                        if val_pos:
-                            val_pos["visible"] = KiCADInterface._extract_property_visible(block_text, "Value")
-                            comp["value_field"] = val_pos
-                except Exception:
-                    pass
+                        if block_text:
+                            comp["properties"] = KiCADInterface._extract_component_properties(
+                                block_text
+                            )
+                            ref_pos = KiCADInterface._extract_property_position(block_text, "Reference")
+                            if ref_pos:
+                                ref_pos["visible"] = KiCADInterface._extract_property_visible(block_text, "Reference")
+                                comp["ref_field"] = ref_pos
+                            val_pos = KiCADInterface._extract_property_position(block_text, "Value")
+                            if val_pos:
+                                val_pos["visible"] = KiCADInterface._extract_property_visible(block_text, "Value")
+                                comp["value_field"] = val_pos
+                    except Exception:
+                        pass
 
                 # Get pins if available
                 try:
@@ -3609,7 +3613,8 @@ class KiCADInterface:
                         if pin_list:
                             xs = [p["position"]["x"] for p in pin_list]
                             ys = [p["position"]["y"] for p in pin_list]
-                            comp["bounds"] = {"minX": min(xs), "maxX": max(xs), "minY": min(ys), "maxY": max(ys)}
+                            if not compact:
+                                comp["bounds"] = {"minX": min(xs), "maxX": max(xs), "minY": min(ys), "maxY": max(ys)}
                             pad = 1.27
                             comp["body_bbox"] = {
                                 "x_min": min(xs) - pad, "y_min": min(ys) - pad,
@@ -4375,7 +4380,13 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_list_schematic_nets(self, params):
-        """List all nets in a schematic with their connections"""
+        """List all NAMED nets in a schematic.
+
+        NOTE: Only lists nets that have at least one local or global net label.
+        Pins wired together via unlabeled wire segments will NOT appear here.
+        Use list_schematic_wires to verify physical connectivity of unlabeled wires,
+        or get_net_topology for full per-net trace.
+        """
         logger.info("Listing schematic nets")
         try:
             from pathlib import Path
@@ -4869,12 +4880,14 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_list_schematic_wires(self, params):
-        """List all wires in a schematic"""
+        """List wires in a schematic. Optional netName filter returns only wires reachable from that net's labels."""
         logger.info("Listing schematic wires")
         try:
             schematic_path = params.get("schematicPath")
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
+
+            net_name_filter = params.get("netName")
 
             schematic = SchematicManager.load_schematic(schematic_path)
             if not schematic:
@@ -4902,6 +4915,52 @@ class KiCADInterface:
                                 }
                             )
 
+            if net_name_filter:
+                # Filter to only wires reachable from the named net's labels (BFS)
+                TOL = 0.5
+
+                def pts_coincide(a, b):
+                    return abs(a[0] - b[0]) < TOL and abs(a[1] - b[1]) < TOL
+
+                # Collect seed points from net labels and global labels
+                seeds = []
+                if hasattr(schematic, "label"):
+                    for lbl in schematic.label:
+                        if hasattr(lbl, "value") and lbl.value == net_name_filter:
+                            if hasattr(lbl, "at") and hasattr(lbl.at, "value"):
+                                pos = lbl.at.value
+                                seeds.append((float(pos[0]), float(pos[1])))
+                if hasattr(schematic, "global_label"):
+                    for lbl in schematic.global_label:
+                        if hasattr(lbl, "value") and lbl.value == net_name_filter:
+                            if hasattr(lbl, "at") and hasattr(lbl.at, "value"):
+                                pos = lbl.at.value
+                                seeds.append((float(pos[0]), float(pos[1])))
+
+                if seeds:
+                    # BFS to find all reachable wire indices
+                    all_segs = [(w["start"]["x"], w["start"]["y"], w["end"]["x"], w["end"]["y"]) for w in wires]
+                    reachable_pts = list(seeds)
+                    reachable_indices = set()
+
+                    changed = True
+                    while changed:
+                        changed = False
+                        for i, (x1, y1, x2, y2) in enumerate(all_segs):
+                            if i in reachable_indices:
+                                continue
+                            for rx, ry in reachable_pts:
+                                if pts_coincide((rx, ry), (x1, y1)) or pts_coincide((rx, ry), (x2, y2)):
+                                    reachable_indices.add(i)
+                                    # Add new endpoint to reachable
+                                    new_pt = (x2, y2) if pts_coincide((rx, ry), (x1, y1)) else (x1, y1)
+                                    if not any(pts_coincide(new_pt, (ex, ey)) for ex, ey in reachable_pts):
+                                        reachable_pts.append(new_pt)
+                                    changed = True
+                                    break
+
+                    wires = [wires[i] for i in sorted(reachable_indices)]
+
             return {"success": True, "wires": wires, "count": len(wires)}
 
         except Exception as e:
@@ -4922,6 +4981,8 @@ class KiCADInterface:
             filter_net_name = filter_params.get("netName")
             filter_comp_ref = filter_params.get("componentRef")
             filter_bbox = filter_params.get("boundingBox")  # {x_min,y_min,x_max,y_max}
+            filter_use_body_box = filter_params.get("useBodyBox", False)
+            filter_body_box_expand = float(filter_params.get("bodyBoxExpand", 2.0))
 
             schematic = SchematicManager.load_schematic(schematic_path)
             if not schematic:
@@ -5028,7 +5089,7 @@ class KiCADInterface:
                 ]
 
             if filter_comp_ref:
-                # Keep only labels near the pin tips of the specified component
+                # Keep only labels near the pin tips (or body box) of the specified component
                 try:
                     from pathlib import Path as _Path2
                     from commands.pin_locator import PinLocator as _PL2
@@ -5039,14 +5100,29 @@ class KiCADInterface:
                          float(v[1]) if isinstance(v, (list, tuple)) else float(v["y"]))
                         for v in _comp_pins.values()
                     ]
-                    _LABEL_TOL = 1.0  # mm — generous to catch slightly-offset labels
-                    def _near_any_pin(lbl):
-                        lx, ly = lbl["position"]["x"], lbl["position"]["y"]
-                        return any(
-                            abs(lx - px) < _LABEL_TOL and abs(ly - py) < _LABEL_TOL
-                            for px, py in _pin_tips
-                        )
-                    labels = [l for l in labels if _near_any_pin(l)]
+                    if filter_use_body_box and _pin_tips:
+                        # Use component body bbox (pin extents ± 1.27mm) expanded by bodyBoxExpand
+                        _xs = [p[0] for p in _pin_tips]
+                        _ys = [p[1] for p in _pin_tips]
+                        _exp = filter_body_box_expand + 1.27
+                        _bx_min = min(_xs) - _exp
+                        _bx_max = max(_xs) + _exp
+                        _by_min = min(_ys) - _exp
+                        _by_max = max(_ys) + _exp
+                        labels = [
+                            l for l in labels
+                            if _bx_min <= l["position"]["x"] <= _bx_max
+                            and _by_min <= l["position"]["y"] <= _by_max
+                        ]
+                    else:
+                        _LABEL_TOL = 3.0  # mm — 3mm catches labels on wires a few mm from pin tips
+                        def _near_any_pin(lbl):
+                            lx, ly = lbl["position"]["x"], lbl["position"]["y"]
+                            return any(
+                                abs(lx - px) < _LABEL_TOL and abs(ly - py) < _LABEL_TOL
+                                for px, py in _pin_tips
+                            )
+                        labels = [l for l in labels if _near_any_pin(l)]
                 except Exception as _fe:
                     logger.warning(f"componentRef filter failed: {_fe}")
 
@@ -5056,6 +5132,232 @@ class KiCADInterface:
             logger.error(f"Error listing schematic labels: {e}")
             import traceback
 
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_get_net_topology(self, params):
+        """Trace a complete net and return all wire segments, labels, pins, and dangling endpoints."""
+        logger.info("Getting net topology")
+        try:
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+
+            schematic_path = params.get("schematicPath")
+            net_name = params.get("netName")
+            if not schematic_path or not net_name:
+                return {"success": False, "message": "schematicPath and netName are required"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            sch_path = Path(schematic_path)
+            TOL = 0.5  # mm
+
+            def pts_coincide(a, b):
+                return abs(a[0] - b[0]) < TOL and abs(a[1] - b[1]) < TOL
+
+            # 1. Collect label positions for this net
+            labels_out = []
+            seed_pts = []
+            if hasattr(schematic, "label"):
+                for lbl in schematic.label:
+                    if hasattr(lbl, "value") and lbl.value == net_name:
+                        pos = lbl.at.value if hasattr(lbl, "at") and hasattr(lbl.at, "value") else [0, 0]
+                        x, y = float(pos[0]), float(pos[1])
+                        labels_out.append({
+                            "name": net_name,
+                            "type": "local",
+                            "position": {"x": x, "y": y},
+                            "angle": float(pos[2]) if len(pos) > 2 else 0,
+                        })
+                        seed_pts.append((x, y))
+            if hasattr(schematic, "global_label"):
+                for lbl in schematic.global_label:
+                    if hasattr(lbl, "value") and lbl.value == net_name:
+                        pos = lbl.at.value if hasattr(lbl, "at") and hasattr(lbl.at, "value") else [0, 0]
+                        x, y = float(pos[0]), float(pos[1])
+                        labels_out.append({
+                            "name": net_name,
+                            "type": "global",
+                            "position": {"x": x, "y": y},
+                            "angle": float(pos[2]) if len(pos) > 2 else 0,
+                        })
+                        seed_pts.append((x, y))
+
+            if not seed_pts:
+                return {
+                    "success": True,
+                    "net": net_name,
+                    "wire_segments": [],
+                    "labels": [],
+                    "pins": [],
+                    "dangling_endpoints": [],
+                    "message": f"No labels found for net '{net_name}'",
+                }
+
+            # 2. Collect all wire segments from schematic
+            all_segs = []
+            if hasattr(schematic, "wire"):
+                for wire in schematic.wire:
+                    if hasattr(wire, "pts") and hasattr(wire.pts, "xy"):
+                        pts = []
+                        for pt in wire.pts.xy:
+                            if hasattr(pt, "value"):
+                                pts.append((float(pt.value[0]), float(pt.value[1])))
+                        for i in range(len(pts) - 1):
+                            all_segs.append((pts[i], pts[i + 1]))
+
+            # 3. BFS from seed points to find reachable wire segments
+            reachable_pts = list(seed_pts)
+            reachable_seg_indices = set()
+
+            changed = True
+            while changed:
+                changed = False
+                for i, (wa, wb) in enumerate(all_segs):
+                    if i in reachable_seg_indices:
+                        continue
+                    for rx, ry in reachable_pts:
+                        if pts_coincide((rx, ry), wa):
+                            reachable_seg_indices.add(i)
+                            if not any(pts_coincide(wb, (ex, ey)) for ex, ey in reachable_pts):
+                                reachable_pts.append(wb)
+                            changed = True
+                            break
+                        elif pts_coincide((rx, ry), wb):
+                            reachable_seg_indices.add(i)
+                            if not any(pts_coincide(wa, (ex, ey)) for ex, ey in reachable_pts):
+                                reachable_pts.append(wa)
+                            changed = True
+                            break
+
+            wire_segments_out = [
+                {"start": {"x": all_segs[i][0][0], "y": all_segs[i][0][1]},
+                 "end":   {"x": all_segs[i][1][0], "y": all_segs[i][1][1]}}
+                for i in sorted(reachable_seg_indices)
+            ]
+
+            # 4. Find component pins at reachable points
+            locator = PinLocator()
+            pins_out = []
+            reachable_pt_set = reachable_pts  # list for tolerance-based lookup
+
+            if hasattr(schematic, "symbol"):
+                for symbol in schematic.symbol:
+                    if not hasattr(symbol.property, "Reference"):
+                        continue
+                    ref = symbol.property.Reference.value
+                    if ref.startswith("_TEMPLATE") or ref.startswith("#"):
+                        continue
+                    try:
+                        all_pins = locator.get_all_symbol_pins(sch_path, ref)
+                        lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
+                        pins_def = locator.get_symbol_pins(sch_path, lib_id) if lib_id else {}
+                        for pin_num, coords in all_pins.items():
+                            px, py = float(coords[0]), float(coords[1])
+                            if any(pts_coincide((px, py), (rx, ry)) for rx, ry in reachable_pt_set):
+                                pd = pins_def.get(str(pin_num), {})
+                                pins_out.append({
+                                    "ref": ref,
+                                    "pin_number": pin_num,
+                                    "pin_name": pd.get("name", pin_num),
+                                    "pin_type": pd.get("type", "unknown"),
+                                    "position": {"x": px, "y": py},
+                                })
+                    except Exception as _pe:
+                        logger.debug(f"Pin lookup failed for {ref}: {_pe}")
+
+            # 5. Find dangling wire endpoints (no other wire, no label, no pin at that point)
+            # Count how many reachable wire endpoints coincide with each reachable point
+            endpoint_count: dict = {}  # key: index into reachable_pts, count of wires touching it
+            reachable_pts_indexed = list(enumerate(reachable_pts))
+
+            for i in reachable_seg_indices:
+                wa, wb = all_segs[i]
+                for ep in (wa, wb):
+                    for idx, rpt in reachable_pts_indexed:
+                        if pts_coincide(ep, rpt):
+                            endpoint_count[idx] = endpoint_count.get(idx, 0) + 1
+                            break
+
+            pin_positions = [(p["position"]["x"], p["position"]["y"]) for p in pins_out]
+            label_positions_set = [(l["position"]["x"], l["position"]["y"]) for l in labels_out]
+
+            dangling_out = []
+            for idx, rpt in reachable_pts_indexed:
+                wire_count = endpoint_count.get(idx, 0)
+                if wire_count != 1:
+                    continue  # Not a stub end (0 = seed-only, 2+ = junction)
+                is_label = any(pts_coincide(rpt, lp) for lp in label_positions_set)
+                is_pin = any(pts_coincide(rpt, pp) for pp in pin_positions)
+                if not is_label and not is_pin:
+                    dangling_out.append({"x": rpt[0], "y": rpt[1]})
+
+            return {
+                "success": True,
+                "net": net_name,
+                "wire_segments": wire_segments_out,
+                "labels": labels_out,
+                "pins": pins_out,
+                "dangling_endpoints": dangling_out,
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting net topology: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_get_component_pin_positions(self, params):
+        """Return world coordinates for all pins of a component reference."""
+        logger.info("Getting component pin positions")
+        try:
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+
+            schematic_path = params.get("schematicPath")
+            reference = params.get("reference")
+            if not schematic_path or not reference:
+                return {"success": False, "message": "schematicPath and reference are required"}
+
+            sch_path = Path(schematic_path)
+            locator = PinLocator()
+
+            all_pins = locator.get_all_symbol_pins(sch_path, reference)
+            if not all_pins:
+                return {"success": False, "message": f"No pins found for {reference} — check reference designator"}
+
+            lib_id = locator._get_lib_id(sch_path, reference)
+            pins_def = locator.get_symbol_pins(sch_path, lib_id) if lib_id else {}
+
+            pins_out = []
+            for pin_num, coords in all_pins.items():
+                pd = pins_def.get(str(pin_num), {})
+                pin_info = {
+                    "pin_number": pin_num,
+                    "pin_name": pd.get("name", pin_num),
+                    "pin_type": pd.get("type", "unknown"),
+                    "position": {"x": float(coords[0]), "y": float(coords[1])},
+                }
+                try:
+                    angle = locator.get_pin_angle(sch_path, reference, str(pin_num))
+                    if angle is not None:
+                        pin_info["stub_direction_angle"] = angle
+                except Exception:
+                    pass
+                pins_out.append(pin_info)
+
+            return {
+                "success": True,
+                "reference": reference,
+                "pins": pins_out,
+                "count": len(pins_out),
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting component pin positions: {e}")
+            import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -6240,6 +6542,13 @@ class KiCADInterface:
                         "location": loc,
                     }
                     violation_dict["benign"] = _is_benign_violation(violation_dict)
+                    if violation_dict.get("type") == "global_label_dangling":
+                        violation_dict["note"] = (
+                            "Fires when no matching global label exists on any other sheet "
+                            "in the project. The label may still be correctly wired on this "
+                            "sheet. This is expected for sub-sheets created before their peer "
+                            "sheet exists."
+                        )
                     violations.append(violation_dict)
                     if vseverity in severity_counts:
                         severity_counts[vseverity] += 1

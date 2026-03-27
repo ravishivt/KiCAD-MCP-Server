@@ -963,7 +963,7 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
   // List all components in schematic
   server.tool(
     "list_schematic_components",
-    "List all components in a schematic with their references, values, positions, pins, and property field positions. Essential for inspecting what's on the schematic before making edits. Each component includes ref_field and value_field with {x, y, angle, visible} for the Reference and Value text positions, and body_bbox with {x_min, y_min, x_max, y_max} for the symbol body bounding box (not including ref/val text).",
+    "List all components in a schematic with their references, values, positions, pins, and property field positions. Essential for inspecting what's on the schematic before making edits. Each component includes ref_field and value_field with {x, y, angle, visible} for the Reference and Value text positions, and body_bbox with {x_min, y_min, x_max, y_max} for the symbol body bounding box (not including ref/val text). Set compact=true to omit field positions, properties, and bounds — returns only ref, libId, value, position, rotation, pin_count, body_bbox for faster review.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       filter: z
@@ -973,10 +973,12 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
         })
         .optional()
         .describe("Optional filters"),
+      compact: z.boolean().optional().describe("If true, omit ref_field, value_field, properties, and bounds — returns only the essentials for design review"),
     },
     async (args: {
       schematicPath: string;
       filter?: { libId?: string; referencePrefix?: string };
+      compact?: boolean;
     }) => {
       const result = await callKicadScript("list_schematic_components", args);
       if (result.success) {
@@ -988,8 +990,10 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
         }
         const lines = comps.map((c: any) => {
           let line = `  ${c.reference}: ${c.libId} = "${c.value}" at (${c.position.x}, ${c.position.y}) rot=${c.rotation}°${c.pins ? ` [${c.pins.length} pins]` : ""}`;
-          if (c.ref_field) line += ` ref@(${c.ref_field.x},${c.ref_field.y})`;
-          if (c.value_field) line += ` val@(${c.value_field.x},${c.value_field.y})`;
+          if (!args.compact) {
+            if (c.ref_field) line += ` ref@(${c.ref_field.x},${c.ref_field.y})`;
+            if (c.value_field) line += ` val@(${c.value_field.x},${c.value_field.y})`;
+          }
           if (c.body_bbox) line += ` bbox=[${c.body_bbox.x_min},${c.body_bbox.y_min},${c.body_bbox.x_max},${c.body_bbox.y_max}]`;
           return line;
         });
@@ -1122,7 +1126,7 @@ Parameters:
   // List all nets in schematic
   server.tool(
     "list_schematic_nets",
-    "List all nets in the schematic with their connections.",
+    "List all NAMED nets in the schematic with their connections. WARNING: Only lists nets that have at least one local or global net label. Pins connected via unlabeled wire segments will NOT appear — use list_schematic_wires to verify physical connectivity, or get_net_topology for a full trace of a specific net.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
     },
@@ -1166,11 +1170,12 @@ Parameters:
   // List all wires in schematic
   server.tool(
     "list_schematic_wires",
-    "List all wires in the schematic with start/end coordinates.",
+    "List wires in the schematic with start/end coordinates. Use netName to filter to only wires reachable from a specific named net (BFS from that net's labels) — turns the flat wire dump into a targeted connectivity trace.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      netName: z.string().optional().describe("If provided, return only wire segments reachable from this net's labels (local or global)"),
     },
-    async (args: { schematicPath: string }) => {
+    async (args: { schematicPath: string; netName?: string }) => {
       const result = await callKicadScript("list_schematic_wires", args);
       if (result.success) {
         const wires = result.wires || [];
@@ -1204,19 +1209,21 @@ Parameters:
   // List all labels in schematic
   server.tool(
     "list_schematic_labels",
-    "List all net labels, global labels, power flags, and no-connect markers in the schematic. Types returned: [net] = local net label, [global] = global label, [power] = power symbol instance (e.g. PWR_FLAG, not a net label), [no_connect] = unconnected pin marker. Use filter.componentRef to see only labels near a specific component's pins — avoids the full 50+ label dump when debugging one component.",
+    "List all net labels, global labels, power flags, and no-connect markers in the schematic. Types returned: [net] = local net label, [global] = global label, [power] = power symbol instance (e.g. PWR_FLAG, not a net label), [no_connect] = unconnected pin marker. Use filter.componentRef to see only labels near a specific component's pins (within 3mm of any pin tip) — avoids the full 50+ label dump when debugging one component. Set useBodyBox=true to instead return all labels within the component's body bounding box expanded by bodyBoxExpand mm.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       filter: z.object({
         netName: z.string().optional().describe("Return only labels whose name exactly matches this net name"),
-        componentRef: z.string().optional().describe("Return only labels near the pin tips of this component (within 1mm). Most efficient way to inspect one component's connections."),
+        componentRef: z.string().optional().describe("Return only labels near the pin tips of this component (within 3mm). Most efficient way to inspect one component's connections."),
+        useBodyBox: z.boolean().optional().describe("When true, use body bounding box (pin extents + bodyBoxExpand) instead of per-pin radius for componentRef filter"),
+        bodyBoxExpand: z.number().optional().describe("Expand the body bounding box by this many mm on each side when useBodyBox=true (default: 2.0)"),
         boundingBox: z.object({
           x_min: z.number(), y_min: z.number(),
           x_max: z.number(), y_max: z.number(),
         }).optional().describe("Return only labels whose position falls within this bounding box (mm)"),
       }).optional().describe("Optional filters to narrow results"),
     },
-    async (args: { schematicPath: string; filter?: { netName?: string; componentRef?: string; boundingBox?: { x_min: number; y_min: number; x_max: number; y_max: number } } }) => {
+    async (args: { schematicPath: string; filter?: { netName?: string; componentRef?: string; useBodyBox?: boolean; bodyBoxExpand?: number; boundingBox?: { x_min: number; y_min: number; x_max: number; y_max: number } } }) => {
       const result = await callKicadScript("list_schematic_labels", args);
       if (result.success) {
         const labels = result.labels || [];
@@ -1870,6 +1877,88 @@ Parameters:
             text: `Failed to add hierarchical sheet: ${result.message || "Unknown error"}`,
           },
         ],
+        isError: true,
+      };
+    },
+  );
+
+  // Trace a complete net topology
+  server.tool(
+    "get_net_topology",
+    `Trace a complete named net and return every element on it in one call:
+- wire_segments: all wire segments (start/end coordinates) that form this net
+- labels: all local and global net labels on this net (position, type, angle)
+- pins: all component pins connected to this net (ref, pin_number, pin_name, pin_type, world position)
+- dangling_endpoints: wire endpoints with no pin, no label, and no junction — true open circuits
+
+This replaces multiple separate tool calls (list_schematic_wires + list_schematic_labels + list_schematic_nets) when you need to inspect or debug a specific net. Use it to verify connectivity, find floating stubs, or map out signal paths.`,
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      netName: z.string().describe("Net name to trace (must match a local or global label exactly)"),
+    },
+    async (args: { schematicPath: string; netName: string }) => {
+      const result = await callKicadScript("get_net_topology", args);
+      if (result.success) {
+        const lines: string[] = [`Net: ${result.net}`];
+        const segs = result.wire_segments || [];
+        lines.push(`Wire segments (${segs.length}):`);
+        for (const s of segs) {
+          lines.push(`  (${s.start.x}, ${s.start.y}) → (${s.end.x}, ${s.end.y})`);
+        }
+        const lbls = result.labels || [];
+        lines.push(`Labels (${lbls.length}):`);
+        for (const l of lbls) {
+          lines.push(`  [${l.type}] ${l.name} at (${l.position.x}, ${l.position.y}) angle=${l.angle}`);
+        }
+        const pins = result.pins || [];
+        lines.push(`Pins (${pins.length}):`);
+        for (const p of pins) {
+          lines.push(`  ${p.ref}/${p.pin_number}(${p.pin_name}) [${p.pin_type}] at (${p.position.x}, ${p.position.y})`);
+        }
+        const dang = result.dangling_endpoints || [];
+        if (dang.length > 0) {
+          lines.push(`DANGLING endpoints (${dang.length}) — open circuits:`);
+          for (const d of dang) {
+            lines.push(`  (${d.x}, ${d.y})`);
+          }
+        } else {
+          lines.push("No dangling endpoints.");
+        }
+        if (result.message) lines.push(result.message);
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+      return {
+        content: [{ type: "text", text: `get_net_topology failed: ${result.message || "Unknown error"}` }],
+        isError: true,
+      };
+    },
+  );
+
+  // Get component pin world positions
+  server.tool(
+    "get_component_pin_positions",
+    `Return the world (schematic) coordinates for every pin of a component reference — after applying the component's position, rotation, and KiCad's Y-flip. Returns pin_number, pin_name, pin_type, position {x, y}, and stub_direction_angle for each pin.
+
+Use this instead of manually combining list_symbol_pins (symbol-local coords) + rotation math. Internally uses the same PinLocator as add_no_connect and place_net_label_at_pin.`,
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      reference: z.string().describe("Component reference designator (e.g., 'U9', 'R3')"),
+    },
+    async (args: { schematicPath: string; reference: string }) => {
+      const result = await callKicadScript("get_component_pin_positions", args);
+      if (result.success) {
+        const pins = result.pins || [];
+        const lines = [
+          `${result.reference} — ${result.count} pin(s):`,
+          ...pins.map((p: any) => {
+            const angle = p.stub_direction_angle != null ? ` dir=${p.stub_direction_angle}°` : "";
+            return `  pin ${p.pin_number} (${p.pin_name}) [${p.pin_type}] at (${p.position.x}, ${p.position.y})${angle}`;
+          }),
+        ];
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+      return {
+        content: [{ type: "text", text: `get_component_pin_positions failed: ${result.message || "Unknown error"}` }],
         isError: true,
       };
     },
