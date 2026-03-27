@@ -838,6 +838,45 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
     },
   );
 
+  // Get wire connections
+  server.tool(
+    "get_wire_connections",
+    "Find all component pins reachable from a schematic point via connected wires, net labels, and power symbols. The query point must be at a wire endpoint or junction — midpoints of wire segments are not matched. Use get_schematic_pin_locations or list_schematic_wires to obtain exact endpoint coordinates first.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      x: z.number().describe("X coordinate of a wire endpoint or junction"),
+      y: z.number().describe("Y coordinate of a wire endpoint or junction"),
+    },
+    async (args: { schematicPath: string; x: number; y: number }) => {
+      const result = await callKicadScript("get_wire_connections", args);
+      if (result.success && result.pins) {
+        const pinList = result.pins
+          .map((p: any) => `  - ${p.component}/${p.pin}`)
+          .join("\n");
+        const wireList = (result.wires ?? [])
+          .map((w: any) => `  - (${w.start.x},${w.start.y}) → (${w.end.x},${w.end.y})`)
+          .join("\n");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Pins connected at (${args.x},${args.y}):\n${pinList || "  (none found)"}\n\nWire segments:\n${wireList || "  (none)"}`,
+            },
+          ],
+        };
+      } else {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Failed to get wire connections: ${result.message || "Unknown error"}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
   // Get pin locations for one or more schematic components
   server.tool(
     "get_schematic_pin_locations",
@@ -1882,6 +1921,48 @@ Parameters:
     },
   );
 
+  // ============================================================
+  // Schematic Analysis Tools (read-only)
+  // ============================================================
+
+  // Get a zoomed view of a schematic region
+  server.tool(
+    "get_schematic_view_region",
+    "Export a cropped region of the schematic as an image (PNG or SVG). Specify bounding box coordinates in schematic mm. Useful for zooming into a specific area to inspect wiring or layout.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
+      x1: z.number().describe("Left X coordinate of the region in mm"),
+      y1: z.number().describe("Top Y coordinate of the region in mm"),
+      x2: z.number().describe("Right X coordinate of the region in mm"),
+      y2: z.number().describe("Bottom Y coordinate of the region in mm"),
+      format: z.enum(["png", "svg"]).optional().describe("Output image format (default: png)"),
+      width: z.number().optional().describe("Output image width in pixels (default: 800)"),
+      height: z.number().optional().describe("Output image height in pixels (default: 600)"),
+    },
+    async (args: {
+      schematicPath: string;
+      x1: number; y1: number; x2: number; y2: number;
+      format?: string; width?: number; height?: number;
+    }) => {
+      const result = await callKicadScript("get_schematic_view_region", args);
+      if (result.success && result.imageData) {
+        if (result.format === "svg") {
+          return { content: [{ type: "text", text: result.imageData }] };
+        }
+        return {
+          content: [{
+            type: "image",
+            data: result.imageData,
+            mimeType: "image/png",
+          }],
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Failed: ${result.message || "Unknown error"}` }],
+      };
+    },
+  );
+
   // Trace a complete net topology
   server.tool(
     "get_net_topology",
@@ -1934,6 +2015,47 @@ This replaces multiple separate tool calls (list_schematic_wires + list_schemati
     },
   );
 
+  // Find overlapping elements
+  server.tool(
+    "find_overlapping_elements",
+    "Detect spatially overlapping symbols, wires, and labels in the schematic. Finds duplicate power symbols at the same position, collinear overlapping wires, and labels stacked on top of each other.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
+      tolerance: z.number().optional().describe("Distance threshold in mm for label proximity and wire collinearity checks. Symbol overlap uses bounding-box intersection. (default: 0.5)"),
+    },
+    async (args: { schematicPath: string; tolerance?: number }) => {
+      const result = await callKicadScript("find_overlapping_elements", args);
+      if (result.success) {
+        const lines = [`Found ${result.totalOverlaps} overlap(s):`];
+        const syms: any[] = result.overlappingSymbols || [];
+        const lbls: any[] = result.overlappingLabels || [];
+        const wires: any[] = result.overlappingWires || [];
+        if (syms.length) {
+          lines.push(`\nOverlapping symbols (${syms.length}):`);
+          syms.slice(0, 20).forEach((o: any) => {
+            lines.push(`  ${o.element1.reference} ↔ ${o.element2.reference} (${o.distance}mm) [${o.type}]`);
+          });
+        }
+        if (lbls.length) {
+          lines.push(`\nOverlapping labels (${lbls.length}):`);
+          lbls.slice(0, 20).forEach((o: any) => {
+            lines.push(`  "${o.element1.name}" ↔ "${o.element2.name}" (${o.distance}mm)`);
+          });
+        }
+        if (wires.length) {
+          lines.push(`\nOverlapping wires (${wires.length}):`);
+          wires.slice(0, 20).forEach((o: any) => {
+            lines.push(`  wire @ (${o.wire1.start.x},${o.wire1.start.y})→(${o.wire1.end.x},${o.wire1.end.y}) overlaps with another`);
+          });
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+      return {
+        content: [{ type: "text", text: `Failed: ${result.message || "Unknown error"}` }],
+      };
+    },
+  );
+
   // Get component pin world positions
   server.tool(
     "get_component_pin_positions",
@@ -1960,6 +2082,82 @@ Use this instead of manually combining list_symbol_pins (symbol-local coords) + 
       return {
         content: [{ type: "text", text: `get_component_pin_positions failed: ${result.message || "Unknown error"}` }],
         isError: true,
+      };
+    },
+  );
+
+  // Get elements in a region
+  server.tool(
+    "get_elements_in_region",
+    "List all symbols, wires, and labels within a rectangular region of the schematic. Useful for understanding what is in a specific area before modifying it.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
+      x1: z.number().describe("Left X coordinate of the region in mm"),
+      y1: z.number().describe("Top Y coordinate of the region in mm"),
+      x2: z.number().describe("Right X coordinate of the region in mm"),
+      y2: z.number().describe("Bottom Y coordinate of the region in mm"),
+    },
+    async (args: {
+      schematicPath: string;
+      x1: number; y1: number; x2: number; y2: number;
+    }) => {
+      const result = await callKicadScript("get_elements_in_region", args);
+      if (result.success) {
+        const c = result.counts;
+        const lines = [`Region (${args.x1},${args.y1})→(${args.x2},${args.y2}): ${c.symbols} symbols, ${c.wires} wires, ${c.labels} labels`];
+        const syms: any[] = result.symbols || [];
+        if (syms.length) {
+          lines.push("\nSymbols:");
+          syms.forEach((s: any) => {
+            const pinCount = s.pins ? Object.keys(s.pins).length : 0;
+            lines.push(`  ${s.reference} (${s.libId}) @ (${s.position.x}, ${s.position.y}) [${pinCount} pins]`);
+          });
+        }
+        const wires: any[] = result.wires || [];
+        if (wires.length) {
+          lines.push(`\nWires (${wires.length}):`);
+          wires.slice(0, 30).forEach((w: any) => {
+            lines.push(`  (${w.start.x},${w.start.y}) → (${w.end.x},${w.end.y})`);
+          });
+          if (wires.length > 30) lines.push(`  ... and ${wires.length - 30} more`);
+        }
+        const labels: any[] = result.labels || [];
+        if (labels.length) {
+          lines.push(`\nLabels (${labels.length}):`);
+          labels.forEach((l: any) => {
+            lines.push(`  "${l.name}" [${l.type}] @ (${l.position.x}, ${l.position.y})`);
+          });
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+      return {
+        content: [{ type: "text", text: `Failed: ${result.message || "Unknown error"}` }],
+      };
+    },
+  );
+
+  // Find wires crossing symbols
+  server.tool(
+    "find_wires_crossing_symbols",
+    "Find all wires that cross over component symbol bodies. Wires passing over symbols are unacceptable in schematics — they indicate routing mistakes where a wire was drawn across a component instead of around it.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
+    },
+    async (args: { schematicPath: string }) => {
+      const result = await callKicadScript("find_wires_crossing_symbols", args);
+      if (result.success) {
+        const collisions: any[] = result.collisions || [];
+        const lines = [`Found ${collisions.length} wire(s) crossing symbols:`];
+        collisions.slice(0, 30).forEach((c: any, i: number) => {
+          lines.push(
+            `  ${i + 1}. Wire (${c.wire.start.x},${c.wire.start.y})→(${c.wire.end.x},${c.wire.end.y}) crosses ${c.component.reference} (${c.component.libId})`
+          );
+        });
+        if (collisions.length > 30) lines.push(`  ... and ${collisions.length - 30} more`);
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+      return {
+        content: [{ type: "text", text: `Failed: ${result.message || "Unknown error"}` }],
       };
     },
   );
