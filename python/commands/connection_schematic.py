@@ -424,31 +424,44 @@ class ConnectionManager:
                 logger.warning("Schematic has no wires")
                 return connections
 
-            connected_wire_points = set()
+            # Pre-collect all wire point lists once (avoid re-parsing on each BFS step)
+            all_wire_point_lists = []
             for wire in schematic.wire:
                 if hasattr(wire, "pts") and hasattr(wire.pts, "xy"):
-                    # Get all points in this wire (polyline)
-                    wire_points = []
+                    pts = []
                     for point in wire.pts.xy:
                         if hasattr(point, "value"):
-                            wire_points.append(
+                            pts.append(
                                 [float(point.value[0]), float(point.value[1])]
                             )
+                    if pts:
+                        all_wire_point_lists.append(pts)
 
-                    # Check if any wire point touches a label
-                    wire_connected = False
-                    for wire_pt in wire_points:
-                        for label_pt in net_label_positions:
-                            if points_coincide(wire_pt, label_pt):
-                                wire_connected = True
-                                break
-                        if wire_connected:
-                            break
+            # BFS: seed reachable set with label positions, then expand
+            # transitively through any wire that touches an already-reachable point.
+            # A single pass misses components reachable via 2+ wire hops from the label.
+            connected_wire_points = set()
+            reachable_points = list(net_label_positions)
 
-                    # If this wire is connected to the net, add all its points
-                    if wire_connected:
+            changed = True
+            while changed:
+                changed = False
+                for wire_points in all_wire_point_lists:
+                    # Skip wires already fully absorbed
+                    if all(tuple(p) in connected_wire_points for p in wire_points):
+                        continue
+                    # Expand if any wire endpoint touches an already-reachable point
+                    if any(
+                        points_coincide(wp, rp)
+                        for wp in wire_points
+                        for rp in reachable_points
+                    ):
                         for pt in wire_points:
-                            connected_wire_points.add((pt[0], pt[1]))
+                            key = tuple(pt)
+                            if key not in connected_wire_points:
+                                connected_wire_points.add(key)
+                                reachable_points.append(pt)
+                                changed = True
 
             # Also include label positions themselves — labels placed directly at pin
             # endpoints (no wire stub) connect to the pin without a wire.
