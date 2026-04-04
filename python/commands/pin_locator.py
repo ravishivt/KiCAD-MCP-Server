@@ -10,7 +10,8 @@ import math
 import re
 import tempfile
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+from typing import Dict, List, Optional, Tuple
+
 import sexpdata
 from sexpdata import Symbol
 from skip import Schematic
@@ -122,11 +123,7 @@ class PinLocator:
             # Find lib_symbols section
             lib_symbols = None
             for item in sch_data:
-                if (
-                    isinstance(item, list)
-                    and len(item) > 0
-                    and item[0] == Symbol("lib_symbols")
-                ):
+                if isinstance(item, list) and len(item) > 0 and item[0] == Symbol("lib_symbols"):
                     lib_symbols = item
                     break
 
@@ -136,11 +133,7 @@ class PinLocator:
 
             # Find the specific symbol definition
             for item in lib_symbols[1:]:  # Skip 'lib_symbols' itself
-                if (
-                    isinstance(item, list)
-                    and len(item) > 1
-                    and item[0] == Symbol("symbol")
-                ):
+                if isinstance(item, list) and len(item) > 1 and item[0] == Symbol("symbol"):
                     symbol_name = str(item[1]).strip('"')
                     if symbol_name == lib_id:
                         # Found the symbol, parse pins
@@ -532,14 +525,14 @@ class PinLocator:
 
 if __name__ == "__main__":
     # Test pin location discovery
+    import shutil
     import sys
-
-    sys.path.insert(0, "/home/chris/MCP/KiCAD-MCP-Server/python")
-
     from pathlib import Path
+
     from commands.component_schematic import ComponentManager
     from commands.schematic import SchematicManager
-    import shutil
+
+    sys.path.insert(0, str(Path(__file__).parent.parent))
 
     print("=" * 80)
     print("PIN LOCATOR TEST")
@@ -547,8 +540,8 @@ if __name__ == "__main__":
 
     # Create test schematic with components (cross-platform temp directory)
     test_path = Path(tempfile.gettempdir()) / "test_pin_locator.kicad_sch"
-    template_path = Path(
-        "/home/chris/MCP/KiCAD-MCP-Server/python/templates/template_with_symbols_expanded.kicad_sch"
+    template_path = (
+        Path(__file__).parent.parent / "templates" / "template_with_symbols_expanded.kicad_sch"
     )
 
     shutil.copy(template_path, test_path)

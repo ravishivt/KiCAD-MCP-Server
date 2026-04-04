@@ -97,6 +97,7 @@ export const toolCategories: ToolCategory[] = [
       "add_wire",
       "delete_schematic_wire",
       "add_schematic_connection",
+      "add_schematic_junction",
       "add_schematic_net_label",
       "delete_schematic_net_label",
       "connect_to_net",
@@ -328,3 +329,4 @@ export function getRegistryStats() {
 
 // Initialize on module load
 initializeRegistry();
+/*UPSTREAM_DUPLICATE_START

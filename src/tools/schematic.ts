@@ -5,10 +5,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-export function registerSchematicTools(
-  server: McpServer,
-  callKicadScript: Function,
-) {
+export function registerSchematicTools(server: McpServer, callKicadScript: Function) {
   // Create schematic tool
   server.tool(
     "create_schematic",
@@ -46,9 +43,7 @@ export function registerSchematicTools(
       schematicPath: z.string().describe("Path to the schematic file"),
       symbol: z
         .string()
-        .describe(
-          "Symbol library:name reference (e.g., Device:R, EDA-MCP:ESP32-C3)",
-        ),
+        .describe("Symbol library:name reference (e.g., Device:R, EDA-MCP:ESP32-C3)"),
       reference: z.string().describe("Component reference (e.g., R1, U1)"),
       value: z.string().optional().describe("Component value"),
       footprint: z.string().optional().describe("KiCAD footprint (e.g. Resistor_SMD:R_0603_1608Metric). Applied directly to the placed instance's Footprint property field — no separate edit_schematic_component call needed."),
@@ -93,10 +88,7 @@ export function registerSchematicTools(
         },
       };
 
-      const result = await callKicadScript(
-        "add_schematic_component",
-        transformed,
-      );
+      const result = await callKicadScript("add_schematic_component", transformed);
       if (result.success) {
         const pos = result.snapped_position;
         const snappedNote = pos
@@ -322,14 +314,27 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       reference: z.string().describe("Current reference designator of the component (e.g. R1, U3)"),
-      footprint: z.string().optional().describe("New KiCAD footprint string (e.g. Resistor_SMD:R_0603_1608Metric)"),
+      footprint: z
+        .string()
+        .optional()
+        .describe("New KiCAD footprint string (e.g. Resistor_SMD:R_0603_1608Metric)"),
       value: z.string().optional().describe("New value string (e.g. 10k, 100nF)"),
-      newReference: z.string().optional().describe("Rename the reference designator (e.g. R1 → R10)"),
-      fieldPositions: z.record(z.object({
-        x: z.number(),
-        y: z.number(),
-        angle: z.number().optional().default(0),
-      })).optional().describe("Reposition field labels: map of field name to {x, y, angle} (e.g. {\"Reference\": {\"x\": 12.5, \"y\": 17.0}})"),
+      newReference: z
+        .string()
+        .optional()
+        .describe("Rename the reference designator (e.g. R1 → R10)"),
+      fieldPositions: z
+        .record(
+          z.object({
+            x: z.number(),
+            y: z.number(),
+            angle: z.number().optional().default(0),
+          }),
+        )
+        .optional()
+        .describe(
+          'Reposition field labels: map of field name to {x, y, angle} (e.g. {"Reference": {"x": 12.5, "y": 17.0}})',
+        ),
     },
     async (args: {
       schematicPath: string;
@@ -428,85 +433,57 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
           : "unknown";
         const fieldLines = Object.entries(result.fields ?? {}).map(
           ([name, f]: [string, any]) =>
-            `  ${name}: "${f.value}" @ (${f.x}, ${f.y}, angle=${f.angle}°)`
+            `  ${name}: "${f.value}" @ (${f.x}, ${f.y}, angle=${f.angle}°)`,
         );
-        return {
-          content: [{
-            type: "text",
-            text: `Component ${result.reference} at ${pos}\nFields:\n${fieldLines.join("\n")}`,
-          }],
-        };
-      }
-      return {
-        content: [{
-          type: "text",
-          text: `Failed to get component: ${result.message || "Unknown error"}`,
-        }],
-      };
-    },
-  );
-
-  // Connect components with wire
-  server.tool(
-    "add_wire",
-    "Add a wire connection in the schematic",
-    {
-      schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      start: z
-        .object({
-          x: z.number(),
-          y: z.number(),
-        })
-        .describe("Start position"),
-      end: z
-        .object({
-          x: z.number(),
-          y: z.number(),
-        })
-        .describe("End position"),
-    },
-    async (args: { schematicPath: string; start: { x: number; y: number }; end: { x: number; y: number } }) => {
-      const result = await callKicadScript("add_schematic_wire", {
-        schematicPath: args.schematicPath,
-        startPoint: [args.start.x, args.start.y],
-        endPoint: [args.end.x, args.end.y],
-      });
-      if (result.success) {
-        return { content: [{ type: "text", text: "Wire added successfully" }] };
-      }
-      return { content: [{ type: "text", text: `Failed to add wire: ${result.message || "Unknown error"}` }] };
-    },
-  );
-
-  // Add pin-to-pin connection
-  server.tool(
-    "add_schematic_connection",
-    "Connect two component pins with a wire. Use this for individual connections between components with different pin roles (e.g. U1.SDA → J3.2). WARNING: Do NOT use this in a loop to wire N passthrough pins — use connect_passthrough instead (single call, cleaner layout, far fewer tokens).",
-    {
-      schematicPath: z.string().describe("Path to the schematic file"),
-      sourceRef: z.string().describe("Source component reference (e.g., R1)"),
-      sourcePin: z
-        .string()
-        .describe("Source pin name/number (e.g., 1, 2, GND)"),
-      targetRef: z.string().describe("Target component reference (e.g., C1)"),
-      targetPin: z
-        .string()
-        .describe("Target pin name/number (e.g., 1, 2, VCC)"),
-    },
-    async (args: {
-      schematicPath: string;
-      sourceRef: string;
-      sourcePin: string;
-      targetRef: string;
-      targetPin: string;
-    }) => {
-      const result = await callKicadScript("add_schematic_connection", args);
-      if (result.success) {
         return {
           content: [
             {
               type: "text",
-              text: `Successfully connected ${args.sourceRef}/${args.sourcePin} to ${args.targetRef}/${args.targetPin}`,
+              text: `Component ${result.reference} at ${pos}\nFields:\n${fieldLines.join("\n")}`,
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to get component: ${result.message || "Unknown error"}`,
+          },
+        ],
+      };
+    },
+  );
+
+  // Draw wire between coordinate waypoints with optional pin snapping
+  server.tool(
+    "add_schematic_wire",
+    "Draws a wire on the schematic between two or more coordinate points. Always call get_schematic_pin_locations first to get the approximate pin coordinates, then pass them as the first and last waypoints. snapToPins (on by default) will correct any float imprecision by snapping endpoints to the exact nearest pin coordinate. To route around components, add intermediate waypoints between the start and end: e.g. [[x1,y1], [xMid,y1], [xMid,y2], [x2,y2]] routes horizontally then vertically. Intermediate waypoints are never snapped.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      waypoints: z
+        .array(z.array(z.number()).length(2))
+        .min(2)
+        .describe("Ordered list of [x, y] coordinates. Minimum 2 points."),
+      snapToPins: z
+        .boolean()
+        .optional()
+        .describe("Snap the first and last waypoints to the nearest pin (default: true)"),
+      snapTolerance: z.number().optional().describe("Maximum snap distance in mm (default: 1.0)"),
+    },
+    async (args: {
+      schematicPath: string;
+      waypoints: number[][];
+      snapToPins?: boolean;
+      snapTolerance?: number;
+    }) => {
+      const result = await callKicadScript("add_schematic_wire", args);
+      if (result.success) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: result.message || "Wire added successfully",
             },
           ],
         };
@@ -514,8 +491,40 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
         return {
           content: [
             {
-              type: "text",
-              text: `Failed to add connection: ${result.message || "Unknown error"}`,
+              type: "text" as const,
+              text: `Failed to add wire: ${result.message || "Unknown error"}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // Add junction dot at a T/X intersection
+  server.tool(
+    "add_schematic_junction",
+    "Place a junction dot at a wire intersection in the schematic. Required at T-branch and X-cross points so KiCAD recognises the electrical connection.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      position: z.array(z.number()).length(2).describe("Junction position [x, y] in mm"),
+    },
+    async (args: { schematicPath: string; position: number[] }) => {
+      const result = await callKicadScript("add_schematic_junction", args);
+      if (result.success) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: result.message || "Junction added successfully",
+            },
+          ],
+        };
+      } else {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Failed to add junction: ${result.message || "Unknown error"}`,
             },
           ],
         };
@@ -850,9 +859,7 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
     async (args: { schematicPath: string; x: number; y: number }) => {
       const result = await callKicadScript("get_wire_connections", args);
       if (result.success && result.pins) {
-        const pinList = result.pins
-          .map((p: any) => `  - ${p.component}/${p.pin}`)
-          .join("\n");
+        const pinList = result.pins.map((p: any) => `  - ${p.component}/${p.pin}`).join("\n");
         const wireList = (result.wires ?? [])
           .map((w: any) => `  - (${w.start.x},${w.start.y}) → (${w.end.x},${w.end.y})`)
           .join("\n");
@@ -929,10 +936,12 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
         };
       } else {
         return {
-          content: [{
-            type: "text",
-            text: `Failed to get pin locations: ${result.message || "Unknown error"}`,
-          }],
+          content: [
+            {
+              type: "text",
+              text: `Failed to get pin locations: ${result.message || "Unknown error"}`,
+            },
+          ],
         };
       }
     },
@@ -979,21 +988,42 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
       schematicPath: z.string().describe("Path to the schematic file"),
       sourceRef: z.string().describe("Source connector reference (e.g. J1)"),
       targetRef: z.string().describe("Target connector reference (e.g. J2)"),
-      netPrefix: z.string().optional().describe("Net name prefix, e.g. 'CSI' → CSI_1, CSI_2 (default: PIN)"),
-      pinOffset: z.number().optional().describe("Add to pin number when building net name (default: 0)"),
+      netPrefix: z
+        .string()
+        .optional()
+        .describe("Net name prefix, e.g. 'CSI' → CSI_1, CSI_2 (default: PIN)"),
+      pinOffset: z
+        .number()
+        .optional()
+        .describe("Add to pin number when building net name (default: 0)"),
     },
-    async (args: { schematicPath: string; sourceRef: string; targetRef: string; netPrefix?: string; pinOffset?: number }) => {
+    async (args: {
+      schematicPath: string;
+      sourceRef: string;
+      targetRef: string;
+      netPrefix?: string;
+      pinOffset?: number;
+    }) => {
       const result = await callKicadScript("connect_passthrough", args);
       if (result.success !== false || (result.connected && result.connected.length > 0)) {
         const lines: string[] = [];
-        if (result.connected?.length) lines.push(`Connected (${result.connected.length}): ${result.connected.slice(0, 5).join(", ")}${result.connected.length > 5 ? " ..." : ""}`);
-        if (result.failed?.length) lines.push(`Failed (${result.failed.length}): ${result.failed.join(", ")}`);
+        if (result.connected?.length)
+          lines.push(
+            `Connected (${result.connected.length}): ${result.connected.slice(0, 5).join(", ")}${result.connected.length > 5 ? " ..." : ""}`,
+          );
+        if (result.failed?.length)
+          lines.push(`Failed (${result.failed.length}): ${result.failed.join(", ")}`);
         return {
           content: [{ type: "text", text: result.message + "\n" + lines.join("\n") }],
         };
       } else {
         return {
-          content: [{ type: "text", text: `Passthrough failed: ${result.message || "Unknown error"}` }],
+          content: [
+            {
+              type: "text",
+              text: `Passthrough failed: ${result.message || "Unknown error"}`,
+            },
+          ],
         };
       }
     },
@@ -1008,7 +1038,10 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
       filter: z
         .object({
           libId: z.string().optional().describe("Filter by library ID (e.g., 'Device:R')"),
-          referencePrefix: z.string().optional().describe("Filter by reference prefix (e.g., 'R', 'C', 'U')"),
+          referencePrefix: z
+            .string()
+            .optional()
+            .describe("Filter by reference prefix (e.g., 'R', 'C', 'U')"),
         })
         .optional()
         .describe("Optional filters"),
@@ -1224,8 +1257,7 @@ Parameters:
           };
         }
         const lines = wires.map(
-          (w: any) =>
-            `  (${w.start.x}, ${w.start.y}) → (${w.end.x}, ${w.end.y})`,
+          (w: any) => `  (${w.start.x}, ${w.start.y}) → (${w.end.x}, ${w.end.y})`,
         );
         return {
           content: [
@@ -1293,40 +1325,40 @@ Parameters:
     },
   );
 
-  // Move schematic component
+  // Move a placed symbol, dragging connected wires
   server.tool(
     "move_schematic_component",
-    "Move a placed symbol to a new position in the schematic. The position is auto-snapped to the KiCAD 50mil (1.27mm) grid. Net labels attached to the component's pin tips are automatically moved along with the component — no separate delete/reconnect round-trips needed.",
+    "Move a placed symbol to a new position in the schematic. By default (preserveWires=true) wire endpoints touching the component's pins are stretched to follow the new position.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       reference: z.string().describe("Reference designator (e.g., R1, U1)"),
       position: z
-        .object({
-          x: z.number(),
-          y: z.number(),
-        })
-        .describe("New position"),
+        .object({ x: z.number(), y: z.number() })
+        .describe("New position in schematic mm coordinates"),
+      preserveWires: z
+        .boolean()
+        .optional()
+        .describe("Stretch connected wire endpoints to follow the move (default true)"),
     },
     async (args: {
       schematicPath: string;
       reference: string;
       position: { x: number; y: number };
+      preserveWires?: boolean;
     }) => {
       const result = await callKicadScript("move_schematic_component", args);
       if (result.success) {
-        const labelsMoved: any[] = result.labels_moved || [];
-        const labelsSkipped: any[] = result.labels_skipped || [];
-        const labelNote = labelsMoved.length > 0
-          ? `\n  Dragged ${labelsMoved.length} net label(s): ${labelsMoved.map((l: any) => `${l.net} → (${l.to.x},${l.to.y})`).join(", ")}`
-          : "";
-        const skipNote = labelsSkipped.length > 0
-          ? `\n  Skipped ${labelsSkipped.length} label(s) shared with other components: ${labelsSkipped.map((l: any) => `${l.net} @ (${l.position.x},${l.position.y})`).join(", ")}`
-          : "";
+        const moved = result.wiresMoved ?? 0;
+        const removed = result.wiresRemoved ?? 0;
         return {
           content: [
             {
               type: "text",
-              text: `Moved ${args.reference} from (${result.oldPosition.x}, ${result.oldPosition.y}) to (${result.newPosition.x}, ${result.newPosition.y})${labelNote}${skipNote}`,
+              text:
+                `Moved ${args.reference} from (${result.oldPosition.x}, ${result.oldPosition.y}) ` +
+                `to (${result.newPosition.x}, ${result.newPosition.y})` +
+                (moved > 0 ? `, ${moved} wire endpoint(s) updated` : "") +
+                (removed > 0 ? `, ${removed} zero-length wire(s) removed` : ""),
             },
           ],
         };
@@ -1351,10 +1383,7 @@ Parameters:
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       reference: z.string().describe("Reference designator (e.g., R1, U1)"),
       angle: z.number().describe("Rotation angle in degrees (0, 90, 180, 270)"),
-      mirror: z
-        .enum(["x", "y"])
-        .optional()
-        .describe("Optional mirror axis"),
+      mirror: z.enum(["x", "y"]).optional().describe("Optional mirror axis"),
     },
     async (args: {
       schematicPath: string;
@@ -1437,12 +1466,8 @@ Parameters:
     "Remove a wire from the schematic by start and end coordinates.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      start: z
-        .object({ x: z.number(), y: z.number() })
-        .describe("Wire start position"),
-      end: z
-        .object({ x: z.number(), y: z.number() })
-        .describe("Wire end position"),
+      start: z.object({ x: z.number(), y: z.number() }).describe("Wire start position"),
+      end: z.object({ x: z.number(), y: z.number() }).describe("Wire end position"),
     },
     async (args: {
       schematicPath: string;
@@ -1545,16 +1570,9 @@ Parameters:
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       outputPath: z.string().describe("Output SVG file path"),
-      blackAndWhite: z
-        .boolean()
-        .optional()
-        .describe("Export in black and white"),
+      blackAndWhite: z.boolean().optional().describe("Export in black and white"),
     },
-    async (args: {
-      schematicPath: string;
-      outputPath: string;
-      blackAndWhite?: boolean;
-    }) => {
+    async (args: { schematicPath: string; outputPath: string; blackAndWhite?: boolean }) => {
       const result = await callKicadScript("export_schematic_svg", args);
       if (result.success) {
         return {
@@ -1585,16 +1603,9 @@ Parameters:
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       outputPath: z.string().describe("Output PDF file path"),
-      blackAndWhite: z
-        .boolean()
-        .optional()
-        .describe("Export in black and white"),
+      blackAndWhite: z.boolean().optional().describe("Export in black and white"),
     },
-    async (args: {
-      schematicPath: string;
-      outputPath: string;
-      blackAndWhite?: boolean;
-    }) => {
+    async (args: { schematicPath: string; outputPath: string; blackAndWhite?: boolean }) => {
       const result = await callKicadScript("export_schematic_pdf", args);
       if (result.success) {
         return {
@@ -1624,10 +1635,7 @@ Parameters:
     "Return a rasterized image of the schematic (PNG by default, or SVG). Uses kicad-cli to export SVG, then converts to PNG via cairosvg. Use this for visual feedback after placing or wiring components.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      format: z
-        .enum(["png", "svg"])
-        .optional()
-        .describe("Output format (default: png)"),
+      format: z.enum(["png", "svg"]).optional().describe("Output format (default: png)"),
       width: z.number().optional().describe("Image width in pixels (default: 1200)"),
       height: z.number().optional().describe("Image height in pixels (default: 900)"),
       crop: z.boolean().optional().describe("Auto-crop to the bounding box of placed components with a small margin (default: false). Makes the image readable when components occupy only a small portion of the sheet. Requires Pillow (pip install Pillow)."),
@@ -1770,7 +1778,12 @@ Parameters:
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } else {
         return {
-          content: [{ type: "text", text: `ERC failed: ${result.message || "Unknown error"}${result.errorDetails ? "\n" + result.errorDetails : ""}` }],
+          content: [
+            {
+              type: "text",
+              text: `ERC failed: ${result.message || "Unknown error"}${result.errorDetails ? "\n" + result.errorDetails : ""}`,
+            },
+          ],
         };
       }
     },
@@ -1941,8 +1954,13 @@ Parameters:
     },
     async (args: {
       schematicPath: string;
-      x1: number; y1: number; x2: number; y2: number;
-      format?: string; width?: number; height?: number;
+      x1: number;
+      y1: number;
+      x2: number;
+      y2: number;
+      format?: string;
+      width?: number;
+      height?: number;
     }) => {
       const result = await callKicadScript("get_schematic_view_region", args);
       if (result.success && result.imageData) {
@@ -1950,11 +1968,13 @@ Parameters:
           return { content: [{ type: "text", text: result.imageData }] };
         }
         return {
-          content: [{
-            type: "image",
-            data: result.imageData,
-            mimeType: "image/png",
-          }],
+          content: [
+            {
+              type: "image",
+              data: result.imageData,
+              mimeType: "image/png",
+            },
+          ],
         };
       }
       return {
@@ -2015,13 +2035,19 @@ This replaces multiple separate tool calls (list_schematic_wires + list_schemati
     },
   );
 
+
   // Find overlapping elements
   server.tool(
     "find_overlapping_elements",
     "Detect spatially overlapping symbols, wires, and labels in the schematic. Finds duplicate power symbols at the same position, collinear overlapping wires, and labels stacked on top of each other.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
-      tolerance: z.number().optional().describe("Distance threshold in mm for label proximity and wire collinearity checks. Symbol overlap uses bounding-box intersection. (default: 0.5)"),
+      tolerance: z
+        .number()
+        .optional()
+        .describe(
+          "Distance threshold in mm for label proximity and wire collinearity checks. Symbol overlap uses bounding-box intersection. (default: 0.5)",
+        ),
     },
     async (args: { schematicPath: string; tolerance?: number }) => {
       const result = await callKicadScript("find_overlapping_elements", args);
@@ -2033,7 +2059,9 @@ This replaces multiple separate tool calls (list_schematic_wires + list_schemati
         if (syms.length) {
           lines.push(`\nOverlapping symbols (${syms.length}):`);
           syms.slice(0, 20).forEach((o: any) => {
-            lines.push(`  ${o.element1.reference} ↔ ${o.element2.reference} (${o.distance}mm) [${o.type}]`);
+            lines.push(
+              `  ${o.element1.reference} ↔ ${o.element2.reference} (${o.distance}mm) [${o.type}]`,
+            );
           });
         }
         if (lbls.length) {
@@ -2045,7 +2073,9 @@ This replaces multiple separate tool calls (list_schematic_wires + list_schemati
         if (wires.length) {
           lines.push(`\nOverlapping wires (${wires.length}):`);
           wires.slice(0, 20).forEach((o: any) => {
-            lines.push(`  wire @ (${o.wire1.start.x},${o.wire1.start.y})→(${o.wire1.end.x},${o.wire1.end.y}) overlaps with another`);
+            lines.push(
+              `  wire @ (${o.wire1.start.x},${o.wire1.start.y})→(${o.wire1.end.x},${o.wire1.end.y}) overlaps with another`,
+            );
           });
         }
         return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -2097,20 +2127,21 @@ Use this instead of manually combining list_symbol_pins (symbol-local coords) + 
       x2: z.number().describe("Right X coordinate of the region in mm"),
       y2: z.number().describe("Bottom Y coordinate of the region in mm"),
     },
-    async (args: {
-      schematicPath: string;
-      x1: number; y1: number; x2: number; y2: number;
-    }) => {
+    async (args: { schematicPath: string; x1: number; y1: number; x2: number; y2: number }) => {
       const result = await callKicadScript("get_elements_in_region", args);
       if (result.success) {
         const c = result.counts;
-        const lines = [`Region (${args.x1},${args.y1})→(${args.x2},${args.y2}): ${c.symbols} symbols, ${c.wires} wires, ${c.labels} labels`];
+        const lines = [
+          `Region (${args.x1},${args.y1})→(${args.x2},${args.y2}): ${c.symbols} symbols, ${c.wires} wires, ${c.labels} labels`,
+        ];
         const syms: any[] = result.symbols || [];
         if (syms.length) {
           lines.push("\nSymbols:");
           syms.forEach((s: any) => {
             const pinCount = s.pins ? Object.keys(s.pins).length : 0;
-            lines.push(`  ${s.reference} (${s.libId}) @ (${s.position.x}, ${s.position.y}) [${pinCount} pins]`);
+            lines.push(
+              `  ${s.reference} (${s.libId}) @ (${s.position.x}, ${s.position.y}) [${pinCount} pins]`,
+            );
           });
         }
         const wires: any[] = result.wires || [];
@@ -2150,7 +2181,7 @@ Use this instead of manually combining list_symbol_pins (symbol-local coords) + 
         const lines = [`Found ${collisions.length} wire(s) crossing symbols:`];
         collisions.slice(0, 30).forEach((c: any, i: number) => {
           lines.push(
-            `  ${i + 1}. Wire (${c.wire.start.x},${c.wire.start.y})→(${c.wire.end.x},${c.wire.end.y}) crosses ${c.component.reference} (${c.component.libId})`
+            `  ${i + 1}. Wire (${c.wire.start.x},${c.wire.start.y})→(${c.wire.end.x},${c.wire.end.y}) crosses ${c.component.reference} (${c.component.libId})`,
           );
         });
         if (collisions.length > 30) lines.push(`  ... and ${collisions.length - 30} more`);
