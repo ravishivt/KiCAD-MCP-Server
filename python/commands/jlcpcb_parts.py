@@ -12,7 +12,7 @@ import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("kicad_interface")
 
@@ -57,10 +57,10 @@ class JLCPCBPartsManager:
             db_path = str(data_dir / "jlcpcb_parts.db")
 
         self.db_path = db_path
-        self.conn = None
+        self.conn: Optional[sqlite3.Connection] = None
         self._init_database()
 
-    def _init_database(self):
+    def _init_database(self) -> None:
         """Initialize SQLite database with schema"""
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row  # Return rows as dicts
@@ -128,7 +128,9 @@ class JLCPCBPartsManager:
         self.conn.commit()
         logger.info(f"Initialized JLCPCB parts database at {self.db_path}")
 
-    def import_parts(self, parts: List[Dict], progress_callback=None):
+    def import_parts(
+        self, parts: List[Dict], progress_callback: Optional[Callable[..., Any]] = None
+    ) -> None:
         """
         Import parts from JLCPCB Open API response.
 
@@ -666,7 +668,7 @@ class JLCPCBPartsManager:
         alternatives = [p for p in alternatives if p["lcsc"] != lcsc_number]
 
         # Sort by: Basic first, then by price, then by stock
-        def sort_key(p):
+        def sort_key(p: Dict[str, Any]) -> Tuple[int, float, int]:
             is_basic = 1 if p.get("library_type") == "Basic" else 0
             try:
                 prices = json.loads(p.get("price_json", "[]"))
@@ -681,7 +683,7 @@ class JLCPCBPartsManager:
 
         return alternatives[:limit]
 
-    def close(self):
+    def close(self) -> None:
         """Close database connection"""
         if self.conn:
             self.conn.close()
