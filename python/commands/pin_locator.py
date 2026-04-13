@@ -417,20 +417,13 @@ class PinLocator:
                 logger.error(f"Symbol {symbol_reference} not found in schematic")
                 return None
 
-            # Try skip's pin.location first
-            try:
-                pin = self._find_skip_pin(symbol, pin_number)
-                if pin:
-                    loc = pin.location
-                    logger.info(f"Pin {symbol_reference}/{pin_number} located at ({loc.x}, {loc.y}) via skip")
-                    return [loc.x, loc.y]
-            except Exception as skip_err:
-                logger.debug(f"skip pin lookup failed for {symbol_reference}/{pin_number}: {skip_err}")
-
-            # Fallback: compute from lib_symbols + component transform
+            # Always use lib_symbols fallback: skip's pin.location does not apply the
+            # Y-flip between KiCad library (Y-up) and schematic (Y-down) coordinate
+            # systems, causing K/A positions to be swapped for components with
+            # non-zero rotation angles. The lib_symbols path correctly handles this.
             logger.info(
-                f"skip pin lookup empty for {symbol_reference}/{pin_number}, "
-                "trying lib_symbols fallback"
+                f"Computing pin location for {symbol_reference}/{pin_number} "
+                "via lib_symbols fallback"
             )
             all_pins = self._get_all_pins_from_lib_symbols(schematic_path, symbol, symbol_reference)
             if not all_pins:
@@ -487,24 +480,9 @@ class PinLocator:
                 logger.error(f"Symbol {symbol_reference} not found")
                 return {}
 
-            # Try skip's pin.location first
-            result = {}
-            try:
-                for pin in symbol.pin:
-                    loc = pin.location
-                    result[str(pin.number)] = [loc.x, loc.y]
-            except Exception as skip_err:
-                logger.debug(f"skip pin iteration failed for {symbol_reference}: {skip_err}")
-
-            if result:
-                logger.info(f"Located {len(result)} pins on {symbol_reference} via skip")
-                return result
-
-            # Fallback: compute from lib_symbols + component transform
-            logger.info(
-                f"skip returned no pins for {symbol_reference}, "
-                "using lib_symbols fallback"
-            )
+            # Always use lib_symbols fallback: skip's pin.location does not apply the
+            # Y-flip between KiCad library (Y-up) and schematic (Y-down) coordinate
+            # systems, causing pin positions to be swapped for rotated components.
             fallback = self._get_all_pins_from_lib_symbols(schematic_path, symbol, symbol_reference)
             return fallback
         except Exception as e:
