@@ -329,4 +329,3 @@ export function getRegistryStats() {
 
 // Initialize on module load
 initializeRegistry();
-/*UPSTREAM_DUPLICATE_START
