@@ -318,8 +318,10 @@ Complete schematic workflow with dynamic symbol loading (~10,000 symbols) and in
 
 - `add_schematic_component` - Place symbols from any KiCad library
 - `delete_schematic_component` - Remove component
-- `edit_schematic_component` - Edit properties and fields
-- `get_schematic_component` - Get component info with field positions
+- `edit_schematic_component` - Edit footprint, value, reference, label positions, and **arbitrary custom properties** (MPN, Manufacturer, DigiKey_PN, LCSC, Voltage, Tolerance, Dielectric, …) in one batched call
+- `set_schematic_component_property` - Add or update a single custom property (BOM/sourcing field) on a component
+- `remove_schematic_component_property` - Delete a single custom property from a component
+- `get_schematic_component` - Inspect every field on a component (built-in + custom) including label positions
 - `list_schematic_components` - List all components
 - `move_schematic_component` - Reposition component
 - `rotate_schematic_component` - Rotate component
@@ -430,9 +432,9 @@ See [Freerouting Guide](docs/FREEROUTING_GUIDE.md) for setup and usage.
 - Download from [nodejs.org](https://nodejs.org/)
 - Verify: `node --version` and `npm --version`
 
-**Python 3.10 or Higher**
+**Python 3.9 or Higher**
 
-- Usually included with KiCAD
+- Comes bundled with KiCAD (macOS builds ship Python 3.9; Linux/Windows builds ship Python 3.11)
 - Required packages (auto-installed):
   - kicad-python (kipy) >= 0.5.0 (IPC API support, optional but recommended)
   - kicad-skip >= 0.1.0 (schematic support)
@@ -505,7 +507,9 @@ See [Windows Installation Guide](docs/WINDOWS_SETUP.md) for detailed instruction
 
 ### macOS
 
-**Important:** On macOS, use KiCAD's bundled Python to ensure proper access to pcbnew module.
+**Important:** On macOS, use KiCAD's bundled Python to ensure proper access to the `pcbnew` module.
+
+#### Manual Setup
 
 ```bash
 # Install KiCAD 9.0 from kicad.org/download/macos
@@ -529,7 +533,135 @@ pip install -r requirements.txt
 npm run build
 ```
 
-**Note:** The `--system-site-packages` flag is required to access KiCAD's pcbnew module from the virtual environment.
+**Note:** The `--system-site-packages` flag is required to access KiCAD's `pcbnew` module from the virtual environment.
+
+#### Automated Setup
+
+To simplify configuration with Claude Desktop, this repository provides a macOS setup script:
+
+```bash
+./setup-macos.sh
+```
+
+In case of error `zsh: permission denied: ./setup-macos.sh` you can either:
+
+- always allow the script to be executed by running: `chmod +x setup-macos.sh`.
+- alternatively explicitly run it with bash: `bash setup-macos.sh` so no chmod change needed.
+
+This script does **not replace the manual setup above** — it assumes dependencies are already installed and the project is built. Instead, it automates:
+
+- detection of your environment (Node.js, KiCad Python, `pcbnew`)
+- resolving the correct macOS `PYTHONPATH`
+- generating the correct Claude Desktop MCP configuration
+- safely merging the configuration into your existing Claude config
+- optionally writing the configuration with backup support
+
+##### Basic Usage
+
+###### Verify setup (no changes)
+
+```bash
+./setup-macos.sh --verify
+```
+
+###### Preview configuration (dry run)
+
+```bash
+./setup-macos.sh --dry-run
+```
+
+###### Apply configuration
+
+```bash
+./setup-macos.sh --apply
+```
+
+After applying, restart Claude Desktop.
+
+##### Parameters
+
+###### Required parameters
+
+None. The script works out-of-the-box using sensible defaults.
+
+###### Optional parameters
+
+##### `--name NAME`
+
+Specify the MCP server name in Claude Desktop.
+
+Default:
+
+```text
+kicad
+```
+
+Example:
+
+```bash
+./setup-macos.sh --apply --name kicad-dev
+```
+
+Use this when:
+
+- running multiple MCP configurations
+- testing forks or development versions
+- avoiding overwriting an existing setup
+
+##### `--claude-config PATH`
+
+Specify a custom Claude Desktop configuration file.
+
+Default:
+
+```text
+~/Library/Application Support/Claude/claude_desktop_config.json
+```
+
+Example:
+
+```bash
+./setup-macos.sh --dry-run --claude-config ~/tmp/claude_config.json
+```
+
+Use this when:
+
+- testing configurations safely
+- using non-standard config locations
+- debugging without modifying your main setup
+
+##### `--yes`
+
+Skip confirmation prompt when applying changes.
+
+Example:
+
+```bash
+./setup-macos.sh --apply --yes
+```
+
+##### After Setup
+
+1. Fully quit Claude Desktop
+2. Reopen Claude Desktop
+3. Open a new chat
+4. Click **+ → Connectors**
+5. Verify the server appears (e.g. `kicad` or your custom name)
+
+Test with prompt in Claude Desktop:
+
+```text
+Use the kicad MCP server to run check_kicad_ui.
+```
+
+##### Notes
+
+- The script only modifies the `mcpServers` section and leaves all other configuration untouched
+- Existing configurations are automatically backed up before changes
+- macOS support relies on KiCad’s bundled Python; system Python will not work correctly
+- If KiCad is updated or moved, re-run the script to refresh paths
+
+---
 
 ## Configuration
 
@@ -537,7 +669,8 @@ npm run build
 
 Edit configuration file:
 
-- **Linux/macOS:** `~/.config/Claude/claude_desktop_config.json`
+- **Linux:** `~/.config/Claude/claude_desktop_config.json`
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
 **Configuration:**
@@ -561,7 +694,7 @@ Edit configuration file:
 
 - **Linux:** `/usr/lib/kicad/lib/python3/dist-packages`
 - **Windows:** `C:\Program Files\KiCad\9.0\lib\python3\dist-packages`
-- **macOS:** `/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/3.11/lib/python3.11/site-packages`
+- **macOS:** `/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/3.9/lib/python3.9/site-packages`
 
 #### Linux Python Detection
 

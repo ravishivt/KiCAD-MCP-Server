@@ -8,31 +8,12 @@ and component selection.
 import json
 import logging
 import os
-import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("kicad_interface")
-
-
-def _build_fts_query(query: str) -> str:
-    """
-    Convert a free-text user query into a safe FTS5 MATCH expression.
-
-    - Splits on whitespace and punctuation that FTS5 treats as operators
-      (-, +, *, (, ), [, ], ^, ", ', /, :, =, <, >, !, comma, semicolon).
-    - Drops single-character tokens (too broad to be useful).
-    - Wraps each remaining token in double-quotes and appends * for prefix
-      matching, so "ferrite bead" → `"ferrite"* "bead"*`.
-
-    Returns an empty string if no usable tokens remain (caller should fall
-    back to a LIKE query).
-    """
-    tokens = re.split(r'[\s\-+*()\[\]{}^"\'/:=<>!,;|\\]+', query.strip())
-    safe = [f'"{t}"*' for t in tokens if len(t) >= 2]
-    return ' '.join(safe)
 
 
 class JLCPCBPartsManager:
@@ -79,21 +60,12 @@ class JLCPCBPartsManager:
                 manufacturer TEXT,
                 library_type TEXT,
                 description TEXT,
-                derived_description TEXT,
                 datasheet TEXT,
                 stock INTEGER,
                 price_json TEXT,
                 last_updated INTEGER
             )
         """)
-
-        # Migrate: add derived_description if it doesn't exist yet
-        try:
-            cursor.execute("ALTER TABLE components ADD COLUMN derived_description TEXT DEFAULT ''")
-            self.conn.commit()
-            logger.info("Migrated: added derived_description column")
-        except Exception:
-            pass  # Column already exists
 
         # Create indexes for fast searching
         cursor.execute(
@@ -104,26 +76,16 @@ class JLCPCBPartsManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_library_type ON components(library_type)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_mfr_part ON components(mfr_part)")
 
-        # Full-text search index — includes derived_description for attribute-based search
-        # If FTS table exists but is missing derived_description, drop and recreate it
-        # (it will be empty until rebuild_fts_index() is called)
-        fts_row = cursor.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='components_fts'"
-        ).fetchone()
-        if fts_row and 'derived_description' not in (fts_row[0] or ''):
-            cursor.execute("DROP TABLE IF EXISTS components_fts")
-            logger.info("Dropped outdated FTS table (missing derived_description); run rebuild_fts_index() to repopulate")
-
-        cursor.execute('''
+        # Full-text search index for descriptions
+        cursor.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS components_fts USING fts5(
                 lcsc,
                 description,
-                derived_description,
                 mfr_part,
                 manufacturer,
                 content=components
             )
-        ''')
+        """)
 
         self.conn.commit()
         logger.info(f"Initialized JLCPCB parts database at {self.db_path}")
@@ -132,45 +94,48 @@ class JLCPCBPartsManager:
         self, parts: List[Dict], progress_callback: Optional[Callable[..., Any]] = None
     ) -> None:
         """
-        Import parts from JLCPCB Open API response.
-
-        The official JLCPCB Open API returns only three fields per component:
-          - componentCode  (LCSC number, e.g. "C25804")
-          - componentModel (manufacturer part number)
-          - componentSpecification (package / footprint)
+        Import parts into database from JLCPCB API response
 
         Args:
-            parts: List of part dicts from JLCPCB Open API
+            parts: List of part dicts from JLCPCB API
             progress_callback: Optional callback(current, total, message)
         """
         cursor = self.conn.cursor()
         imported = 0
         skipped = 0
-        now = int(datetime.now().timestamp())
 
         for i, part in enumerate(parts):
             try:
-                cursor.execute('''
+                # Extract price breaks
+                price_json = json.dumps(part.get("prices", []))
+
+                # Determine library type
+                library_type = self._determine_library_type(part)
+
+                cursor.execute(
+                    """
                     INSERT OR REPLACE INTO components (
                         lcsc, category, subcategory, mfr_part, package,
                         solder_joints, manufacturer, library_type, description,
                         datasheet, stock, price_json, last_updated
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    part.get('componentCode'),          # lcsc
-                    '',                                  # category (not in open API)
-                    '',                                  # subcategory
-                    part.get('componentModel', ''),      # mfr_part
-                    part.get('componentSpecification', ''),  # package
-                    0,                                   # solder_joints
-                    '',                                  # manufacturer
-                    'Extended',                          # library_type (unknown, default Extended)
-                    part.get('componentModel', ''),      # description (use model as description)
-                    '',                                  # datasheet
-                    0,                                   # stock (not in open API)
-                    '[]',                                # price_json
-                    now
-                ))
+                """,
+                    (
+                        part.get("componentCode"),  # lcsc
+                        part.get("firstSortName"),  # category
+                        part.get("secondSortName"),  # subcategory
+                        part.get("componentModelEn"),  # mfr_part
+                        part.get("componentSpecificationEn"),  # package
+                        part.get("soldPoint"),  # solder_joints
+                        part.get("componentBrandEn"),  # manufacturer
+                        library_type,  # library_type
+                        part.get("describe"),  # description
+                        part.get("dataManualUrl"),  # datasheet
+                        part.get("stockCount", 0),  # stock
+                        price_json,  # price_json
+                        int(datetime.now().timestamp()),  # last_updated
+                    ),
+                )
 
                 imported += 1
 
@@ -181,8 +146,11 @@ class JLCPCBPartsManager:
                 logger.error(f"Error importing part {part.get('componentCode')}: {e}")
                 skipped += 1
 
-        # Rebuild FTS index
-        cursor.execute("INSERT INTO components_fts(components_fts) VALUES('rebuild')")
+        # Update FTS index
+        cursor.execute("""
+            INSERT INTO components_fts(components_fts, rowid, lcsc, description, mfr_part, manufacturer)
+            SELECT 'rebuild', rowid, lcsc, description, mfr_part, manufacturer FROM components
+        """)
 
         self.conn.commit()
         logger.info(f"Import complete: {imported} parts imported, {skipped} skipped")
@@ -201,115 +169,9 @@ class JLCPCBPartsManager:
         else:
             return "Extended"  # Default to Extended
 
-    # -------------------------------------------------------------------------
-    # /demo/component/info import
-    # -------------------------------------------------------------------------
-
-    @staticmethod
-    def _parse_component_info_price(price_str: str) -> str:
-        """
-        Convert /demo/component/info price string to JSON price_breaks format.
-
-        Input:  "1-9:0.804724,10-29:0.585826,30-99:0.544881,100-:0.505511"
-        Output: [{"qty": 1, "price": 0.804724}, {"qty": 10, "price": 0.585826}, ...]
-        """
-        if not price_str:
-            return "[]"
-        breaks = []
-        try:
-            for tier in price_str.split(","):
-                tier = tier.strip()
-                if not tier:
-                    continue
-                range_part, price_part = tier.split(":")
-                start_str = range_part.split("-")[0]
-                breaks.append({"qty": int(start_str), "price": float(price_part)})
-        except Exception:
-            return "[]"
-        return json.dumps(breaks)
-
-    @staticmethod
-    def _parse_component_info_library_type(library_type: str) -> str:
-        """Map /demo/component/info libraryType values to canonical form."""
-        mapping = {"base": "Basic", "expand": "Extended", "preferred": "Preferred"}
-        return mapping.get((library_type or "").lower(), "Extended")
-
-    def import_component_info_parts(self, parts: List[Dict], progress_callback=None) -> int:
-        """
-        Import parts from /demo/component/info API response.
-
-        Expected fields per item: lcscPart, firstCategory, secondCategory, mfrPart,
-        packageInfo, solderJoint, manufacturer, libraryType, description, datasheet,
-        price (range string "start-end:price,..."), stock.
-
-        Does NOT rebuild the FTS index — call rebuild_fts_index() after all pages
-        have been imported.
-
-        Args:
-            parts: List of component dicts from /demo/component/info
-            progress_callback: Optional callback(current, total, message)
-
-        Returns:
-            Number of rows successfully imported
-        """
-        cursor = self.conn.cursor()
-        imported = 0
-        skipped = 0
-        now = int(datetime.now().timestamp())
-
-        for i, part in enumerate(parts):
-            try:
-                lcsc = part.get("lcscPart", "")
-                if not lcsc:
-                    skipped += 1
-                    continue
-
-                price_json = self._parse_component_info_price(part.get("price", ""))
-                library_type = self._parse_component_info_library_type(part.get("libraryType", ""))
-
-                cursor.execute('''
-                    INSERT OR REPLACE INTO components (
-                        lcsc, category, subcategory, mfr_part, package,
-                        solder_joints, manufacturer, library_type, description,
-                        derived_description, datasheet, stock, price_json, last_updated
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    lcsc,
-                    part.get("firstCategory", ""),
-                    part.get("secondCategory", ""),
-                    part.get("mfrPart", ""),
-                    part.get("packageInfo") or "",
-                    int(part.get("solderJoint") or 0),
-                    part.get("manufacturer", ""),
-                    library_type,
-                    part.get("description", ""),
-                    "",  # derived_description: not available from /demo/component/info
-                    part.get("datasheet", ""),
-                    int(part.get("stock") or 0),
-                    price_json,
-                    now,
-                ))
-                imported += 1
-
-                if progress_callback and (i + 1) % 1000 == 0:
-                    progress_callback(i + 1, len(parts), f"Imported {imported:,} parts...")
-
-            except Exception as e:
-                logger.error(f"Error importing part {part.get('lcscPart')}: {e}")
-                skipped += 1
-
-        self.conn.commit()
-        logger.debug(f"Batch import: {imported} imported, {skipped} skipped")
-        return imported
-
-    def rebuild_fts_index(self):
-        """Rebuild the full-text search index. Call after bulk imports."""
-        cursor = self.conn.cursor()
-        cursor.execute("INSERT INTO components_fts(components_fts) VALUES('rebuild')")
-        self.conn.commit()
-        logger.info("FTS index rebuilt")
-
-    def import_jlcsearch_parts(self, parts: List[Dict], progress_callback=None):
+    def import_jlcsearch_parts(
+        self, parts: List[Dict], progress_callback: Optional[Callable[..., Any]] = None
+    ) -> None:
         """
         Import parts into database from JLCSearch API response
 
@@ -401,7 +263,6 @@ class JLCPCBPartsManager:
         self,
         query: Optional[str] = None,
         category: Optional[str] = None,
-        subcategory: Optional[str] = None,
         package: Optional[str] = None,
         library_type: Optional[str] = None,
         manufacturer: Optional[str] = None,
@@ -413,8 +274,7 @@ class JLCPCBPartsManager:
 
         Args:
             query: Free-text search (searches description, mfr part, LCSC)
-            category: Filter by top-level category (e.g. "Resistors")
-            subcategory: Filter by sub-category (e.g. "Chip Resistor - Surface Mount")
+            category: Filter by category name
             package: Filter by package type
             library_type: Filter by "Basic", "Extended", or "Preferred"
             manufacturer: Filter by manufacturer name
@@ -431,52 +291,23 @@ class JLCPCBPartsManager:
         params = []
 
         if query:
-            # Split into significant tokens (>= 3 chars) for LIKE-based fallback.
-            tokens = [
-                t for t in re.split(r'[\s\-+*()\[\]{}^"\'/:=<>!,;|\\]+', query.strip())
-                if len(t) >= 3
-            ]
-
-            # Build sub-conditions combined with OR so that a part matches if it
-            # satisfies ANY of: FTS on description/mfr_part/manufacturer, OR a
-            # category/subcategory LIKE for any query token.
-            #
-            # Why OR instead of AND:
-            # - 90%+ of parts have empty descriptions; category/subcategory are the
-            #   only searchable text for most parts.
-            # - AND is too strict for multi-word queries ("ferrite bead 600 ohm 0805"
-            #   requires all 5 terms in a single field, finding far fewer results).
-            sub_conditions = []
-            sub_params = []
-
-            fts_query = _build_fts_query(query)
-            if fts_query:
-                sub_conditions.append(
-                    "lcsc IN (SELECT lcsc FROM components_fts WHERE components_fts MATCH ?)"
+            # Use FTS for text search
+            # Add prefix wildcard to each term for partial matching
+            # (e.g., "BQ25895" becomes "BQ25895*" so FTS matches "BQ25895RTWR")
+            fts_query = " ".join(
+                f"{term}*" if not term.endswith("*") else term for term in query.strip().split()
+            )
+            sql_parts.append("""
+                AND lcsc IN (
+                    SELECT lcsc FROM components_fts
+                    WHERE components_fts MATCH ?
                 )
-                sub_params.append(fts_query)
-
-            # Category/subcategory LIKE per token — catches "USB Connectors",
-            # "Ferrite Beads", "DC-DC Converters", etc. for parts with no description.
-            for token in tokens[:5]:
-                sub_conditions.append("(category LIKE ? OR subcategory LIKE ?)")
-                sub_params.extend([f"%{token}%", f"%{token}%"])
-
-            if sub_conditions:
-                sql_parts.append(f"AND ({' OR '.join(sub_conditions)})")
-                params.extend(sub_params)
-            elif not fts_query:
-                # All tokens were too short — fall back to LIKE on both description fields
-                sql_parts.append("AND (description LIKE ? OR derived_description LIKE ?)")
-                params.extend([f"%{query}%", f"%{query}%"])
+            """)
+            params.append(fts_query)
 
         if category:
             sql_parts.append("AND category LIKE ?")
             params.append(f"%{category}%")
-
-        if subcategory:
-            sql_parts.append("AND subcategory LIKE ?")
-            params.append(f"%{subcategory}%")
 
         if package:
             sql_parts.append("AND package LIKE ?")
@@ -527,52 +358,9 @@ class JLCPCBPartsManager:
                 try:
                     part["price_breaks"] = json.loads(part["price_json"])
                 except:
-                    part['price_breaks'] = []
-            part['price_approximate'] = True
+                    part["price_breaks"] = []
             return part
         return None
-
-    def get_categories(self, category: Optional[str] = None) -> Dict:
-        """
-        Return category/subcategory data from the local DB.
-
-        If category is None: returns top-level categories with part counts only.
-        If category is provided: returns subcategories for that category.
-        Rows with empty category are omitted.
-        """
-        cursor = self.conn.cursor()
-
-        if category:
-            cursor.execute("""
-                SELECT subcategory, COUNT(*) as cnt
-                FROM components
-                WHERE category = ? AND subcategory != '' AND subcategory IS NOT NULL
-                GROUP BY subcategory
-                ORDER BY cnt DESC
-            """, (category,))
-            rows = cursor.fetchall()
-            return {
-                'category': category,
-                'subcategories': [
-                    {'subcategory': row['subcategory'], 'count': row['cnt']}
-                    for row in rows
-                ]
-            }
-        else:
-            cursor.execute("""
-                SELECT category, COUNT(*) as cnt
-                FROM components
-                WHERE category != '' AND category IS NOT NULL
-                GROUP BY category
-                ORDER BY category
-            """)
-            rows = cursor.fetchall()
-            return {
-                'categories': [
-                    {'category': row['category'], 'count': row['cnt']}
-                    for row in rows
-                ]
-            }
 
     def get_database_stats(self) -> Dict:
         """Get statistics about the database"""

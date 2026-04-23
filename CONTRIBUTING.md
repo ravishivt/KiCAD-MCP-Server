@@ -21,7 +21,7 @@ Thank you for your interest in contributing to the KiCAD MCP Server! This guide 
 
 - **KiCAD 9.0 or higher** - [Download here](https://www.kicad.org/download/)
 - **Node.js v18+** - [Download here](https://nodejs.org/)
-- **Python 3.10+** - Should come with KiCAD, or install separately
+- **Python 3.9+** - Comes bundled with KiCAD (macOS builds ship Python 3.9; Linux/Windows builds ship Python 3.11)
 - **Git** - For version control
 
 ### Platform-Specific Setup
@@ -39,7 +39,7 @@ curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt-get install -y nodejs
 
 # Clone the repository
-git clone https://github.com/yourusername/kicad-mcp-server.git
+git clone https://github.com/mixelpixx/KiCAD-MCP-Server.git
 cd kicad-mcp-server
 
 # Install Node.js dependencies
@@ -64,7 +64,7 @@ pytest
 # Install Node.js from https://nodejs.org/
 
 # Clone the repository
-git clone https://github.com/yourusername/kicad-mcp-server.git
+git clone https://github.com/mixelpixx/KiCAD-MCP-Server.git
 cd kicad-mcp-server
 
 # Install Node.js dependencies
@@ -90,7 +90,7 @@ pytest
 brew install node
 
 # Clone the repository
-git clone https://github.com/yourusername/kicad-mcp-server.git
+git clone https://github.com/mixelpixx/KiCAD-MCP-Server.git
 cd kicad-mcp-server
 
 # Install Node.js dependencies
@@ -106,6 +106,25 @@ npm run build
 npm test
 pytest
 ```
+
+### Pre-commit Hooks
+
+This project uses [pre-commit](https://pre-commit.com/) to run linters and formatters automatically before each commit. Pre-commit hooks prevent noisy formatting diffs caused by different IDE configurations across contributors, catch common mistakes and type errors before they reach code review, and ensure every commit in the repository meets the same quality baseline — so reviewers can focus on logic and design rather than style issues.
+
+**All contributors must install pre-commit hooks after cloning the repo:**
+
+```bash
+# Install pre-commit (if not already installed)
+pip install pre-commit
+
+# Install the git hooks
+pre-commit install
+
+# (Optional) Run against all files to verify setup
+pre-commit run --all-files
+```
+
+> **Important:** Do not use `git commit --no-verify` to bypass pre-commit hooks. The hooks enforce code quality checks (Black, isort, Prettier, flake8, mypy, ESLint) that must pass before code is merged. If a hook fails, fix the underlying issue rather than skipping the check.
 
 ---
 

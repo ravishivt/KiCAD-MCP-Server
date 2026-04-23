@@ -13,28 +13,15 @@ import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from resources.resource_definitions import RESOURCE_DEFINITIONS, handle_resource_read
 
-# Load .env file from project root (if present) before anything else reads env vars
-def _load_dotenv():
-    env_path = Path(__file__).parent.parent / '.env'
-    if env_path.exists():
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, _, value = line.partition('=')
-                    key = key.strip()
-                    value = value.strip()
-                    if key and key not in os.environ:
-                        os.environ[key] = value
-
-_load_dotenv()
-
-# Import tool schemas and resource definitions
+# Import tool schemas, resource definitions, and IPC API annotations
 from schemas.tool_schemas import TOOL_SCHEMAS
+from annotations import AnnotationLoader
+
+_annotation_loader = AnnotationLoader()
 
 # Configure logging
 log_dir = os.path.join(os.path.expanduser("~"), ".kicad-mcp", "logs")
@@ -259,7 +246,6 @@ class KiCADInterface:
     """Main interface class to handle KiCAD operations"""
 
     def __init__(self) -> None:
-        
         """Initialize the interface and command handlers"""
         self.board = None
         self.project_filename = None
@@ -298,6 +284,9 @@ class KiCADInterface:
 
         # Initialize JLCPCB API integration
         self.jlcpcb_client = JLCPCBClient()  # Official API (requires auth)
+        from commands.jlcsearch import JLCSearchClient
+
+        self.jlcsearch_client = JLCSearchClient()  # Public API (no auth required)
         self.jlcpcb_parts = JLCPCBPartsManager()
 
         # Schematic-related classes don't need board reference
@@ -372,11 +361,11 @@ class KiCADInterface:
             "search_symbols": self.symbol_library_commands.search_symbols,
             "list_library_symbols": self.symbol_library_commands.list_library_symbols,
             "get_symbol_info": self.symbol_library_commands.get_symbol_info,
-            # JLCPCB commands
+            # JLCPCB API commands (complete parts catalog via API)
+            "download_jlcpcb_database": self._handle_download_jlcpcb_database,
             "search_jlcpcb_parts": self._handle_search_jlcpcb_parts,
             "get_jlcpcb_part": self._handle_get_jlcpcb_part,
             "get_jlcpcb_database_stats": self._handle_get_jlcpcb_database_stats,
-            "get_jlcpcb_categories": self._handle_get_jlcpcb_categories,
             "suggest_jlcpcb_alternatives": self._handle_suggest_jlcpcb_alternatives,
             # Datasheet commands
             "enrich_datasheets": self._handle_enrich_datasheets,
@@ -385,57 +374,36 @@ class KiCADInterface:
             "create_schematic": self._handle_create_schematic,
             "load_schematic": self._handle_load_schematic,
             "add_schematic_component": self._handle_add_schematic_component,
-            "batch_add_components": self._handle_batch_add_components,
             "delete_schematic_component": self._handle_delete_schematic_component,
-            "replace_schematic_component": self._handle_replace_schematic_component,
             "edit_schematic_component": self._handle_edit_schematic_component,
-            "batch_edit_schematic_components": self._handle_batch_edit_schematic_components,
+            "set_schematic_component_property": self._handle_set_schematic_component_property,
+            "remove_schematic_component_property": self._handle_remove_schematic_component_property,
             "get_schematic_component": self._handle_get_schematic_component,
             "add_schematic_wire": self._handle_add_schematic_wire,
             "add_schematic_net_label": self._handle_add_schematic_net_label,
             "add_schematic_junction": self._handle_add_schematic_junction,
-            "set_schematic_property_position": self._handle_set_schematic_property_position,
-            "batch_set_schematic_property_positions": self._handle_batch_set_schematic_property_positions,
-            "add_no_connect": self._handle_add_no_connect,
-            "batch_add_no_connects": self._handle_batch_add_no_connects,
-            "save_schematic": self._handle_save_schematic,
             "connect_to_net": self._handle_connect_to_net,
-            "batch_connect": self._handle_batch_connect,
-            "batch_add_and_connect": self._handle_batch_add_and_connect,
             "connect_passthrough": self._handle_connect_passthrough,
             "get_schematic_pin_locations": self._handle_get_schematic_pin_locations,
             "get_net_connections": self._handle_get_net_connections,
-            "validate_schematic": self._handle_validate_schematic,
             "get_wire_connections": self._handle_get_wire_connections,
+            "get_net_at_point": self._handle_get_net_at_point,
             "run_erc": self._handle_run_erc,
-            "place_net_label_at_pin": self._handle_place_net_label_at_pin,
-            "list_unconnected_pins": self._handle_list_unconnected_pins,
-            "search_schematic_symbols": self._handle_search_schematic_symbols,
-            "list_symbol_pins": self._handle_list_symbol_pins,
-            "batch_list_symbol_pins": self._handle_batch_list_symbol_pins,
+            "export_netlist": self._handle_export_netlist,
             "generate_netlist": self._handle_generate_netlist,
             "sync_schematic_to_board": self._handle_sync_schematic_to_board,
             "list_schematic_libraries": self._handle_list_schematic_libraries,
             "get_schematic_view": self._handle_get_schematic_view,
             "list_schematic_components": self._handle_list_schematic_components,
-            "check_schematic_layout": self._handle_check_schematic_layout,
-            "autoplace_schematic_fields": self._handle_autoplace_schematic_fields,
             "list_schematic_nets": self._handle_list_schematic_nets,
-            "find_single_pin_nets": self._handle_find_single_pin_nets,
-            "classify_nets": self._handle_classify_nets,
-            "get_net_graph": self._handle_get_net_graph,
-            "get_schematic_summary": self._handle_get_schematic_summary,
             "list_schematic_wires": self._handle_list_schematic_wires,
             "list_schematic_labels": self._handle_list_schematic_labels,
-            "get_net_topology": self._handle_get_net_topology,
-            "get_component_pin_positions": self._handle_get_component_pin_positions,
             "move_schematic_component": self._handle_move_schematic_component,
             "rotate_schematic_component": self._handle_rotate_schematic_component,
             "annotate_schematic": self._handle_annotate_schematic,
-            "add_hierarchical_sheet": self._handle_add_hierarchical_sheet,
-            "create_hierarchical_subsheet": self._handle_create_hierarchical_subsheet,
             "delete_schematic_wire": self._handle_delete_schematic_wire,
             "delete_schematic_net_label": self._handle_delete_schematic_net_label,
+            "move_schematic_net_label": self._handle_move_schematic_net_label,
             "export_schematic_pdf": self._handle_export_schematic_pdf,
             "export_schematic_svg": self._handle_export_schematic_svg,
             # Schematic analysis tools (read-only)
@@ -443,6 +411,13 @@ class KiCADInterface:
             "find_overlapping_elements": self._handle_find_overlapping_elements,
             "get_elements_in_region": self._handle_get_elements_in_region,
             "find_wires_crossing_symbols": self._handle_find_wires_crossing_symbols,
+            "find_orphaned_wires": self._handle_find_orphaned_wires,
+            "list_floating_labels": self._handle_list_floating_labels,
+            "snap_to_grid": self._handle_snap_to_grid,
+            "add_schematic_hierarchical_label": self._handle_add_schematic_hierarchical_label,
+            "add_schematic_text": self._handle_add_schematic_text,
+            "list_schematic_texts": self._handle_list_schematic_texts,
+            "add_sheet_pin": self._handle_add_sheet_pin,
             "import_svg_logo": self._handle_import_svg_logo,
             # UI/Process management commands
             "check_kicad_ui": self._handle_check_kicad_ui,
@@ -504,117 +479,6 @@ class KiCADInterface:
         # Save command
         "save_project": "_ipc_save_project",
     }
-
-    # KiCad-internal property names that are not user-visible component properties
-    _KICAD_INTERNAL_PROPS = frozenset(
-        {"ki_keywords", "ki_description", "ki_fp_filters", "ki_locked", "ki_model"}
-    )
-
-    @staticmethod
-    def _find_matching_paren(s: str, start: int) -> int:
-        
-        """Return index of the closing ')' that matches the '(' at position start."""
-        depth = 0
-        i = start
-        while i < len(s):
-            if s[i] == "(":
-                depth += 1
-            elif s[i] == ")":
-                depth -= 1
-                if depth == 0:
-                    return i
-            i += 1
-        return -1
-
-    @staticmethod
-    def _extract_component_properties(block_text: str, exclude_internal: bool = True) -> dict:
-        """
-        Extract all (property "Name" "Value" ...) entries from a placed symbol block.
-        Returns {"Name": "Value", ...}.  When exclude_internal=True, ki_* fields are skipped.
-        """
-        import re
-        prop_pattern = re.compile(r'\(property\s+"([^"]*)"\s+"([^"]*)"')
-        props = {}
-        for m in prop_pattern.finditer(block_text):
-            name, value = m.group(1), m.group(2)
-            if exclude_internal and name in KiCADInterface._KICAD_INTERNAL_PROPS:
-                continue
-            props[name] = value
-        return props
-
-    @staticmethod
-    def _extract_property_position(block_text: str, property_name: str):
-        """Extract the (at x y angle) from a named property inside a symbol block.
-        Returns {"x": float, "y": float, "angle": float} or None if not found."""
-        import re
-        pat = re.compile(
-            r'\(property\s+"' + re.escape(property_name) + r'"\s+"[^"]*"\s+\(at\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\)'
-        )
-        m = pat.search(block_text)
-        if m:
-            return {"x": float(m.group(1)), "y": float(m.group(2)), "angle": float(m.group(3))}
-        return None
-
-    @staticmethod
-    def _extract_property_visible(block_text: str, property_name: str) -> bool:
-        
-        """Return True if the named property is visible (no hide flag), False if hidden."""
-        import re
-        prop_pat = re.compile(r'\(property\s+"' + re.escape(property_name) + r'"')
-        m = prop_pat.search(block_text)
-        if not m:
-            return True
-        # Walk parens to extract the full property sub-expression
-        start = m.start()
-        depth = 0
-        i = start
-        while i < len(block_text):
-            if block_text[i] == '(':
-                depth += 1
-            elif block_text[i] == ')':
-                depth -= 1
-                if depth == 0:
-                    prop_sub = block_text[start:i + 1]
-                    return '(hide yes)' not in prop_sub and '(hide)' not in prop_sub
-            i += 1
-        return True
-
-    @staticmethod
-    def _find_placed_symbol_block(content: str, reference: str):
-        """
-        Find the placed symbol block for *reference* in schematic file content.
-        Returns (block_text, block_start, block_end) or (None, -1, -1) if not found.
-        Skips the lib_symbols section.
-        """
-        import re
-        lib_sym_pos = content.find("(lib_symbols")
-        lib_sym_end = (
-            KiCADInterface._find_matching_paren(content, lib_sym_pos)
-            if lib_sym_pos >= 0
-            else -1
-        )
-        pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
-        search_start = 0
-        while True:
-            m = pattern.search(content, search_start)
-            if not m:
-                break
-            pos = m.start()
-            if lib_sym_pos >= 0 and lib_sym_pos <= pos <= lib_sym_end:
-                search_start = lib_sym_end + 1
-                continue
-            end = KiCADInterface._find_matching_paren(content, pos)
-            if end < 0:
-                search_start = pos + 1
-                continue
-            block_text = content[pos: end + 1]
-            if re.search(
-                r'\(property\s+"Reference"\s+"' + re.escape(reference) + r'"',
-                block_text,
-            ):
-                return block_text, pos, end
-            search_start = end + 1
-        return None, -1, -1
 
     def handle_command(self, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Route command to appropriate handler, preferring IPC when available"""
@@ -727,7 +591,6 @@ class KiCADInterface:
             logger.warning(f"Auto-save failed: {e}")
 
     def _update_command_handlers(self) -> None:
-        
         """Update board reference in all command handlers"""
         logger.debug("Updating board reference in command handlers")
         self.project_commands.board = self.board
@@ -740,7 +603,6 @@ class KiCADInterface:
 
     # Schematic command handlers
     def _handle_create_schematic(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Create a new schematic"""
         logger.info("Creating schematic")
         try:
@@ -750,35 +612,16 @@ class KiCADInterface:
             # - Legacy uses: projectName, path, metadata
             project_name = params.get("projectName") or params.get("name") or params.get("title")
 
-            # Compute the full output file_path before calling create_schematic.
-            # BUG-2 fix (a): if `path` ends with .kicad_sch, treat it as the full
-            #   output path (don't append name again).
-            # BUG-2 fix (b): when no path given and a project board is loaded,
-            #   default to the project directory instead of CWD.
+            # Handle filename parameter - it may contain full path
             filename = params.get("filename")
             if filename:
+                # If filename provided, extract name and path from it
                 if filename.endswith(".kicad_sch"):
-                    file_path = os.path.abspath(filename)
-                    project_name = project_name or os.path.splitext(os.path.basename(file_path))[0]
-                else:
-                    path = os.path.dirname(filename) or "."
-                    project_name = project_name or os.path.basename(filename)
-                    file_path = os.path.abspath(os.path.join(path, f"{project_name}.kicad_sch"))
+                    filename = filename[:-10]  # Remove .kicad_sch extension
+                path = os.path.dirname(filename) or "."
+                project_name = project_name or os.path.basename(filename)
             else:
-                path_param = params.get("path", "")
-                if path_param and path_param.endswith(".kicad_sch"):
-                    # path is actually a full file path — use it directly
-                    file_path = os.path.abspath(path_param)
-                    project_name = project_name or os.path.splitext(os.path.basename(file_path))[0]
-                elif path_param:
-                    file_path = os.path.abspath(os.path.join(path_param, f"{project_name}.kicad_sch"))
-                elif self.board:
-                    # Default to project directory when a project is open
-                    board_dir = os.path.dirname(self.board.GetFileName())
-                    file_path = os.path.abspath(os.path.join(board_dir, f"{project_name}.kicad_sch"))
-                else:
-                    file_path = os.path.abspath(f"{project_name}.kicad_sch")
-
+                path = params.get("path", ".")
             metadata = params.get("metadata", {})
 
             if not project_name:
@@ -787,56 +630,23 @@ class KiCADInterface:
                     "message": "Schematic name is required. Provide 'name', 'projectName', or 'filename' parameter.",
                 }
 
-            # Warn if the schematic is in a subdirectory relative to the nearest .kicad_pro.
-            # ${KIPRJMOD} is resolved relative to the project root, so sub-sheet paths
-            # outside the root directory cause "Symbol not found" errors.
-            _subdir_warning = None
-            try:
-                from commands.dynamic_symbol_loader import _find_project_root as _fpr
-                _fp = Path(file_path)
-                _proj_root = _fpr(_fp.parent)
-                if _fp.parent.resolve() != _proj_root.resolve() and _proj_root != _fp.parent:
-                    _rel = _fp.relative_to(_proj_root) if _fp.is_relative_to(_proj_root) else _fp.name
-                    _subdir_warning = (
-                        f"Sub-sheet created at {_rel} — library paths using ${{KIPRJMOD}} "
-                        f"may not resolve correctly from this location. Place the sub-sheet "
-                        f"in the same directory as the .kicad_pro file to avoid lookup errors."
-                    )
-            except Exception:
-                pass
-
-            # Pass the full file_path so create_schematic writes to the right location
-            schematic = SchematicManager.create_schematic(file_path, metadata)
+            sch_path = path if path and path != "." else None
+            schematic = SchematicManager.create_schematic(
+                project_name, path=sch_path, metadata=metadata
+            )
+            base_name = (
+                project_name if project_name.endswith(".kicad_sch") else f"{project_name}.kicad_sch"
+            )
+            normalized_path = path or "."
+            file_path = os.path.join(normalized_path, base_name)
             success = SchematicManager.save_schematic(schematic, file_path)
 
-            from commands.schematic import _last_removed_templates
-            # Read back the schematic UUID from the saved file so callers can use it
-            schematic_uuid = None
-            try:
-                import re as _re
-                with open(file_path, "r", encoding="utf-8") as _f:
-                    _content = _f.read()
-                _m = _re.search(r'\(uuid\s+([0-9a-fA-F-]+)\)', _content)
-                if _m:
-                    schematic_uuid = _m.group(1)
-            except Exception:
-                pass
-
-            result = {"success": success, "file_path": file_path}
-            if schematic_uuid:
-                result["schematic_uuid"] = schematic_uuid
-            if _last_removed_templates:
-                result["removed_template_components"] = list(_last_removed_templates)
-                result["note"] = f"Removed {len(_last_removed_templates)} template placeholder components"
-            if _subdir_warning:
-                result["warning"] = _subdir_warning
-            return result
+            return {"success": success, "file_path": file_path}
         except Exception as e:
             logger.error(f"Error creating schematic: {str(e)}")
             return {"success": False, "message": str(e)}
 
     def _handle_load_schematic(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Load an existing schematic"""
         logger.info("Loading schematic")
         try:
@@ -893,12 +703,12 @@ class KiCADInterface:
         return self.component_commands.place_component(params)
 
     def _handle_add_schematic_component(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Add a component to a schematic using text-based injection (no sexpdata)"""
         logger.info("Adding component to schematic")
         try:
             from pathlib import Path
-            from commands.dynamic_symbol_loader import DynamicSymbolLoader, _find_project_root
+
+            from commands.dynamic_symbol_loader import DynamicSymbolLoader
 
             schematic_path = params.get("schematicPath")
             component = params.get("component", {})
@@ -908,8 +718,6 @@ class KiCADInterface:
             if not component:
                 return {"success": False, "message": "Component definition is required"}
 
-            from commands.dynamic_symbol_loader import _snap
-
             comp_type = component.get("type", "R")
             library = component.get("library", "Device")
             reference = component.get("reference", "X?")
@@ -917,18 +725,11 @@ class KiCADInterface:
             footprint = component.get("footprint", "")
             x = component.get("x", 0)
             y = component.get("y", 0)
-            rotation = component.get("rotation", 0)
-            include_pins = component.get("includePins", False)
+            unit = component.get("unit", 1)
 
-            # Snap to KiCAD 50mil grid so pins land on-grid (same snap applied inside loader)
-            snapped_x = _snap(x)
-            snapped_y = _snap(y)
-
-            # Derive project path: walk up from the schematic's directory to find the
-            # nearest .kicad_pro so ${KIPRJMOD} resolves correctly for sub-sheets in
-            # subdirectories (e.g. project/sheets/foo.kicad_sch → project/).
+            # Derive project path from schematic path for project-local library resolution
             schematic_file = Path(schematic_path)
-            derived_project_path = _find_project_root(schematic_file.parent)
+            derived_project_path = schematic_file.parent
 
             loader = DynamicSymbolLoader(project_path=derived_project_path)
             loader.add_component(
@@ -940,126 +741,15 @@ class KiCADInterface:
                 footprint=footprint,
                 x=x,
                 y=y,
-                rotation=rotation,
+                unit=unit,
                 project_path=derived_project_path,
             )
 
-            # Resolve footprint: use the caller-supplied value, or extract from library
-            resolved_footprint = footprint
-            if not resolved_footprint:
-                try:
-                    sym_block = loader.extract_symbol_from_library(library, comp_type)
-                    if sym_block:
-                        import re as _re
-                        fp_match = _re.search(r'\(property\s+"Footprint"\s+"([^"]*)"', sym_block)
-                        if fp_match:
-                            resolved_footprint = fp_match.group(1)
-                except Exception:
-                    pass
-
-            # If this schematic is a sub-sheet of another, fix hierarchical instance
-            # paths so parent-context ERC shows correct references even when
-            # annotate_schematic is never called (clients often supply explicit refs).
-            sch_name = schematic_file.name
-            for candidate in schematic_file.parent.glob("*.kicad_sch"):
-                if candidate.resolve() == schematic_file.resolve():
-                    continue
-                try:
-                    candidate_content = candidate.read_text(encoding="utf-8")
-                    if sch_name in candidate_content:
-                        self._fix_subsheet_instances(str(candidate), candidate_content)
-                except Exception:
-                    pass
-
-            response = {
+            return {
                 "success": True,
                 "component_reference": reference,
                 "symbol_source": f"{library}:{comp_type}",
-                "snapped_position": {"x": snapped_x, "y": snapped_y},
-                "footprint": resolved_footprint or "",
             }
-
-            if include_pins:
-                # Return pin locations so caller doesn't need a separate round-trip
-                from commands.pin_locator import PinLocator
-                locator = PinLocator()
-                pins_raw = locator.get_all_symbol_pins(schematic_file, reference) or {}
-                # Enrich with pin names from lib definition
-                lib_id = f"{library}:{comp_type}"
-                pins_def = locator.get_symbol_pins(schematic_file, lib_id) or {}
-                pins = {}
-                for pin_num, coords in pins_raw.items():
-                    pins[pin_num] = {
-                        "x": coords[0],
-                        "y": coords[1],
-                        "name": pins_def.get(str(pin_num), {}).get("name", str(pin_num)),
-                    }
-                response["pins"] = pins
-
-            # Check if any pin lands mid-wire (not at an endpoint of an existing wire)
-            try:
-                import math as _math
-                from commands.pin_locator import PinLocator as _PinLocator
-
-                _locator = _PinLocator()
-                _all_pins = _locator.get_all_symbol_pins(schematic_file, reference) or {}
-
-                if _all_pins:
-                    _sch2 = SchematicManager.load_schematic(schematic_path)
-                    _wires = []
-                    if _sch2 and hasattr(_sch2, "wire"):
-                        for _w in _sch2.wire:
-                            if hasattr(_w, "pts") and hasattr(_w.pts, "xy"):
-                                _pts = []
-                                for _pt in _w.pts.xy:
-                                    if hasattr(_pt, "value"):
-                                        _pts.append((float(_pt.value[0]), float(_pt.value[1])))
-                                if len(_pts) >= 2:
-                                    _wires.append((_pts[0], _pts[-1]))
-
-                    _TOL_ON = 0.05   # mm: on-wire tolerance
-                    _TOL_EP = 0.1    # mm: endpoint tolerance
-
-                    def _pt_near(p, q, tol):
-                        return _math.hypot(p[0] - q[0], p[1] - q[1]) < tol
-
-                    def _pt_on_seg(p, a, b, tol):
-                        """Return True if p lies on segment a-b within tol (parametric check)."""
-                        dx, dy = b[0] - a[0], b[1] - a[1]
-                        seg_len = _math.hypot(dx, dy)
-                        if seg_len < 1e-9:
-                            return _math.hypot(p[0] - a[0], p[1] - a[1]) < tol
-                        t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (seg_len * seg_len)
-                        if t < 0 or t > 1:
-                            return False
-                        closest = (a[0] + t * dx, a[1] + t * dy)
-                        return _math.hypot(p[0] - closest[0], p[1] - closest[1]) < tol
-
-                    _lib_id = f"{library}:{comp_type}"
-                    _pins_def = _locator.get_symbol_pins(schematic_file, _lib_id) or {}
-                    _warnings = []
-                    for _pnum, _pcoords in _all_pins.items():
-                        _px, _py = float(_pcoords[0]), float(_pcoords[1])
-                        for (_a, _b) in _wires:
-                            if _pt_near((_px, _py), _a, _TOL_EP) or _pt_near((_px, _py), _b, _TOL_EP):
-                                # Pin is at a wire endpoint — fine
-                                break
-                            if _pt_on_seg((_px, _py), _a, _b, _TOL_ON):
-                                _pname = _pins_def.get(str(_pnum), {}).get("name", str(_pnum))
-                                _warnings.append(
-                                    f"\u26a0 Pin {_pnum} ({_pname}) at ({_px:.2f}, {_py:.2f}) lands "
-                                    f"mid-wire on segment ({_a[0]:.2f},{_a[1]:.2f})\u2192({_b[0]:.2f},{_b[1]:.2f}). "
-                                    "KiCAD will not connect this pin without a wire endpoint here. "
-                                    f"Suggested fix: split the wire at ({_px:.2f}, {_py:.2f}) or move component to a wire endpoint."
-                                )
-                                break
-
-                    if _warnings:
-                        response["warnings"] = _warnings
-            except Exception as _mw_err:
-                logger.warning(f"Mid-wire pin check failed (non-fatal): {_mw_err}")
-
-            return response
         except Exception as e:
             logger.error(f"Error adding component to schematic: {str(e)}")
             import traceback
@@ -1067,246 +757,7 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
-    def _handle_batch_add_components(self, params):
-        """Add multiple components to a schematic in a single call."""
-        logger.info("Batch adding components to schematic")
-        try:
-            import re as _re
-            from pathlib import Path
-            from commands.dynamic_symbol_loader import DynamicSymbolLoader, _snap
-            from commands.pin_locator import PinLocator
-
-            schematic_path = params.get("schematicPath")
-            components = params.get("components", [])
-            origin_x = params.get("origin_x", 0) or 0
-            origin_y = params.get("origin_y", 0) or 0
-            auto_position_fields = params.get("auto_position_fields", True)
-
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-            if not components:
-                return {"success": False, "message": "components list is required and must be non-empty"}
-
-            schematic_file = Path(schematic_path)
-            project_path = schematic_file.parent
-            loader = DynamicSymbolLoader(project_path=project_path)
-            locator = PinLocator()
-
-            results = []
-            errors = []
-
-            for comp in components:
-                symbol = comp.get("symbol", "")
-                if ":" not in symbol:
-                    errors.append({"symbol": symbol, "reference": comp.get("reference", "?"), "error": "symbol must be 'Library:SymbolName'"})
-                    continue
-
-                library, sym_name = symbol.split(":", 1)
-                reference = comp.get("reference", "X?")
-                value = comp.get("value", sym_name)
-                footprint = comp.get("footprint", "")
-                pos = comp.get("position", {})
-                x = (pos.get("x", 0) if isinstance(pos, dict) else 0) + origin_x
-                y = (pos.get("y", 0) if isinstance(pos, dict) else 0) + origin_y
-                rotation = comp.get("rotation", 0)
-                include_pins = comp.get("includePins", False)
-
-                try:
-                    loader.add_component(
-                        schematic_file,
-                        library,
-                        sym_name,
-                        reference=reference,
-                        value=value,
-                        footprint=footprint,
-                        x=x,
-                        y=y,
-                        rotation=rotation,
-                        project_path=project_path,
-                    )
-
-                    entry = {
-                        "reference": reference,
-                        "symbol": symbol,
-                        "snapped_position": {"x": _snap(x), "y": _snap(y)},
-                    }
-
-                    # Validate footprint — warn per-component without blocking placement.
-                    if footprint:
-                        fp_resolved = self.footprint_library.find_footprint(footprint)
-                        if fp_resolved is None:
-                            entry["footprint_warning"] = (
-                                f"Footprint '{footprint}' was not found in any registered footprint library "
-                                "(validation only — the footprint string WAS written to the schematic's "
-                                "Footprint property field). If the string is correct it will still work in KiCad. "
-                                "Use search_footprints to find a valid footprint string."
-                            )
-
-                    # Invalidate cache immediately so fresh pin lookups see the just-placed symbol
-                    locator._schematic_cache.pop(str(schematic_file), None)
-
-                    # Fetch all pins once — reused for field positioning, includePins, and body_bbox
-                    _all_pins = locator.get_all_symbol_pins(schematic_file, reference) or {}
-
-                    # Auto-position ref/value fields using actual pin axis direction.
-                    # Rules (always angle=0 for readable horizontal text):
-                    #   2-pin: axis is vertical (dy>dx) → labels left/right of body
-                    #          axis is horizontal (dx>dy) → labels above/below body
-                    #   multi-pin: labels above the topmost pin and below the bottommost pin
-                    block_text = None
-                    if auto_position_fields:
-                        cx, cy = _snap(x), _snap(y)
-                        _OFF = 2.54
-                        _num_pins = len(_all_pins)
-                        if _num_pins == 2:
-                            _coords = list(_all_pins.values())
-                            _p1x = float(_coords[0][0]) if isinstance(_coords[0], (list, tuple)) else float(_coords[0]["x"])
-                            _p1y = float(_coords[0][1]) if isinstance(_coords[0], (list, tuple)) else float(_coords[0]["y"])
-                            _p2x = float(_coords[1][0]) if isinstance(_coords[1], (list, tuple)) else float(_coords[1]["x"])
-                            _p2y = float(_coords[1][1]) if isinstance(_coords[1], (list, tuple)) else float(_coords[1]["y"])
-                            if abs(_p1y - _p2y) > abs(_p1x - _p2x):
-                                # Vertical pin axis (pins top/bottom) → labels left/right
-                                _field_positions = [
-                                    ("Reference", round(cx - _OFF, 4), cy, 0),
-                                    ("Value",     round(cx + _OFF, 4), cy, 0),
-                                ]
-                            else:
-                                # Horizontal pin axis (pins left/right) → labels above/below
-                                _field_positions = [
-                                    ("Reference", cx, round(cy - _OFF, 4), 0),
-                                    ("Value",     cx, round(cy + _OFF, 4), 0),
-                                ]
-                        elif _all_pins:
-                            # Multi-pin: above the topmost pin tip, below the bottommost pin tip
-                            _pin_ys = [float(c[1]) if isinstance(c, (list, tuple)) else float(c["y"]) for c in _all_pins.values()]
-                            _field_positions = [
-                                ("Reference", cx, round(min(_pin_ys) - _OFF, 4), 0),
-                                ("Value",     cx, round(max(_pin_ys) + _OFF, 4), 0),
-                            ]
-                        else:
-                            # No pins found — fallback to above/below center
-                            _field_positions = [
-                                ("Reference", cx, round(cy - _OFF, 4), 0),
-                                ("Value",     cx, round(cy + _OFF, 4), 0),
-                            ]
-                        try:
-                            raw_content = schematic_file.read_text(encoding="utf-8")
-                            block_text, block_start, block_end = KiCADInterface._find_placed_symbol_block(raw_content, reference)
-                            if block_text:
-                                new_block = block_text
-                                for _prop, _px, _py, _pa in _field_positions:
-                                    _pat = _re.compile(
-                                        r'(\(property\s+"' + _re.escape(_prop) + r'"\s+"[^"]*"\s+)'
-                                        r'\(at\s+[-\d.]+\s+[-\d.]+\s+[-\d.]+\)'
-                                    )
-                                    new_block, _ = _pat.subn(
-                                        r'\g<1>' + f"(at {_px} {_py} {_pa})", new_block
-                                    )
-                                if new_block != block_text:
-                                    raw_content = raw_content[:block_start] + new_block + raw_content[block_end + 1:]
-                                    schematic_file.write_text(raw_content, encoding="utf-8")
-                                    block_text = new_block
-                        except Exception:
-                            pass
-                    else:
-                        # Read block_text for property position extraction only
-                        try:
-                            raw_content = schematic_file.read_text(encoding="utf-8")
-                            block_text, _, _ = KiCADInterface._find_placed_symbol_block(raw_content, reference)
-                        except Exception:
-                            pass
-
-                    if block_text:
-                        ref_pos = KiCADInterface._extract_property_position(block_text, "Reference")
-                        val_pos = KiCADInterface._extract_property_position(block_text, "Value")
-                        if ref_pos:
-                            entry["ref_position"] = ref_pos
-                        if val_pos:
-                            entry["value_position"] = val_pos
-
-                    if include_pins:
-                        pins_def = locator.get_symbol_pins(schematic_file, symbol) or {}
-                        pins = {}
-                        for pin_num, coords in _all_pins.items():
-                            pins[pin_num] = {
-                                "x": coords[0],
-                                "y": coords[1],
-                                "name": pins_def.get(str(pin_num), {}).get("name", str(pin_num)),
-                            }
-                        entry["pins"] = pins
-                        if not pins:
-                            entry["pins_error"] = (
-                                f"Pin extraction returned no data for {reference} ({symbol}). "
-                                "Use get_schematic_pin_locations as a follow-up if pin coordinates are needed."
-                            )
-
-                    # Compute body_bbox from pin spread (best-effort), fall back to center ± 2.54mm
-                    try:
-                        if _all_pins:
-                            xs = [c[0] if isinstance(c, (list, tuple)) else c["x"] for c in _all_pins.values()]
-                            ys = [c[1] if isinstance(c, (list, tuple)) else c["y"] for c in _all_pins.values()]
-                            pad = 1.27
-                            entry["body_bbox"] = {
-                                "x_min": min(xs) - pad, "y_min": min(ys) - pad,
-                                "x_max": max(xs) + pad, "y_max": max(ys) + pad,
-                            }
-                        else:
-                            cx, cy = _snap(x), _snap(y)
-                            entry["body_bbox"] = {"x_min": cx - 2.54, "y_min": cy - 2.54, "x_max": cx + 2.54, "y_max": cy + 2.54}
-                    except Exception:
-                        cx, cy = _snap(x), _snap(y)
-                        entry["body_bbox"] = {"x_min": cx - 2.54, "y_min": cy - 2.54, "x_max": cx + 2.54, "y_max": cy + 2.54}
-
-                    results.append(entry)
-
-                except Exception as e:
-                    logger.error(f"Error adding {reference} ({symbol}): {e}")
-                    errors.append({"symbol": symbol, "reference": reference, "error": str(e)})
-
-            # If this schematic is a sub-sheet of another, fix hierarchical instance
-            # paths now so parent-context ERC shows correct references even when
-            # annotate_schematic is never called (clients often supply explicit refs).
-            sch_name = schematic_file.name
-            for candidate in project_path.glob("*.kicad_sch"):
-                if candidate.resolve() == schematic_file.resolve():
-                    continue
-                try:
-                    candidate_content = candidate.read_text(encoding="utf-8")
-                    if sch_name in candidate_content:
-                        self._fix_subsheet_instances(str(candidate), candidate_content)
-                except Exception:
-                    pass
-
-            # Compute overall placement bounding box from all placed components
-            placement_bbox = None
-            if results:
-                all_x_min = [r["body_bbox"]["x_min"] for r in results if "body_bbox" in r]
-                all_y_min = [r["body_bbox"]["y_min"] for r in results if "body_bbox" in r]
-                all_x_max = [r["body_bbox"]["x_max"] for r in results if "body_bbox" in r]
-                all_y_max = [r["body_bbox"]["y_max"] for r in results if "body_bbox" in r]
-                if all_x_min:
-                    placement_bbox = {
-                        "x_min": min(all_x_min), "y_min": min(all_y_min),
-                        "x_max": max(all_x_max), "y_max": max(all_y_max),
-                    }
-
-            return {
-                "success": len(errors) == 0,
-                "added": results,
-                "errors": errors,
-                "added_count": len(results),
-                "error_count": len(errors),
-                "placement_bbox": placement_bbox,
-            }
-
-        except Exception as e:
-            logger.error(f"Error in batch_add_components: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
     def _handle_delete_schematic_component(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Remove a placed symbol from a schematic using text-based manipulation (no skip writes)"""
         logger.info("Deleting schematic component")
         try:
@@ -1412,145 +863,215 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
-    def _handle_replace_schematic_component(self, params):
-        """Replace a placed symbol with a different symbol, preserving position and field values."""
-        logger.info("Replacing schematic component")
-        try:
-            import re
-            from pathlib import Path
-            from commands.dynamic_symbol_loader import DynamicSymbolLoader, _find_project_root, _snap
+    # Built-in property names that have dedicated parameters and cannot be removed
+    # via the generic removeProperties path. They are also written by KiCad on every
+    # save, so deleting them produces an invalid schematic.
+    _PROTECTED_PROPERTY_FIELDS = frozenset({"Reference", "Value", "Footprint", "Datasheet"})
 
-            schematic_path = params.get("schematicPath")
-            reference = params.get("reference")
-            new_symbol = params.get("newSymbol")  # e.g. "Device:D_Zener"
-            new_rotation = params.get("newRotation")
+    @staticmethod
+    def _escape_sexpr_string(value: str) -> str:
+        """Escape a string for safe insertion into an S-expression double-quoted token."""
+        return value.replace("\\", "\\\\").replace('"', '\\"')
 
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-            if not reference:
-                return {"success": False, "message": "reference is required"}
-            if not new_symbol:
-                return {"success": False, "message": "newSymbol is required (e.g. 'Device:D_Zener')"}
+    @staticmethod
+    def _find_matching_paren(s: str, start: int) -> int:
+        """Return the index of the closing paren matching the opening paren at `start`.
 
-            if ":" not in new_symbol:
-                return {"success": False, "message": "newSymbol must be in 'Library:Symbol' format"}
-            new_library, new_type = new_symbol.split(":", 1)
+        Returns -1 if no match is found. Does not understand string literals — that's
+        fine for KiCAD .kicad_sch files because property values cannot contain a
+        bare `(` or `)` character (they would be backslash-escaped).
+        """
+        depth = 0
+        i = start
+        while i < len(s):
+            if s[i] == "(":
+                depth += 1
+            elif s[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
 
-            sch_file = Path(schematic_path)
-            if not sch_file.exists():
-                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+    def _set_property_in_block(
+        self,
+        block: str,
+        name: str,
+        spec: Dict[str, Any],
+        default_position: Tuple[float, float],
+    ) -> Tuple[str, str]:
+        """Add or update a property within a placed-symbol block.
 
-            # Step 1: Get current component info (position, rotation, fields)
-            comp_info = self._handle_get_schematic_component(
-                {"schematicPath": schematic_path, "reference": reference}
+        Args:
+            block: The full text of the (symbol ...) block.
+            name: Property name (e.g. "MPN", "Manufacturer").
+            spec: Dict that may contain keys: value, x, y, angle, hide, fontSize.
+            default_position: (x, y) of the parent symbol — used as the default
+                location for newly-created properties so the field is anchored
+                near the component, not at (0, 0).
+
+        Returns:
+            Tuple of (new_block_text, action_taken) where action is "added" or "updated".
+        """
+        import re
+
+        new_value = spec.get("value")
+        new_x = spec.get("x")
+        new_y = spec.get("y")
+        new_angle = spec.get("angle")
+        new_hide = spec.get("hide")
+        font_size = spec.get("fontSize", 1.27)
+
+        existing_match = re.search(
+            r'\(property\s+"' + re.escape(name) + r'"\s+"',
+            block,
+        )
+
+        if existing_match:
+            # Property exists — patch value / position / hide in place
+            if new_value is not None:
+                escaped = self._escape_sexpr_string(str(new_value))
+                block = re.sub(
+                    r'(\(property\s+"' + re.escape(name) + r'"\s+)"[^"]*"',
+                    rf'\1"{escaped}"',
+                    block,
+                    count=1,
+                )
+
+            if new_x is not None or new_y is not None or new_angle is not None:
+                pos_match = re.search(
+                    r'(\(property\s+"'
+                    + re.escape(name)
+                    + r'"\s+"[^"]*"\s+\(at\s+)([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)(\s*\))',
+                    block,
+                )
+                if pos_match:
+                    cx = new_x if new_x is not None else float(pos_match.group(2))
+                    cy = new_y if new_y is not None else float(pos_match.group(3))
+                    ca = new_angle if new_angle is not None else float(pos_match.group(4))
+                    block = (
+                        block[: pos_match.start()]
+                        + pos_match.group(1)
+                        + f"{cx} {cy} {ca}"
+                        + pos_match.group(5)
+                        + block[pos_match.end() :]
+                    )
+
+            if new_hide is not None:
+                block = self._set_hide_on_property(block, name, bool(new_hide))
+
+            return block, "updated"
+
+        # Property does not exist — append a new one after the last existing property
+        if new_value is None:
+            # Adding a brand-new property requires at least a value
+            raise ValueError(
+                f"Property '{name}' does not exist on this component yet — supply a value to create it"
             )
-            if not comp_info.get("success"):
-                return {"success": False, "message": f"Cannot find component '{reference}': {comp_info.get('message', '')}"}
 
-            old_pos = comp_info.get("position", {})
-            old_x = old_pos.get("x", 0)
-            old_y = old_pos.get("y", 0)
-            old_rotation = old_pos.get("angle", 0)
-            old_fields = comp_info.get("fields", {})
+        cx = new_x if new_x is not None else default_position[0]
+        cy = new_y if new_y is not None else default_position[1]
+        ca = new_angle if new_angle is not None else 0
+        # New properties default to hidden (BOM/sourcing data normally has no
+        # visible footprint on the schematic canvas).
+        hide_str = "(hide yes)" if (new_hide is None or new_hide) else "(hide no)"
+        escaped = self._escape_sexpr_string(str(new_value))
+        escaped_name = self._escape_sexpr_string(str(name))
 
-            use_rotation = new_rotation if new_rotation is not None else old_rotation
+        new_prop = (
+            f'    (property "{escaped_name}" "{escaped}" (at {cx} {cy} {ca})\n'
+            f"      (effects (font (size {font_size} {font_size})) {hide_str})\n"
+            f"    )"
+        )
 
-            # Step 2: Remove old symbol block from the schematic
-            with open(sch_file, "r", encoding="utf-8") as f:
-                content = f.read()
+        # Find the last existing property block and insert immediately after it.
+        last_prop_end = -1
+        for m in re.finditer(r'\(property\s+"', block):
+            end = self._find_matching_paren(block, m.start())
+            if end > last_prop_end:
+                last_prop_end = end
 
-            block_text, block_start, block_end = KiCADInterface._find_placed_symbol_block(content, reference)
-            if block_text is None:
-                return {"success": False, "message": f"Component '{reference}' not found in schematic file"}
+        if last_prop_end < 0:
+            # No properties at all — insert just before the closing paren of the symbol
+            block_close = block.rfind(")")
+            if block_close < 0:
+                raise ValueError("Malformed symbol block: no closing paren")
+            block = block[:block_close] + "\n" + new_prop + "\n  " + block[block_close:]
+        else:
+            block = block[: last_prop_end + 1] + "\n" + new_prop + block[last_prop_end + 1 :]
 
-            # Trim leading whitespace/newline before block
-            trim_start = block_start
-            while trim_start > 0 and content[trim_start - 1] in (" ", "\t"):
-                trim_start -= 1
-            if trim_start > 0 and content[trim_start - 1] == "\n":
-                trim_start -= 1
-            content = content[:trim_start] + content[block_end + 1:]
+        return block, "added"
 
-            with open(sch_file, "w", encoding="utf-8") as f:
-                f.write(content)
+    def _set_hide_on_property(self, block: str, name: str, hide: bool) -> str:
+        """Set the (hide yes|no) flag on a named property's effects clause.
 
-            # Step 3: Add the new symbol at the same position
-            derived_project_path = _find_project_root(sch_file.parent)
-            loader = DynamicSymbolLoader(project_path=derived_project_path)
+        Handles three pre-existing forms:
+            (effects (font (size 1.27 1.27)))                   — no hide flag
+            (effects (font (size 1.27 1.27)) hide)              — legacy bare token
+            (effects (font (size 1.27 1.27)) (hide yes|no))     — KiCad 9 form
+        """
+        import re
 
-            old_value = old_fields.get("Value", {}).get("value", new_type) if isinstance(old_fields.get("Value"), dict) else old_fields.get("Value", new_type)
-            old_footprint = old_fields.get("Footprint", {}).get("value", "") if isinstance(old_fields.get("Footprint"), dict) else old_fields.get("Footprint", "")
+        prop_match = re.search(
+            r'\(property\s+"' + re.escape(name) + r'"',
+            block,
+        )
+        if not prop_match:
+            return block
+        prop_start = prop_match.start()
+        prop_end = self._find_matching_paren(block, prop_start)
+        if prop_end < 0:
+            return block
 
-            loader.add_component(
-                sch_file,
-                new_library,
-                new_type,
-                reference=reference,
-                value=old_value,
-                footprint=old_footprint,
-                x=old_x,
-                y=old_y,
-                rotation=use_rotation,
-                project_path=derived_project_path,
-            )
+        # Locate the (effects ...) clause inside the property
+        prop_segment = block[prop_start : prop_end + 1]
+        eff_match = re.search(r"\(effects\b", prop_segment)
+        if not eff_match:
+            return block
+        eff_start = prop_start + eff_match.start()
+        eff_end = self._find_matching_paren(block, eff_start)
+        if eff_end < 0:
+            return block
 
-            # Step 4: Restore any additional field values from old component
-            # (Reference and Value are already set; restore Footprint and any custom fields)
-            fields_to_restore = {}
-            for fname, fdata in old_fields.items():
-                if fname in ("Reference", "Value", "Footprint"):
-                    continue  # already handled above
-                if isinstance(fdata, dict):
-                    fields_to_restore[fname] = fdata.get("value", "")
-                else:
-                    fields_to_restore[fname] = str(fdata)
+        eff_inner = block[eff_start + 1 : eff_end]  # 'effects (font ...) ...'
+        eff_inner = re.sub(r"\s*\(hide\s+(yes|no)\)", "", eff_inner)
+        eff_inner = re.sub(r"\s+hide\b(?!\s+(yes|no))", "", eff_inner)
+        eff_inner = eff_inner.rstrip() + f' (hide {"yes" if hide else "no"})'
 
-            if fields_to_restore:
-                with open(sch_file, "r", encoding="utf-8") as f:
-                    content_after = f.read()
-                new_block, _, _ = KiCADInterface._find_placed_symbol_block(content_after, reference)
-                if new_block:
-                    for fname, fval in fields_to_restore.items():
-                        # If field already exists, update; otherwise skip (not injecting new fields here)
-                        prop_pat = re.compile(
-                            r'(\(property\s+"' + re.escape(fname) + r'"\s+)"[^"]*"'
-                        )
-                        content_after = prop_pat.sub(r'\1"' + fval.replace('"', '\\"') + '"', content_after, count=1)
-                    with open(sch_file, "w", encoding="utf-8") as f:
-                        f.write(content_after)
+        new_effects = "(" + eff_inner + ")"
+        return block[:eff_start] + new_effects + block[eff_end + 1 :]
 
-            # Step 5: Collect new pin positions
-            from commands.pin_locator import PinLocator
-            pin_locator = PinLocator()
-            pins_raw = pin_locator.get_all_symbol_pins(sch_file, reference) or {}
-            lib_id = f"{new_library}:{new_type}"
-            pins_def = pin_locator.get_symbol_pins(sch_file, lib_id) or {}
-            pins = {}
-            for pin_num, coords in pins_raw.items():
-                pins[pin_num] = {
-                    "x": coords[0],
-                    "y": coords[1],
-                    "name": pins_def.get(str(pin_num), {}).get("name", str(pin_num)),
-                }
+    def _remove_property_from_block(self, block: str, name: str) -> Tuple[str, bool]:
+        """Remove a property from the symbol block. Returns (new_block, removed_bool)."""
+        import re
 
-            return {
-                "success": True,
-                "reference": reference,
-                "newSymbol": new_symbol,
-                "position": {"x": old_x, "y": old_y, "rotation": use_rotation},
-                "pins": pins,
-                "message": f"Replaced {reference} with {new_symbol} at ({old_x}, {old_y})",
-            }
+        m = re.search(r'\(property\s+"' + re.escape(name) + r'"\s+"', block)
+        if not m:
+            return block, False
+        start = m.start()
+        end = self._find_matching_paren(block, start)
+        if end < 0:
+            return block, False
 
-        except Exception as e:
-            logger.error(f"Error replacing schematic component: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
+        # Trim surrounding whitespace (leading newline + indent) so the resulting
+        # file does not develop blank lines after every removal.
+        trim_start = start
+        while trim_start > 0 and block[trim_start - 1] in (" ", "\t"):
+            trim_start -= 1
+        if trim_start > 0 and block[trim_start - 1] == "\n":
+            trim_start -= 1
+        return block[:trim_start] + block[end + 1 :], True
 
     def _handle_edit_schematic_component(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Update properties of a placed symbol in a schematic (footprint, value, reference).
-        Uses text-based in-place editing – preserves position, UUID and all other fields.
+        """Update properties of a placed symbol in a schematic.
+
+        Supports updating the standard fields (footprint / value / reference rename),
+        repositioning field labels, and managing **arbitrary custom properties**
+        (MPN, Manufacturer, Distributor part numbers, Voltage, Dielectric, Tolerance,
+        LCSC, etc.) used by BOM/CPL exporters and JLCPCB / Digi-Key sourcing.
+
+        Uses text-based in-place editing — preserves position, UUID, and all
+        unrelated fields.
         """
         logger.info("Editing schematic component")
         try:
@@ -1562,9 +1083,12 @@ class KiCADInterface:
             new_footprint = params.get("footprint")
             new_value = params.get("value")
             new_reference = params.get("newReference")
-            field_positions = params.get(
-                "fieldPositions"
-            )  # dict: {"Reference": {"x": 1, "y": 2, "angle": 0}}
+            # dict: {"Reference": {"x": 1, "y": 2, "angle": 0}}
+            field_positions = params.get("fieldPositions")
+            # dict: {"MPN": "RC0603FR-0710KL"}  OR  {"MPN": {"value": "...", "hide": true}}
+            properties = params.get("properties")
+            # list[str]: ["OldField"] — protected built-ins are rejected
+            remove_properties = params.get("removeProperties")
 
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
@@ -1576,12 +1100,257 @@ class KiCADInterface:
                     new_value is not None,
                     new_reference is not None,
                     field_positions is not None,
+                    properties is not None,
+                    remove_properties is not None,
                 ]
             ):
                 return {
                     "success": False,
-                    "message": "At least one of footprint, value, newReference, or fieldPositions must be provided",
+                    "message": (
+                        "At least one of footprint, value, newReference, fieldPositions, "
+                        "properties, or removeProperties must be provided"
+                    ),
                 }
+
+            # Reject removal attempts targeting protected built-in fields up-front
+            if remove_properties:
+                blocked = [n for n in remove_properties if n in self._PROTECTED_PROPERTY_FIELDS]
+                if blocked:
+                    return {
+                        "success": False,
+                        "message": (
+                            f"Cannot remove built-in field(s) {blocked}: use the dedicated "
+                            "value/footprint/newReference parameters or set the value to ''"
+                        ),
+                    }
+
+            sch_file = Path(schematic_path)
+            if not sch_file.exists():
+                return {
+                    "success": False,
+                    "message": f"Schematic not found: {schematic_path}",
+                }
+
+            with open(sch_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Skip lib_symbols section
+            lib_sym_pos = content.find("(lib_symbols")
+            lib_sym_end = (
+                self._find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
+            )
+
+            # Find placed symbol blocks that match the reference
+            # Search for (symbol (lib_id "...") ... (property "Reference" "<ref>" ...) ...)
+            block_start = block_end = None
+            search_start = 0
+            pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
+            while True:
+                m = pattern.search(content, search_start)
+                if not m:
+                    break
+                pos = m.start()
+                # Skip if inside lib_symbols section
+                if lib_sym_pos >= 0 and lib_sym_pos <= pos <= lib_sym_end:
+                    search_start = lib_sym_end + 1
+                    continue
+                end = self._find_matching_paren(content, pos)
+                if end < 0:
+                    search_start = pos + 1
+                    continue
+                block_text = content[pos : end + 1]
+                if re.search(
+                    r'\(property\s+"Reference"\s+"' + re.escape(reference) + r'"',
+                    block_text,
+                ):
+                    block_start, block_end = pos, end
+                    break
+                search_start = end + 1
+
+            if block_start is None or block_end is None:
+                return {
+                    "success": False,
+                    "message": f"Component '{reference}' not found in schematic",
+                }
+
+            # Apply property replacements within the found block
+            block_text = content[block_start : block_end + 1]
+
+            # Determine the parent symbol position so that newly-added properties
+            # default to a sensible location (anchored near the component).
+            comp_at = re.search(
+                r'\(symbol\s+\(lib_id\s+"[^"]*"\s*\)\s+\(at\s+([\d\.\-]+)\s+([\d\.\-]+)',
+                block_text,
+            )
+            comp_origin: Tuple[float, float] = (
+                (float(comp_at.group(1)), float(comp_at.group(2))) if comp_at else (0.0, 0.0)
+            )
+
+            if new_footprint is not None:
+                escaped_fp = self._escape_sexpr_string(str(new_footprint))
+                block_text = re.sub(
+                    r'(\(property\s+"Footprint"\s+)"[^"]*"',
+                    rf'\1"{escaped_fp}"',
+                    block_text,
+                )
+            if new_value is not None:
+                escaped_v = self._escape_sexpr_string(str(new_value))
+                block_text = re.sub(
+                    r'(\(property\s+"Value"\s+)"[^"]*"',
+                    rf'\1"{escaped_v}"',
+                    block_text,
+                )
+            if new_reference is not None:
+                escaped_r = self._escape_sexpr_string(str(new_reference))
+                block_text = re.sub(
+                    r'(\(property\s+"Reference"\s+)"[^"]*"',
+                    rf'\1"{escaped_r}"',
+                    block_text,
+                )
+            if field_positions is not None:
+                for field_name, pos in field_positions.items():
+                    x = pos.get("x", 0)
+                    y = pos.get("y", 0)
+                    angle = pos.get("angle", 0)
+                    block_text = re.sub(
+                        r'(\(property\s+"'
+                        + re.escape(field_name)
+                        + r'"\s+"[^"]*"\s+)\(at\s+[\d\.\-]+\s+[\d\.\-]+\s+[\d\.\-]+\s*\)',
+                        rf"\1(at {x} {y} {angle})",
+                        block_text,
+                    )
+
+            properties_added: Dict[str, Any] = {}
+            properties_updated: Dict[str, Any] = {}
+            if properties:
+                if not isinstance(properties, dict):
+                    return {
+                        "success": False,
+                        "message": "properties must be a dict mapping property name -> value or spec",
+                    }
+                for name, spec in properties.items():
+                    if not isinstance(name, str) or not name:
+                        return {
+                            "success": False,
+                            "message": f"Invalid property name: {name!r}",
+                        }
+                    # Normalise scalar values to a spec dict with just {"value": ...}
+                    if not isinstance(spec, dict):
+                        spec = {"value": spec}
+                    try:
+                        block_text, action = self._set_property_in_block(
+                            block_text, name, spec, comp_origin
+                        )
+                    except ValueError as ve:
+                        return {"success": False, "message": str(ve)}
+                    target = properties_added if action == "added" else properties_updated
+                    target[name] = spec.get("value")
+
+            properties_removed: list = []
+            if remove_properties:
+                if not isinstance(remove_properties, list):
+                    return {
+                        "success": False,
+                        "message": "removeProperties must be a list of property names",
+                    }
+                for name in remove_properties:
+                    block_text, removed = self._remove_property_from_block(block_text, name)
+                    if removed:
+                        properties_removed.append(name)
+
+            content = content[:block_start] + block_text + content[block_end + 1 :]
+
+            with open(sch_file, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            changes: Dict[str, Any] = {
+                k: v
+                for k, v in {
+                    "footprint": new_footprint,
+                    "value": new_value,
+                    "reference": new_reference,
+                }.items()
+                if v is not None
+            }
+            if field_positions is not None:
+                changes["fieldPositions"] = field_positions
+            if properties_added:
+                changes["propertiesAdded"] = properties_added
+            if properties_updated:
+                changes["propertiesUpdated"] = properties_updated
+            if properties_removed:
+                changes["propertiesRemoved"] = properties_removed
+
+            logger.info(f"Edited schematic component {reference}: {changes}")
+            return {"success": True, "reference": reference, "updated": changes}
+
+        except Exception as e:
+            logger.error(f"Error editing schematic component: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_set_schematic_component_property(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Add or update a single property on a placed schematic symbol.
+
+        Convenience wrapper around `edit_schematic_component` for the very common
+        case of setting one BOM/sourcing field at a time. The property is created
+        if it does not already exist, otherwise its value (and optionally its
+        position / visibility) is updated in place.
+        """
+        logger.info("Setting schematic component property")
+        name = params.get("name")
+        if not isinstance(name, str) or not name:
+            return {"success": False, "message": "name is required"}
+        if "value" not in params:
+            return {"success": False, "message": "value is required"}
+
+        spec: Dict[str, Any] = {"value": params["value"]}
+        for key in ("x", "y", "angle", "hide", "fontSize"):
+            if params.get(key) is not None:
+                spec[key] = params[key]
+
+        return self._handle_edit_schematic_component(
+            {
+                "schematicPath": params.get("schematicPath"),
+                "reference": params.get("reference"),
+                "properties": {name: spec},
+            }
+        )
+
+    def _handle_remove_schematic_component_property(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove a single custom property from a placed schematic symbol.
+
+        Built-in fields (Reference, Value, Footprint, Datasheet) cannot be
+        removed — use `edit_schematic_component` to clear them instead.
+        """
+        logger.info("Removing schematic component property")
+        name = params.get("name")
+        if not isinstance(name, str) or not name:
+            return {"success": False, "message": "name is required"}
+        return self._handle_edit_schematic_component(
+            {
+                "schematicPath": params.get("schematicPath"),
+                "reference": params.get("reference"),
+                "removeProperties": [name],
+            }
+        )
+
+    def _handle_get_schematic_component(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Return full component info: position and all field values with their (at x y angle) positions."""
+        logger.info("Getting schematic component info")
+        try:
+            import re
+            from pathlib import Path
+
+            schematic_path = params.get("schematicPath")
+            reference = params.get("reference")
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not reference:
+                return {"success": False, "message": "reference is required"}
 
             sch_file = Path(schematic_path)
             if not sch_file.exists():
@@ -1594,7 +1363,6 @@ class KiCADInterface:
                 content = f.read()
 
             def find_matching_paren(s: str, start: int) -> int:
-                """Find the position of the closing paren matching the opening paren at start."""
                 depth = 0
                 i = start
                 while i < len(s):
@@ -1611,8 +1379,7 @@ class KiCADInterface:
             lib_sym_pos = content.find("(lib_symbols")
             lib_sym_end = find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
 
-            # Find placed symbol blocks that match the reference
-            # Search for (symbol (lib_id "...") ... (property "Reference" "<ref>" ...) ...)
+            # Find the placed symbol block for this reference
             block_start = block_end = None
             search_start = 0
             pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
@@ -1621,7 +1388,6 @@ class KiCADInterface:
                 if not m:
                     break
                 pos = m.start()
-                # Skip if inside lib_symbols section
                 if lib_sym_pos >= 0 and lib_sym_pos <= pos <= lib_sym_end:
                     search_start = lib_sym_end + 1
                     continue
@@ -1644,140 +1410,7 @@ class KiCADInterface:
                     "message": f"Component '{reference}' not found in schematic",
                 }
 
-            # Apply property replacements within the found block
             block_text = content[block_start : block_end + 1]
-            if new_footprint is not None:
-                block_text = re.sub(
-                    r'(\(property\s+"Footprint"\s+)"[^"]*"',
-                    rf'\1"{new_footprint}"',
-                    block_text,
-                )
-            if new_value is not None:
-                block_text = re.sub(
-                    r'(\(property\s+"Value"\s+)"[^"]*"', rf'\1"{new_value}"', block_text
-                )
-            if new_reference is not None:
-                block_text = re.sub(
-                    r'(\(property\s+"Reference"\s+)"[^"]*"',
-                    rf'\1"{new_reference}"',
-                    block_text,
-                )
-                # Also update instances...reference so KiCad UI shows the new designator
-                block_text = re.sub(
-                    r'(\(reference\s+)"[^"]*"',
-                    rf'\1"{new_reference}"',
-                    block_text,
-                )
-            if field_positions is not None:
-                for field_name, pos in field_positions.items():
-                    x = pos.get("x", 0)
-                    y = pos.get("y", 0)
-                    angle = pos.get("angle", 0)
-                    block_text = re.sub(
-                        r'(\(property\s+"'
-                        + re.escape(field_name)
-                        + r'"\s+"[^"]*"\s+)\(at\s+[\d\.\-]+\s+[\d\.\-]+\s+[\d\.\-]+\s*\)',
-                        rf"\1(at {x} {y} {angle})",
-                        block_text,
-                    )
-
-            content = content[:block_start] + block_text + content[block_end + 1 :]
-
-            with open(sch_file, "w", encoding="utf-8") as f:
-                f.write(content)
-
-            changes = {
-                k: v
-                for k, v in {
-                    "footprint": new_footprint,
-                    "value": new_value,
-                    "reference": new_reference,
-                }.items()
-                if v is not None
-            }
-            if field_positions is not None:
-                changes["fieldPositions"] = field_positions
-            logger.info(f"Edited schematic component {reference}: {changes}")
-            return {"success": True, "reference": reference, "updated": changes}
-
-        except Exception as e:
-            logger.error(f"Error editing schematic component: {e}")
-            import traceback
-
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
-    def _handle_batch_edit_schematic_components(self, params):
-        """Edit multiple components in a schematic in a single call.
-
-        Accepts: {schematicPath, components: {ref: {footprint?, value?, newReference?, fieldPositions?}}}
-        Applies each edit sequentially using _handle_edit_schematic_component.
-        """
-        logger.info("Batch editing schematic components")
-        schematic_path = params.get("schematicPath")
-        components = params.get("components")
-
-        if not schematic_path:
-            return {"success": False, "message": "schematicPath is required"}
-        if not components or not isinstance(components, dict):
-            return {"success": False, "message": "components must be a dict {reference: {footprint?, value?, newReference?}}"}
-
-        updated = {}
-        errors = []
-
-        for reference, props in components.items():
-            sub_params = {"schematicPath": schematic_path, "reference": reference, **props}
-            result = self._handle_edit_schematic_component(sub_params)
-            if result.get("success"):
-                updated[reference] = result.get("updated", {})
-            else:
-                errors.append({"reference": reference, "error": result.get("message", "Unknown error")})
-
-        return {
-            "success": len(errors) == 0,
-            "updated_count": len(updated),
-            "error_count": len(errors),
-            "updated": updated,
-            "errors": errors,
-        }
-
-    def _handle_get_schematic_component(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
-        """Return full component info: position, all field values, properties, and pin→net assignments."""
-        logger.info("Getting schematic component info")
-        try:
-            import re
-            from pathlib import Path
-            from commands.pin_locator import PinLocator
-            from commands.connection_schematic import ConnectionManager as CM
-
-            schematic_path = params.get("schematicPath")
-            reference = params.get("reference")
-
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-            if not reference:
-                return {"success": False, "message": "reference is required"}
-
-            sch_file = Path(schematic_path)
-            if not sch_file.exists():
-                return {
-                    "success": False,
-                    "message": f"Schematic not found: {schematic_path}",
-                }
-
-            with open(sch_file, "r", encoding="utf-8") as f:
-                content = f.read()
-
-            # Use shared helper to find the placed symbol block
-            block_text, block_start, block_end = KiCADInterface._find_placed_symbol_block(
-                content, reference
-            )
-
-            if block_text is None:                return {
-                    "success": False,
-                    "message": f"Component '{reference}' not found in schematic",
-                }
 
             # Extract component position: first (at x y angle) in the symbol header line
             comp_at = re.search(
@@ -1793,7 +1426,7 @@ class KiCADInterface:
             else:
                 comp_pos = None
 
-            # Extract all properties with their at positions (for backward compat: keep fields)
+            # Extract all properties with their at positions
             prop_pattern = re.compile(
                 r'\(property\s+"([^"]*)"\s+"([^"]*)"\s+\(at\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)\s*\)'
             )
@@ -1813,48 +1446,11 @@ class KiCADInterface:
                     "angle": float(angle),
                 }
 
-            # All properties as flat name→value dict (excludes ki_* internal props)
-            properties = KiCADInterface._extract_component_properties(block_text)
-
-            # ── Pin→net assignments ───────────────────────────────────────────
-            pins = []
-            try:
-                schematic = SchematicManager.load_schematic(schematic_path)
-                netmap = CM.build_full_netmap(schematic, schematic_path)
-
-                locator = PinLocator()
-
-                # Get lib_id from block_text
-                lib_id_m = re.search(r'\(lib_id\s+"([^"]+)"', block_text)
-                lib_id = lib_id_m.group(1) if lib_id_m else None
-
-                pins_def = locator.get_symbol_pins(sch_file, lib_id) if lib_id else {}
-                all_pins = locator.get_all_symbol_pins(sch_file, reference)
-
-                def _pin_sort_key(pn):
-                    return int(pn) if pn.isdigit() else pn
-
-                for pin_num in sorted(all_pins.keys(), key=_pin_sort_key):
-                    pin_data = pins_def.get(str(pin_num), {})
-                    net = netmap.get((reference, str(pin_num)), "unconnected")
-                    coords = all_pins[pin_num]
-                    pins.append({
-                        "pinNumber": pin_num,
-                        "pinName": pin_data.get("name", pin_num),
-                        "pinType": pin_data.get("type", "unknown"),
-                        "connectedNet": net,
-                        "position": {"x": coords[0], "y": coords[1]},
-                    })
-            except Exception as pin_err:
-                logger.warning(f"Could not build pin→net assignments: {pin_err}")
-
             return {
                 "success": True,
                 "reference": reference,
                 "position": comp_pos,
                 "fields": fields,
-                "properties": properties,
-                "pins": pins,
             }
 
         except Exception as e:
@@ -1865,7 +1461,6 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_add_schematic_wire(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Add a wire to a schematic using WireManager, with optional pin snapping"""
         logger.info("Adding wire to schematic")
         try:
@@ -1990,7 +1585,6 @@ class KiCADInterface:
             }
 
     def _handle_add_schematic_junction(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Add a junction (connection dot) to a schematic using WireManager"""
         logger.info("Adding junction to schematic")
         try:
@@ -2024,7 +1618,6 @@ class KiCADInterface:
             }
 
     def _handle_list_schematic_libraries(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """List available symbol libraries"""
         logger.info("Listing schematic libraries")
         try:
@@ -2037,7 +1630,6 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_find_unconnected_pins(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """List component pins with no wire/label/power symbol touching them"""
         logger.info("Finding unconnected pins")
         try:
@@ -2058,7 +1650,6 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_check_wire_collisions(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Detect wires passing through component bodies without connecting to pins"""
         logger.info("Checking wire collisions")
         try:
@@ -2083,7 +1674,6 @@ class KiCADInterface:
     # ------------------------------------------------------------------ #
 
     def _handle_create_footprint(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Create a new .kicad_mod footprint file in a .pretty library."""
         logger.info(f"create_footprint: {params.get('name')} in {params.get('libraryPath')}")
         try:
@@ -2106,7 +1696,6 @@ class KiCADInterface:
             return {"success": False, "error": str(e)}
 
     def _handle_edit_footprint_pad(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Edit an existing pad in a .kicad_mod file."""
         logger.info(
             f"edit_footprint_pad: pad {params.get('padNumber')} in {params.get('footprintPath')}"
@@ -2126,7 +1715,6 @@ class KiCADInterface:
             return {"success": False, "error": str(e)}
 
     def _handle_list_footprint_libraries(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """List .pretty footprint libraries and their contents."""
         logger.info("list_footprint_libraries")
         try:
@@ -2137,7 +1725,6 @@ class KiCADInterface:
             return {"success": False, "error": str(e)}
 
     def _handle_register_footprint_library(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Register a .pretty library in KiCAD's fp-lib-table."""
         logger.info(f"register_footprint_library: {params.get('libraryPath')}")
         try:
@@ -2158,7 +1745,6 @@ class KiCADInterface:
     # ------------------------------------------------------------------ #
 
     def _handle_create_symbol(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Create a new symbol in a .kicad_sym library."""
         logger.info(f"create_symbol: {params.get('name')} in {params.get('libraryPath')}")
         try:
@@ -2183,7 +1769,6 @@ class KiCADInterface:
             return {"success": False, "error": str(e)}
 
     def _handle_delete_symbol(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Delete a symbol from a .kicad_sym library."""
         logger.info(f"delete_symbol: {params.get('name')} from {params.get('libraryPath')}")
         try:
@@ -2197,7 +1782,6 @@ class KiCADInterface:
             return {"success": False, "error": str(e)}
 
     def _handle_list_symbols_in_library(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """List all symbols in a .kicad_sym file."""
         logger.info(f"list_symbols_in_library: {params.get('libraryPath')}")
         try:
@@ -2210,7 +1794,6 @@ class KiCADInterface:
             return {"success": False, "error": str(e)}
 
     def _handle_register_symbol_library(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Register a .kicad_sym library in KiCAD's sym-lib-table."""
         logger.info(f"register_symbol_library: {params.get('libraryPath')}")
         try:
@@ -2227,7 +1810,6 @@ class KiCADInterface:
             return {"success": False, "error": str(e)}
 
     def _handle_export_schematic_pdf(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Export schematic to PDF"""
         logger.info("Exporting schematic to PDF")
         try:
@@ -2277,8 +1859,13 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_add_schematic_net_label(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
-        """Add a net label to schematic using WireManager"""
+        """Add a net label to schematic using WireManager.
+
+        When componentRef and pinNumber are supplied the label is placed at the
+        exact pin endpoint retrieved via PinLocator, ignoring the provided
+        position.  The response includes the actual coordinates used and
+        whether the label landed on a pin endpoint.
+        """
         logger.info("Adding net label to schematic")
         try:
             from pathlib import Path
@@ -2288,16 +1875,66 @@ class KiCADInterface:
             schematic_path = params.get("schematicPath")
             net_name = params.get("netName")
             position = params.get("position")
-            label_type = params.get(
-                "labelType", "label"
-            )  # 'label', 'global_label', 'hierarchical_label'
-            # Support both 'angle' (new) and 'orientation' (legacy) parameter names
-            orientation = params.get("angle", params.get("orientation", 0))  # 0, 90, 180, 270
-            # justify=None means auto-derive from angle in WireManager
-            justify = params.get("justify", None)
+            label_type = params.get("labelType", "label")
+            orientation = params.get("orientation", 0)
+            component_ref = params.get("componentRef")
+            pin_number = params.get("pinNumber")
 
-            if not all([schematic_path, net_name, position]):
-                return {"success": False, "message": "Missing required parameters"}
+            if not all([schematic_path, net_name]):
+                return {
+                    "success": False,
+                    "message": "Missing required parameters: schematicPath, netName",
+                }
+
+            snapped_to_pin: Optional[Dict[str, Any]] = None
+
+            if component_ref and pin_number:
+                # Snap position to exact pin endpoint using PinLocator
+                from commands.pin_locator import PinLocator
+
+                locator = PinLocator()
+                pin_loc = locator.get_pin_location(
+                    Path(schematic_path), component_ref, str(pin_number)
+                )
+                if pin_loc is None:
+                    return {
+                        "success": False,
+                        "message": (
+                            f"Could not locate pin {pin_number} on {component_ref}. "
+                            "Check the reference and pin number."
+                        ),
+                    }
+                position = pin_loc
+                snapped_to_pin = {"component": component_ref, "pin": str(pin_number)}
+                logger.info(
+                    f"Snapped label '{net_name}' to pin {component_ref}/{pin_number} at {position}"
+                )
+            elif position is None:
+                return {
+                    "success": False,
+                    "message": (
+                        "Missing position. Either provide position [x, y] or "
+                        "componentRef + pinNumber to snap to a pin endpoint."
+                    ),
+                }
+
+            # Collect existing net names BEFORE adding the new label so we can
+            # detect case-mismatch collisions against pre-existing nets only.
+            existing_net_names: List[str] = []
+            try:
+                pre_schematic = SchematicManager.load_schematic(schematic_path)
+                if pre_schematic is not None:
+                    if hasattr(pre_schematic, "label"):
+                        for lbl in pre_schematic.label:
+                            if hasattr(lbl, "value"):
+                                existing_net_names.append(lbl.value)
+                    if hasattr(pre_schematic, "global_label"):
+                        for lbl in pre_schematic.global_label:
+                            if hasattr(lbl, "value"):
+                                existing_net_names.append(lbl.value)
+            except Exception:
+                # Non-fatal: if we can't read existing nets, skip the warning
+                existing_net_names = []
 
             # Use WireManager for S-expression manipulation
             success = WireManager.add_label(
@@ -2306,16 +1943,35 @@ class KiCADInterface:
                 position,
                 label_type=label_type,
                 orientation=orientation,
-                justify=justify,
             )
 
-            if success:
-                return {
-                    "success": True,
-                    "message": f"Added net label '{net_name}' at {position}",
-                }
-            else:
+            if not success:
                 return {"success": False, "message": "Failed to add net label"}
+
+            # Compute case-mismatch warnings against pre-existing net names.
+            # A collision is: existing name != new name, but lowercases match.
+            new_name_lower = net_name.lower()
+            case_warnings: List[str] = [
+                f"Net '{existing}' already exists — label '{net_name}' may be a case mismatch."
+                for existing in existing_net_names
+                if existing.lower() == new_name_lower and existing != net_name
+            ]
+
+            response: Dict[str, Any] = {
+                "success": True,
+                "message": f"Added net label '{net_name}' at {position}",
+                "actual_position": position,
+            }
+            if snapped_to_pin:
+                response["snapped_to_pin"] = snapped_to_pin
+                response["message"] = (
+                    f"Added net label '{net_name}' at exact pin endpoint "
+                    f"{component_ref}/{pin_number} ({position[0]}, {position[1]})"
+                )
+            if case_warnings:
+                response["case_warnings"] = case_warnings
+            return response
+
         except Exception as e:
             logger.error(f"Error adding net label: {str(e)}")
             import traceback
@@ -2327,412 +1983,25 @@ class KiCADInterface:
                 "errorDetails": traceback.format_exc(),
             }
 
-    def _handle_set_schematic_property_position(self, params):
-        """Move a symbol's Reference or Value property field to a new coordinate."""
-        import re
-        logger.info("Setting schematic property position")
-        try:
-            from pathlib import Path
-
-            schematic_path = params.get("schematicPath")
-            reference = params.get("reference")
-            property_name = params.get("property")
-            x = params.get("x")
-            y = params.get("y")
-            angle = params.get("angle", 0)
-            visible = params.get("visible", True)
-
-            if not all([schematic_path, reference, property_name, x is not None, y is not None]):
-                return {"success": False, "message": "Missing required parameters: schematicPath, reference, property, x, y"}
-            if property_name not in ("Reference", "Value"):
-                return {"success": False, "message": "property must be 'Reference' or 'Value'"}
-
-            sch_path = Path(schematic_path)
-            if not sch_path.exists():
-                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
-
-            with open(sch_path, "r", encoding="utf-8") as f:
-                content = f.read()
-
-            block_text, block_start, block_end = KiCADInterface._find_placed_symbol_block(content, reference)
-            if block_text is None:
-                return {"success": False, "message": f"Component '{reference}' not found in schematic"}
-
-            # Record old position for reporting
-            old_pos = KiCADInterface._extract_property_position(block_text, property_name)
-
-            # Replace (at X Y ANGLE) inside the target property
-            prop_pat = re.compile(
-                r'(\(property\s+"' + re.escape(property_name) + r'"\s+"[^"]*"\s+)\(at\s+[-\d.]+\s+[-\d.]+\s+[-\d.]+\)'
-            )
-            new_at = f"(at {x} {y} {angle})"
-            new_block, n_subs = prop_pat.subn(r'\g<1>' + new_at, block_text)
-            if n_subs == 0:
-                return {"success": False, "message": f"Property '{property_name}' not found in {reference}"}
-
-            # Handle visibility: find property sub-expression and add/remove (hide yes)
-            prop_sub_m = re.search(r'\(property\s+"' + re.escape(property_name) + r'"', new_block)
-            if prop_sub_m:
-                ps = prop_sub_m.start()
-                depth = 0
-                i = ps
-                while i < len(new_block):
-                    if new_block[i] == '(':
-                        depth += 1
-                    elif new_block[i] == ')':
-                        depth -= 1
-                        if depth == 0:
-                            pe = i
-                            break
-                    i += 1
-                prop_sub = new_block[ps:pe + 1]
-                is_hidden = '(hide yes)' in prop_sub or '(hide)' in prop_sub
-                if not visible and not is_hidden:
-                    # Find (effects ...) and insert (hide yes) before its closing paren
-                    eff_m = re.search(r'\(effects', prop_sub)
-                    if eff_m:
-                        eff_start = eff_m.start()
-                        edepth = 0
-                        ei = eff_start
-                        while ei < len(prop_sub):
-                            if prop_sub[ei] == '(':
-                                edepth += 1
-                            elif prop_sub[ei] == ')':
-                                edepth -= 1
-                                if edepth == 0:
-                                    eff_end = ei
-                                    break
-                            ei += 1
-                        new_eff = prop_sub[eff_start:eff_end] + " (hide yes))"
-                        prop_sub = prop_sub[:eff_start] + new_eff + prop_sub[eff_end + 1:]
-                elif visible and is_hidden:
-                    prop_sub = prop_sub.replace(' (hide yes)', '').replace('(hide yes) ', '').replace('(hide yes)', '')
-                    prop_sub = prop_sub.replace(' (hide)', '').replace('(hide) ', '').replace('(hide)', '')
-                new_block = new_block[:ps] + prop_sub + new_block[pe + 1:]
-
-            new_content = content[:block_start] + new_block + content[block_end + 1:]
-            with open(sch_path, "w", encoding="utf-8") as f:
-                f.write(new_content)
-
-            old_str = f"({old_pos['x']}, {old_pos['y']}, {old_pos['angle']}°)" if old_pos else "unknown"
-            return {
-                "success": True,
-                "message": f"Moved {reference}.{property_name} from {old_str} to ({x}, {y}, {angle}°)",
-            }
-        except Exception as e:
-            logger.error(f"Error setting property position: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
-    def _handle_batch_set_schematic_property_positions(self, params):
-        """Batch-move Reference/Value property fields for multiple components in one file read/write."""
-        import re
-        logger.info("Batch setting schematic property positions")
-        try:
-            from pathlib import Path
-
-            schematic_path = params.get("schematicPath")
-            updates = params.get("updates", [])
-
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-            if not updates:
-                return {"success": False, "message": "updates list is required"}
-
-            sch_path = Path(schematic_path)
-            if not sch_path.exists():
-                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
-
-            content = sch_path.read_text(encoding="utf-8")
-            applied = []
-            failed = []
-
-            for upd in updates:
-                reference = upd.get("reference")
-                property_name = upd.get("property")
-                x = upd.get("x")
-                y = upd.get("y")
-                angle = upd.get("angle", 0)
-                visible = upd.get("visible", True)
-
-                if not reference or not property_name or x is None or y is None:
-                    failed.append({"reference": reference, "property": property_name,
-                                   "reason": "Missing required fields: reference, property, x, y"})
-                    continue
-                if property_name not in ("Reference", "Value"):
-                    failed.append({"reference": reference, "property": property_name,
-                                   "reason": "property must be 'Reference' or 'Value'"})
-                    continue
-
-                block_text, block_start, block_end = KiCADInterface._find_placed_symbol_block(content, reference)
-                if block_text is None:
-                    failed.append({"reference": reference, "property": property_name,
-                                   "reason": f"Component '{reference}' not found in schematic"})
-                    continue
-
-                prop_pat = re.compile(
-                    r'(\(property\s+"' + re.escape(property_name) + r'"\s+"[^"]*"\s+)'
-                    r'\(at\s+[-\d.]+\s+[-\d.]+\s+[-\d.]+\)'
-                )
-                new_block, n_subs = prop_pat.subn(r'\g<1>' + f"(at {x} {y} {angle})", block_text)
-                if n_subs == 0:
-                    failed.append({"reference": reference, "property": property_name,
-                                   "reason": f"Property '{property_name}' not found in {reference} block"})
-                    continue
-
-                # Handle visibility
-                prop_sub_m = re.search(r'\(property\s+"' + re.escape(property_name) + r'"', new_block)
-                if prop_sub_m:
-                    ps = prop_sub_m.start()
-                    depth, i, pe = 0, ps, len(new_block) - 1
-                    while i < len(new_block):
-                        if new_block[i] == '(':
-                            depth += 1
-                        elif new_block[i] == ')':
-                            depth -= 1
-                            if depth == 0:
-                                pe = i
-                                break
-                        i += 1
-                    prop_sub = new_block[ps:pe + 1]
-                    is_hidden = '(hide yes)' in prop_sub or '(hide)' in prop_sub
-                    if not visible and not is_hidden:
-                        eff_m = re.search(r'\(effects', prop_sub)
-                        if eff_m:
-                            eff_start = eff_m.start()
-                            edepth, ei, eff_end = 0, eff_start, len(prop_sub) - 1
-                            while ei < len(prop_sub):
-                                if prop_sub[ei] == '(':
-                                    edepth += 1
-                                elif prop_sub[ei] == ')':
-                                    edepth -= 1
-                                    if edepth == 0:
-                                        eff_end = ei
-                                        break
-                                ei += 1
-                            new_eff = prop_sub[eff_start:eff_end] + " (hide yes))"
-                            prop_sub = prop_sub[:eff_start] + new_eff + prop_sub[eff_end + 1:]
-                    elif visible and is_hidden:
-                        prop_sub = prop_sub.replace(' (hide yes)', '').replace('(hide yes) ', '').replace('(hide yes)', '')
-                        prop_sub = prop_sub.replace(' (hide)', '').replace('(hide) ', '').replace('(hide)', '')
-                    new_block = new_block[:ps] + prop_sub + new_block[pe + 1:]
-
-                content = content[:block_start] + new_block + content[block_end + 1:]
-                applied.append({"reference": reference, "property": property_name,
-                                 "x": x, "y": y, "angle": angle, "visible": visible})
-
-            if applied:
-                sch_path.write_text(content, encoding="utf-8")
-
-            return {
-                "success": len(failed) == 0,
-                "applied": applied,
-                "failed": failed,
-                "applied_count": len(applied),
-                "failed_count": len(failed),
-            }
-        except Exception as e:
-            logger.error(f"Error in batch_set_schematic_property_positions: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
-    def _handle_add_no_connect(self, params):
-        """Add a no-connect flag to mark an intentionally unconnected pin"""
-        logger.info("Adding no-connect flag to schematic")
-        try:
-            from pathlib import Path
-            from commands.wire_manager import WireManager
-
-            schematic_path = params.get("schematicPath")
-            position = params.get("position")
-            component_ref = params.get("componentRef")
-            pin_name = params.get("pinName")
-
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-
-            # If componentRef+pinName provided, auto-resolve position via PinLocator
-            if component_ref and pin_name and not position:
-                try:
-                    from commands.pin_locator import PinLocator
-                    locator = PinLocator()
-                    pin_loc = locator.get_pin_location(Path(schematic_path), component_ref, str(pin_name))
-                    if not pin_loc:
-                        return {
-                            "success": False,
-                            "message": f"Could not find pin {pin_name} on {component_ref}",
-                        }
-                    position = pin_loc
-                except Exception as e:
-                    return {"success": False, "message": f"Pin lookup failed: {e}"}
-
-            if not position:
-                return {"success": False, "message": "Provide either 'position' [x, y] or 'componentRef' + 'pinName'"}
-
-            success = WireManager.add_no_connect(Path(schematic_path), position)
-
-            if success:
-                pin_desc = f"{component_ref}/{pin_name}" if component_ref else f"({position[0]}, {position[1]})"
-                return {
-                    "success": True,
-                    "message": f"Added no-connect marker for {pin_desc}",
-                    "position": {"x": position[0], "y": position[1]},
-                }
-            else:
-                return {"success": False, "message": "Failed to add no-connect flag"}
-        except Exception as e:
-            logger.error(f"Error adding no-connect: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {
-                "success": False,
-                "message": str(e),
-                "errorDetails": traceback.format_exc(),
-            }
-
-    def _handle_batch_add_no_connects(self, params):
-        """Add no-connect flags to multiple pins in a single call."""
-        logger.info("Batch adding no-connect flags")
-        try:
-            from pathlib import Path
-            from commands.wire_manager import WireManager
-            from commands.pin_locator import PinLocator
-
-            schematic_path = params.get("schematicPath")
-            pins = params.get("pins", [])
-
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-            if not pins:
-                return {"success": False, "message": "pins list is required and must be non-empty"}
-
-            sch_path = Path(schematic_path)
-            locator = PinLocator()
-            placed = []
-            failed = []
-
-            for entry in pins:
-                comp_ref = entry.get("componentRef")
-                pin_name = entry.get("pinName")
-                if not comp_ref or pin_name is None:
-                    failed.append({"entry": entry, "reason": "componentRef and pinName are required"})
-                    continue
-                try:
-                    pin_loc = locator.get_pin_location(sch_path, comp_ref, str(pin_name))
-                    if not pin_loc:
-                        # Single-pin fallback
-                        all_pins = locator.get_all_symbol_pins(sch_path, comp_ref) or {}
-                        if len(all_pins) == 1:
-                            coords = next(iter(all_pins.values()))
-                            pin_loc = coords
-                        else:
-                            avail = sorted(all_pins.keys()) if all_pins else []
-                            failed.append({"componentRef": comp_ref, "pinName": str(pin_name),
-                                           "reason": f"Pin not found; available: {avail}"})
-                            continue
-                    ok = WireManager.add_no_connect(sch_path, pin_loc)
-                    if ok:
-                        placed.append({
-                            "componentRef": comp_ref,
-                            "pinName": str(pin_name),
-                            "position": {"x": pin_loc[0], "y": pin_loc[1]},
-                        })
-                    else:
-                        failed.append({"componentRef": comp_ref, "pinName": str(pin_name),
-                                       "reason": "add_no_connect returned False"})
-                except Exception as pin_err:
-                    failed.append({"componentRef": comp_ref, "pinName": str(pin_name),
-                                   "reason": str(pin_err)})
-
-            return {
-                "success": len(failed) == 0,
-                "message": f"Placed {len(placed)} no-connect marker(s), {len(failed)} failed",
-                "placed": placed,
-                "failed": failed,
-            }
-        except Exception as e:
-            logger.error(f"Error in batch_add_no_connects: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
-    def _handle_save_schematic(self, params):
-        """Save schematic - confirms the schematic file exists (schematic changes are written immediately by each tool)"""
-        logger.info("Save schematic requested")
-        try:
-            schematic_path = params.get("schematicPath")
-            if not schematic_path:
-                return {"success": False, "message": "Missing required parameter: schematicPath"}
-
-            import os
-            if not os.path.exists(schematic_path):
-                return {"success": False, "message": f"Schematic file not found: {schematic_path}"}
-
-            # Schematic tools write changes directly to disk (no in-memory state)
-            # This tool confirms the file is present and returns its size as proof
-            size = os.path.getsize(schematic_path)
-            return {
-                "success": True,
-                "message": f"Schematic is saved at {schematic_path}",
-                "file_path": schematic_path,
-                "file_size_bytes": size,
-                "note": "Schematic tools write changes directly to disk. No separate save step is required."
-            }
-        except Exception as e:
-            logger.error(f"Error in save_schematic: {str(e)}")
-            return {"success": False, "message": str(e)}
-
-    def _handle_connect_to_net(self, params: Dict[str, Any]) -> Dict[str, Any]:        
+    def _handle_connect_to_net(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Connect a component pin to a named net using wire stub and label"""
         logger.info("Connecting component pin to net")
         try:
             from pathlib import Path
 
             schematic_path = params.get("schematicPath")
-            component_ref = params.get("reference") or params.get("componentRef")
-            pin_name = params.get("pinNumber") or params.get("pinName")
+            component_ref = params.get("componentRef")
+            pin_name = params.get("pinName")
             net_name = params.get("netName")
-            force = params.get("force", False)
 
             if not all([schematic_path, component_ref, pin_name, net_name]):
-                return {"success": False, "message": "Missing required parameters: schematicPath, reference, pinNumber, netName"}
-
-            # Check if a global label with the same name exists; warn unless force=True
-            if not force:
-                try:
-                    schematic = SchematicManager.load_schematic(schematic_path)
-                    if schematic and hasattr(schematic, "global_label"):
-                        for gl in schematic.global_label:
-                            if hasattr(gl, "value") and gl.value == net_name:
-                                return {
-                                    "success": False,
-                                    "warning": True,
-                                    "message": (
-                                        f"Global label '{net_name}' already exists on this sheet. "
-                                        "Placing a local label with the same name will produce an ERC "
-                                        "(same_local_global_label) warning. Use add_wire to connect to "
-                                        "the existing global label net instead. "
-                                        "Pass force=true to place the local label anyway."
-                                    ),
-                                }
-                except Exception as _warn_err:
-                    logger.warning(f"Could not check global labels before connect_to_net: {_warn_err}")
+                return {"success": False, "message": "Missing required parameters"}
 
             # Use ConnectionManager with new WireManager integration
-            label_pos = ConnectionManager.connect_to_net(
+            result = ConnectionManager.connect_to_net(
                 Path(schematic_path), component_ref, pin_name, net_name
             )
-
-            if label_pos is not None:
-                return {
-                    "success": True,
-                    "message": f"Connected {component_ref}/{pin_name} to net '{net_name}'",
-                    "label_position": label_pos,
-                }
-            else:
-                return {"success": False, "message": "Failed to connect to net"}
+            return result
         except Exception as e:
             logger.error(f"Error connecting to net: {str(e)}")
             import traceback
@@ -2745,7 +2014,6 @@ class KiCADInterface:
             }
 
     def _handle_connect_passthrough(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Connect all pins of source connector to matching pins of target connector"""
         logger.info("Connecting passthrough between two connectors")
         try:
@@ -2782,739 +2050,8 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
-    @staticmethod
-    def _find_facing_label(sch_path, net_name: str, position, orientation: int, proximity_mm: float = 14.0):
-        """
-        Scan the schematic for an existing label with *net_name* that:
-          - is within *proximity_mm* of *position*
-          - has an orientation 180° opposite to *orientation* (i.e. the two labels face each other)
-
-        Returns [lx, ly] of the existing label if found, else None.
-        Used to detect when two components on the same net have adjacent facing pins —
-        in that case, a single wire between them is cleaner than two overlapping labels.
-        """
-        import re as _re
-        import math as _math
-        try:
-            content = sch_path.read_text(encoding="utf-8")
-            pat = _re.compile(r'\(label\s+"([^"]+)"\s+\(at\s+([-\d.]+)\s+([-\d.]+)\s+([\d.]+)\)')
-            px, py = float(position[0]), float(position[1])
-            orient_norm = int(round(orientation)) % 360
-            facing = (orient_norm + 180) % 360
-            for m in pat.finditer(content):
-                lname = m.group(1)
-                if lname != net_name:
-                    continue
-                lx, ly, la = float(m.group(2)), float(m.group(3)), float(m.group(4))
-                if _math.hypot(lx - px, ly - py) > proximity_mm:
-                    continue
-                if int(round(la)) % 360 == facing:
-                    return [lx, ly]
-        except Exception:
-            pass
-        return None
-
-    def _handle_place_net_label_at_pin(self, params):
-        """Place a net label at the exact endpoint of a component pin (no wire stub)"""
-        logger.info("Placing net label at pin")
-        try:
-            from pathlib import Path
-            from commands.pin_locator import PinLocator
-            from commands.wire_manager import WireManager
-
-            schematic_path = params.get("schematicPath")
-            reference = params.get("reference")
-            pin_number = params.get("pinNumber")
-            net_name = params.get("netName")
-
-            if not all([schematic_path, reference, pin_number, net_name]):
-                return {
-                    "success": False,
-                    "message": "Missing required parameters: schematicPath, reference, pinNumber, netName",
-                }
-
-            locator = PinLocator()
-            sch_path = Path(schematic_path)
-
-            position = locator.get_pin_location(sch_path, reference, str(pin_number))
-            if not position:
-                # For single-pin components (PWR_FLAG, GND, +3V3, etc.) the pin name
-                # is often non-obvious (e.g. "~" for PWR_FLAG).  Fall back to whichever
-                # pin exists when the component has exactly one pin.
-                all_pins = locator.get_all_symbol_pins(sch_path, reference) or {}
-                if len(all_pins) == 1:
-                    only_pin_num = next(iter(all_pins))
-                    coords = all_pins[only_pin_num]
-                    position = coords
-                    pin_number = only_pin_num
-                    logger.info(
-                        f"Single-pin fallback: {reference} has one pin ({only_pin_num}), using it"
-                    )
-                else:
-                    return {
-                        "success": False,
-                        "message": f"Could not find pin '{pin_number}' on {reference}. "
-                                   f"Available pins: {sorted(all_pins.keys()) if all_pins else 'none found'}",
-                    }
-
-            raw_angle = locator.get_pin_angle(sch_path, reference, str(pin_number)) or 0
-            # Normalize to nearest cardinal angle
-            cardinal = round(raw_angle / 90) * 90 % 360
-            # Map pin angle to label orientation: label text should extend outward
-            angle_map = {0: 180, 90: 270, 180: 0, 270: 90}
-            orientation = angle_map.get(cardinal, 0)
-
-            # If an existing label with the same net name is nearby and facing this one,
-            # add a wire to it instead of placing a duplicate — prevents overlapping labels
-            # between adjacent components on the same net (e.g. D1-VBUS ↔ F1-VBUS).
-            existing_pos = KiCADInterface._find_facing_label(sch_path, net_name, position, orientation)
-            if existing_pos:
-                wire_ok = WireManager.add_wire(sch_path, list(position), existing_pos)
-                return {
-                    "success": wire_ok,
-                    "reference": reference,
-                    "pinNumber": pin_number,
-                    "netName": net_name,
-                    "position": {"x": position[0], "y": position[1]},
-                    "labelOrientation": orientation,
-                    "note": f"Wired to existing '{net_name}' label at ({existing_pos[0]},{existing_pos[1]}) instead of placing duplicate",
-                }
-
-            success = WireManager.add_label(
-                sch_path, net_name, position, label_type="label", orientation=orientation
-            )
-
-            if success:
-                return {
-                    "success": True,
-                    "reference": reference,
-                    "pinNumber": pin_number,
-                    "netName": net_name,
-                    "position": {"x": position[0], "y": position[1]},
-                    "labelOrientation": orientation,
-                }
-            else:
-                return {"success": False, "message": "Failed to place net label"}
-
-        except Exception as e:
-            logger.error(f"Error placing net label at pin: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e), "errorDetails": traceback.format_exc()}
-
-    def _handle_batch_connect(self, params):
-        """Place net labels on multiple pins in a single call to avoid per-pin round-trips."""
-        logger.info("Batch connect: placing net labels on multiple pins")
-        try:
-            from pathlib import Path
-            from commands.pin_locator import PinLocator
-            from commands.wire_manager import WireManager
-
-            schematic_path = params.get("schematicPath")
-            connections = params.get("connections")  # {ref: {pin: netName}}
-            replace = bool(params.get("replace", False))
-
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-            if not connections or not isinstance(connections, dict):
-                return {"success": False, "message": "connections must be a dict {ref: {pin: netName}}"}
-
-            locator = PinLocator()
-            sch_path = Path(schematic_path)
-
-            # Eagerly verify the schematic is parseable before the pin loop.
-            # If skip fails here, ALL pins will silently return "not found" — which is
-            # misleading.  A clear parse error is more actionable.
-            try:
-                from skip import Schematic as _Sch
-                _Sch(str(sch_path))
-            except Exception as parse_err:
-                return {
-                    "success": False,
-                    "message": (
-                        f"ERROR: Failed to load schematic at {schematic_path}: {parse_err}. "
-                        "All pin operations aborted. Run validate_schematic to check for "
-                        "syntax errors (parenthesis balance) in the file."
-                    ),
-                }
-
-            placed = []
-            failed = []
-            # Track already-placed label positions to deduplicate pins that share
-            # the same schematic coordinate (e.g. USB-C dual-role pins like A4B9/B4A9).
-            # Key: (rounded_x, rounded_y), Value: net_name already placed there.
-            placed_positions: dict = {}
-
-            for ref, pin_map in connections.items():
-                if not isinstance(pin_map, dict):
-                    failed.append({"ref": ref, "reason": "pin_map must be a dict {pin: netName}"})
-                    continue
-                for pin_id, net_name in pin_map.items():
-                    try:
-                        resolved_pin = str(pin_id)
-                        position = locator.get_pin_location(sch_path, ref, resolved_pin)
-                        if not position:
-                            # Single-pin fallback for PWR_FLAG, GND, +3V3, etc.
-                            all_pins = locator.get_all_symbol_pins(sch_path, ref) or {}
-                            if len(all_pins) == 1:
-                                resolved_pin = next(iter(all_pins))
-                                coords = all_pins[resolved_pin]
-                                position = coords
-                                logger.info(
-                                    f"batch_connect single-pin fallback: {ref} pin {resolved_pin}"
-                                )
-                            else:
-                                avail = sorted(all_pins.keys()) if all_pins else []
-                                failed.append({
-                                    "ref": ref,
-                                    "pin": resolved_pin,
-                                    "reason": f"pin not found; available: {avail}",
-                                })
-                                continue
-
-                        # Deduplicate: if two pins of the same component (or different
-                        # components) resolve to the exact same coordinate for the same
-                        # net, skip placing a second label there.
-                        pos_key = (round(float(position[0]), 2), round(float(position[1]), 2))
-                        if pos_key in placed_positions and placed_positions[pos_key] == net_name:
-                            placed.append({
-                                "ref": ref,
-                                "pin": str(pin_id),
-                                "net": net_name,
-                                "position": {"x": position[0], "y": position[1]},
-                                "note": "deduped: label already placed at this coordinate for this net",
-                            })
-                            continue
-
-                        raw_angle = locator.get_pin_angle(sch_path, ref, resolved_pin) or 0
-                        cardinal = round(raw_angle / 90) * 90 % 360
-                        angle_map = {0: 180, 90: 270, 180: 0, 270: 90}
-                        orientation = angle_map.get(cardinal, 0)
-
-                        # If a facing label with the same net name is nearby, wire to it
-                        # rather than placing a duplicate — avoids overlapping labels between
-                        # adjacent components on the same net (e.g. bus segments).
-                        existing_pos = KiCADInterface._find_facing_label(
-                            sch_path, net_name, position, orientation
-                        )
-                        if existing_pos:
-                            ok = WireManager.add_wire(sch_path, list(position), existing_pos)
-                            if ok:
-                                placed.append({
-                                    "ref": ref,
-                                    "pin": str(pin_id),
-                                    "net": net_name,
-                                    "position": {"x": position[0], "y": position[1]},
-                                    "note": f"wired to existing label at ({existing_pos[0]},{existing_pos[1]})",
-                                })
-                                placed_positions[pos_key] = net_name
-                            else:
-                                failed.append({"ref": ref, "pin": str(pin_id), "net": net_name, "reason": "wire-to-existing-label failed"})
-                            continue
-
-                        # replace=True: delete any existing label at this pin tip
-                        # before placing the new one, so wrong-net labels are cleared.
-                        if replace:
-                            WireManager.delete_label(sch_path, net_name, list(position), tolerance=0.5)
-                            # Also delete any label with a different net at the same position
-                            try:
-                                import sexpdata as _sd
-                                from sexpdata import Symbol as _Sym
-                                with open(sch_path, "r", encoding="utf-8") as _rf:
-                                    _rd = _sd.loads(_rf.read())
-                                changed = False
-                                new_rd = []
-                                for _item in _rd:
-                                    if (isinstance(_item, list) and len(_item) > 0
-                                            and _item[0] == _Sym("label")):
-                                        _at = next(
-                                            (p for p in _item[1:] if isinstance(p, list)
-                                             and len(p) >= 3 and p[0] == _Sym("at")),
-                                            None,
-                                        )
-                                        if _at:
-                                            _lx, _ly = float(_at[1]), float(_at[2])
-                                            if abs(_lx - position[0]) < 0.5 and abs(_ly - position[1]) < 0.5:
-                                                changed = True
-                                                continue  # drop this label
-                                    new_rd.append(_item)
-                                if changed:
-                                    with open(sch_path, "w", encoding="utf-8") as _wf:
-                                        _wf.write(_sd.dumps(new_rd))
-                            except Exception as _re:
-                                logger.warning(f"replace cleanup failed: {_re}")
-
-                        ok = WireManager.add_label(
-                            sch_path, net_name, position, label_type="label", orientation=orientation
-                        )
-                        if ok:
-                            placed.append({
-                                "ref": ref,
-                                "pin": str(pin_id),
-                                "net": net_name,
-                                "position": {"x": position[0], "y": position[1]},
-                            })
-                            placed_positions[pos_key] = net_name
-                        else:
-                            failed.append({"ref": ref, "pin": str(pin_id), "net": net_name, "reason": "add_label failed"})
-                    except Exception as pin_err:
-                        failed.append({"ref": ref, "pin": str(pin_id), "reason": str(pin_err)})
-
-            # PWR_FLAG gap detection: warn for power nets that have no PWR_FLAG
-            power_nets_without_pwr_flag = []
-            try:
-                _POWER_KEYWORDS = {"VCC", "VDD", "VIN", "VBUS", "VBAT", "GND", "AGND", "DGND",
-                                   "PGND", "+5V", "+3V3", "+12V", "+3.3V", "+5.0V", "PWR", "POWER", "AVCC"}
-                _placed_nets = {p["net"] for p in placed}
-                _power_nets = {n for n in _placed_nets
-                               if any(kw in n.upper() for kw in _POWER_KEYWORDS)}
-                if _power_nets:
-                    _pwr_flag_nets = set()
-                    try:
-                        from skip import Schematic as _Sch
-                        _sch_obj = _Sch(str(sch_path))
-                        _pwr_flag_refs = [
-                            sym.property.Reference.value
-                            for sym in getattr(_sch_obj, "symbol", [])
-                            if "PWR_FLAG" in (sym.lib_id.value if hasattr(sym, "lib_id") else "")
-                            and hasattr(sym.property, "Reference")
-                        ]
-                        if _pwr_flag_refs:
-                            _TOL = 0.5
-                            for _pref in _pwr_flag_refs:
-                                _ppin = locator.get_pin_location(sch_path, _pref, "1")
-                                if not _ppin:
-                                    _all = locator.get_all_symbol_pins(sch_path, _pref) or {}
-                                    if _all:
-                                        _ppin = next(iter(_all.values()))
-                                if _ppin:
-                                    for _pl in placed:
-                                        if (abs(_pl["position"]["x"] - _ppin[0]) < _TOL and
-                                                abs(_pl["position"]["y"] - _ppin[1]) < _TOL):
-                                            _pwr_flag_nets.add(_pl["net"])
-                    except Exception:
-                        pass
-                    power_nets_without_pwr_flag = sorted(_power_nets - _pwr_flag_nets)
-            except Exception:
-                pass
-
-            result = {
-                "success": len(failed) == 0,
-                "message": f"Placed {len(placed)} label(s), {len(failed)} failed",
-                "placed": placed,
-                "failed": failed,
-            }
-            if power_nets_without_pwr_flag:
-                result["warnings"] = [
-                    f"Power nets without PWR_FLAG: {', '.join(power_nets_without_pwr_flag)}. "
-                    "Add a PWR_FLAG component to each of these nets to suppress ERC power-pin errors."
-                ]
-            return result
-
-        except Exception as e:
-            logger.error(f"Error in batch_connect: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e), "errorDetails": traceback.format_exc()}
-
-    def _handle_batch_add_and_connect(self, params):
-        """Place multiple components and connect their pins in a single call."""
-        logger.info("Batch add-and-connect: placing components and wiring nets")
-        try:
-            schematic_path = params.get("schematicPath")
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-
-            raw_components = params.get("components", [])
-            if not raw_components:
-                return {"success": False, "message": "components list is required and must be non-empty"}
-
-            # Separate the nets field from the placement params so batch_add_components
-            # receives a clean component list (it doesn't know about "nets").
-            components_for_add = []
-            nets_per_ref: dict = {}
-            for comp in raw_components:
-                comp_copy = {k: v for k, v in comp.items() if k != "nets"}
-                components_for_add.append(comp_copy)
-                nets = comp.get("nets") or {}
-                if nets:
-                    nets_per_ref[comp.get("reference", "")] = nets
-
-            # Step 1: place all components
-            add_params = {k: v for k, v in params.items() if k != "components"}
-            add_params["components"] = components_for_add
-            add_result = self._handle_batch_add_components(add_params)
-
-            # Step 2: connect pins using the resolved pin locations
-            connect_result = {"placed": [], "failed": [], "message": "no nets specified"}
-            if nets_per_ref:
-                connect_result = self._handle_batch_connect({
-                    "schematicPath": schematic_path,
-                    "connections": nets_per_ref,
-                })
-
-            added = add_result.get("added", [])
-            add_errors = add_result.get("errors", [])
-            conn_placed = connect_result.get("placed", [])
-            conn_failed = connect_result.get("failed", [])
-
-            return {
-                "success": add_result.get("added_count", 0) > 0,
-                "message": (
-                    f"Placed {add_result.get('added_count', 0)} component(s)"
-                    f"{' (' + str(len(add_errors)) + ' failed)' if add_errors else ''}, "
-                    f"connected {len(conn_placed)} pin(s)"
-                    f"{' (' + str(len(conn_failed)) + ' failed)' if conn_failed else ''}"
-                ),
-                "added_count": add_result.get("added_count", 0),
-                "added": added,
-                "connected_count": len(conn_placed),
-                "connected": conn_placed,
-                "placement_bbox": add_result.get("placement_bbox"),
-                "errors": add_errors,
-                "failed_connections": conn_failed,
-                "warnings": connect_result.get("warnings", []),
-            }
-
-        except Exception as e:
-            logger.error(f"Error in batch_add_and_connect: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e), "errorDetails": traceback.format_exc()}
-
-    def _handle_list_unconnected_pins(self, params):
-        """List pins with no net connection and no no-connect marker"""
-        logger.info("Listing unconnected pins")
-        try:
-            from pathlib import Path
-            from commands.pin_locator import PinLocator
-
-            schematic_path = params.get("schematicPath")
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-
-            sch_path = Path(schematic_path)
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
-
-            # Build set of connected (ref, pin_num) from netlist
-            netlist = ConnectionManager.generate_netlist(schematic, sch_path)
-            connected_pins = set()
-            for net in netlist.get("nets", []):
-                for conn in net.get("connections", []):
-                    connected_pins.add((conn.get("component"), str(conn.get("pin"))))
-
-            # Build set of no-connect positions
-            no_connect_positions = set()
-            if hasattr(schematic, "no_connect"):
-                for nc in schematic.no_connect:
-                    if hasattr(nc, "at") and hasattr(nc.at, "value"):
-                        pos = nc.at.value
-                        no_connect_positions.add((round(float(pos[0]), 2), round(float(pos[1]), 2)))
-
-            locator = PinLocator()
-            unconnected = []
-
-            for symbol in schematic.symbol:
-                if not hasattr(symbol.property, "Reference"):
-                    continue
-                ref = symbol.property.Reference.value
-                if ref.startswith("_TEMPLATE") or ref.startswith("#"):
-                    continue
-                lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
-                if lib_id.startswith("power:"):
-                    continue
-
-                all_pins = locator.get_all_symbol_pins(sch_path, ref) or {}
-                pins_def = locator.get_symbol_pins(sch_path, lib_id) or {}
-
-                for pin_num, coords in all_pins.items():
-                    if (ref, str(pin_num)) in connected_pins:
-                        continue
-                    pin_pos = (round(float(coords[0]), 2), round(float(coords[1]), 2))
-                    if pin_pos in no_connect_positions:
-                        continue
-                    pin_info = pins_def.get(str(pin_num), {})
-                    unconnected.append({
-                        "reference": ref,
-                        "pinNumber": str(pin_num),
-                        "pinName": pin_info.get("name", str(pin_num)),
-                        "pinType": pin_info.get("type", "unknown"),
-                        "position": {"x": coords[0], "y": coords[1]},
-                    })
-
-            return {"success": True, "unconnected": unconnected, "count": len(unconnected)}
-
-        except Exception as e:
-            logger.error(f"Error listing unconnected pins: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e), "errorDetails": traceback.format_exc()}
-
-    def _handle_search_schematic_symbols(self, params):
-        """Search for symbol names across KiCAD symbol libraries"""
-        logger.info("Searching schematic symbols")
-        try:
-            import re
-            from pathlib import Path
-            from commands.dynamic_symbol_loader import DynamicSymbolLoader
-
-            query = params.get("query", "").strip()
-            max_results = min(int(params.get("maxResults", 20)), 100)
-            schematic_path = params.get("schematicPath")
-
-            if not query:
-                return {"success": False, "message": "query is required"}
-
-            # Build project library map: nickname -> resolved path
-            # These take precedence over (and shadow) global libraries with the same nickname.
-            project_libs: dict = {}  # nickname -> Path
-            project_path = None
-            if schematic_path:
-                project_path = Path(schematic_path).parent
-                loader_proj = DynamicSymbolLoader(project_path=project_path)
-                sym_lib_table = project_path / "sym-lib-table"
-                if sym_lib_table.exists():
-                    try:
-                        with open(sym_lib_table, "r", encoding="utf-8") as f:
-                            table_content = f.read()
-                        for m in re.finditer(
-                            r'\(lib\s+\(name\s+"?([^"\)\s]+)"?\)\s*\(type\s+[^)]+\)\s*\(uri\s+"?([^"\)\s]+)"?',
-                            table_content,
-                            re.IGNORECASE,
-                        ):
-                            nickname = m.group(1)
-                            uri = m.group(2)
-                            resolved = loader_proj._resolve_sym_uri(uri)
-                            if resolved:
-                                p = Path(resolved)
-                                if p.exists():
-                                    project_libs[nickname] = p
-                    except Exception as e:
-                        logger.warning(f"Could not parse project sym-lib-table: {e}")
-
-            loader = DynamicSymbolLoader(project_path=project_path)
-            lib_dirs = loader.find_kicad_symbol_libraries()
-
-            results = []
-            query_lower = query.lower()
-            sub_symbol_re = re.compile(r'.+_\d+_\d+$')
-
-            def _search_lib_file(lib_file: Path, lib_name: str, shadowed_by: str = None):
-                """Search a single .kicad_sym file and append matching symbols to results."""
-                try:
-                    content = lib_file.read_text(encoding="utf-8", errors="ignore")
-                except Exception:
-                    return
-                symbol_names = re.findall(r'\(symbol\s+"([^"]+)"', content)
-                for sym_name in symbol_names:
-                    if len(results) >= max_results:
-                        return
-                    if sub_symbol_re.match(sym_name):
-                        continue
-                    if query_lower in sym_name.lower() or query_lower in lib_name.lower():
-                        entry: dict = {
-                            "library": lib_name,
-                            "symbol": sym_name,
-                            "fullName": f"{lib_name}:{sym_name}",
-                        }
-                        if shadowed_by:
-                            entry["warning"] = (
-                                f"Global library '{lib_name}' is shadowed by the project-local "
-                                f"library with the same nickname. Use results from the project "
-                                f"library instead, or check the project sym-lib-table."
-                            )
-                            entry["shadowed"] = True
-                        results.append(entry)
-
-            # 1. Search project-local libraries first (highest priority)
-            for nickname, lib_file in project_libs.items():
-                if len(results) >= max_results:
-                    break
-                _search_lib_file(lib_file, nickname)
-
-            # 2. Search global libraries, skipping any whose nickname is shadowed by project libs
-            for lib_dir in lib_dirs:
-                if len(results) >= max_results:
-                    break
-                for lib_file in sorted(lib_dir.glob("*.kicad_sym")):
-                    if len(results) >= max_results:
-                        break
-                    lib_name = lib_file.stem
-                    if lib_name in project_libs:
-                        # This global library is fully shadowed; skip silently
-                        continue
-                    _search_lib_file(lib_file, lib_name)
-
-            return {"success": True, "results": results, "count": len(results)}
-
-        except Exception as e:
-            logger.error(f"Error searching schematic symbols: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e), "errorDetails": traceback.format_exc()}
-
-    def _handle_list_symbol_pins(self, params):
-        """List pin names and numbers for a symbol directly from its library (no schematic needed)"""
-        logger.info("Listing symbol pins from library")
-        try:
-            from commands.dynamic_symbol_loader import DynamicSymbolLoader
-            from pathlib import Path
-
-            symbol_spec = params.get("symbol", "")
-            schematic_path = params.get("schematicPath")
-
-            if not symbol_spec or ":" not in symbol_spec:
-                return {"success": False, "message": "symbol must be 'Library:SymbolName'"}
-
-            library_name, symbol_name = symbol_spec.split(":", 1)
-
-            project_path = None
-            if schematic_path:
-                project_path = Path(schematic_path).parent
-
-            loader = DynamicSymbolLoader(project_path=project_path)
-            try:
-                pins = loader.list_symbol_pins(library_name, symbol_name)
-            except ValueError as e:
-                suggestions = getattr(e, "suggestions", [])
-                return {
-                    "success": False,
-                    "message": str(e),
-                    "suggestions": suggestions,
-                }
-
-            return {
-                "success": True,
-                "symbol": symbol_spec,
-                "pin_count": len(pins),
-                "pins": pins,
-            }
-
-        except Exception as e:
-            logger.error(f"Error listing symbol pins: {str(e)}")
-            return {"success": False, "message": str(e)}
-
-    def _handle_batch_list_symbol_pins(self, params):
-        """List pin names, numbers, and types for multiple symbols in a single call."""
-        logger.info("Batch listing symbol pins")
-        try:
-            from commands.dynamic_symbol_loader import DynamicSymbolLoader
-            from pathlib import Path
-
-            symbols = params.get("symbols", [])
-            schematic_path = params.get("schematicPath")
-            compact = bool(params.get("compact", False))
-
-            if not symbols:
-                return {"success": False, "message": "symbols list is required"}
-
-            # Standard 2-pin symmetric passives that qualify for compact mode
-            COMPACT_SYMBOLS = {
-                "Device:R", "Device:R_Small", "Device:R_US",
-                "Device:C", "Device:C_Small", "Device:C_Polarized", "Device:C_Polarized_Small",
-                "Device:L", "Device:L_Small",
-                "Device:LED", "Device:D", "Device:D_Zener", "Device:D_Schottky",
-                "Device:Ferrite_Bead",
-            }
-
-            project_path = None
-            if schematic_path:
-                project_path = Path(schematic_path).parent
-
-            loader = DynamicSymbolLoader(project_path=project_path)
-            results = {}
-            errors = {}
-
-            for symbol_spec in symbols:
-                if ":" not in symbol_spec:
-                    errors[symbol_spec] = "symbol must be 'Library:SymbolName'"
-                    continue
-                library_name, symbol_name = symbol_spec.split(":", 1)
-                try:
-                    pins = loader.list_symbol_pins(library_name, symbol_name)
-                    # Compute body_bbox from pin positions in symbol-local coords (Y up, per lib convention).
-                    # Expand pin envelope by 1.27mm (50mil) on each side — same padding batch_add_components uses.
-                    pin_coords = [(p["x"], p["y"]) for p in pins if "x" in p]
-                    body_bbox = None
-                    if pin_coords:
-                        _pad = 1.27
-                        _xs = [c[0] for c in pin_coords]
-                        _ys = [c[1] for c in pin_coords]
-                        body_bbox = {
-                            "x_min": round(min(_xs) - _pad, 4),
-                            "y_min": round(min(_ys) - _pad, 4),
-                            "x_max": round(max(_xs) + _pad, 4),
-                            "y_max": round(max(_ys) + _pad, 4),
-                            "width": round(max(_xs) - min(_xs) + 2 * _pad, 4),
-                            "height": round(max(_ys) - min(_ys) + 2 * _pad, 4),
-                        }
-                    # Compact mode: omit per-pin detail for standard symmetric 2-pin passives
-                    is_symmetric_2pin = (
-                        len(pins) == 2 and
-                        (symbol_spec in COMPACT_SYMBOLS or
-                         (len(set(p.get("type", "") for p in pins)) == 1 and
-                          all(p.get("type", "") == "passive" for p in pins)))
-                    )
-                    if compact and is_symmetric_2pin:
-                        results[symbol_spec] = {
-                            "pin_count": len(pins),
-                            "body_bbox": body_bbox,
-                            "is_symmetric": True,
-                            "compact": True,
-                            "note": "Pin detail omitted (compact mode, symmetric 2-pin passive). Set compact=false to see individual pin coords.",
-                        }
-                    else:
-                        results[symbol_spec] = {"pins": pins, "pin_count": len(pins), "body_bbox": body_bbox}
-                except ValueError as e:
-                    suggestions = getattr(e, "suggestions", [])
-                    errors[symbol_spec] = {"message": str(e), "suggestions": suggestions}
-
-            return {
-                "success": len(errors) == 0,
-                "symbols": results,
-                "errors": errors if errors else None,
-            }
-
-        except Exception as e:
-            logger.error(f"Error in batch_list_symbol_pins: {str(e)}")
-            return {"success": False, "message": str(e)}
-
-    @staticmethod
-    def _get_sheet_usable_area(schematic_path):
-        """Return (left, top, right, bottom) usable area boundaries in mm for the schematic's paper size."""
-        # KiCad border frame is approximately 12.7mm from each edge
-        paper_dims = {
-            "A4": (297.0, 210.0),
-            "A3": (420.0, 297.0),
-            "A2": (594.0, 420.0),
-            "A1": (841.0, 594.0),
-            "A0": (1189.0, 841.0),
-            "A": (279.4, 215.9),   # US Letter
-            "B": (431.8, 279.4),   # US Tabloid
-            "C": (558.8, 431.8),
-            "D": (863.6, 558.8),
-            "E": (1117.6, 863.6),
-        }
-        border = 12.7
-        width, height = 297.0, 210.0  # default A4
-        try:
-            import re
-            with open(schematic_path, "r", encoding="utf-8") as f:
-                content = f.read(4096)  # Only need the header
-            m = re.search(r'\(paper\s+"([^"]+)"', content)
-            if m:
-                paper = m.group(1).strip()
-                if paper in paper_dims:
-                    width, height = paper_dims[paper]
-        except Exception:
-            pass
-        return (border, border, width - border, height - border)
-
     def _handle_get_schematic_pin_locations(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
-        """Return exact pin endpoint coordinates for one or more schematic components"""
+        """Return exact pin endpoint coordinates for a schematic component"""
         logger.info("Getting schematic pin locations")
         try:
             from pathlib import Path
@@ -3522,83 +2059,44 @@ class KiCADInterface:
             from commands.pin_locator import PinLocator
 
             schematic_path = params.get("schematicPath")
-            # Support both single 'reference' and batch 'references' list
-            references_param = params.get("references")
-            single_ref = params.get("reference")
-            if references_param:
-                references = list(references_param)
-            elif single_ref:
-                references = [single_ref]
-            else:
+            reference = params.get("reference")
+
+            if not all([schematic_path, reference]):
                 return {
                     "success": False,
-                    "message": "Missing required parameters: schematicPath and reference or references",
+                    "message": "Missing required parameters: schematicPath, reference",
                 }
 
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-
             locator = PinLocator()
-            sch_path = Path(schematic_path)
-            components_result = {}
+            all_pins = locator.get_all_symbol_pins(Path(schematic_path), reference)
 
-            # Sheet boundaries for near_boundary detection
-            left_b, top_b, right_b, bottom_b = KiCADInterface._get_sheet_usable_area(schematic_path)
-            near_threshold = 20.0
-            worst_case_label_mm = 15.0  # 10 chars × ~1.5mm/char
+            if not all_pins:
+                return {
+                    "success": False,
+                    "message": f"No pins found for {reference} — check reference and schematic path",
+                }
 
-            for reference in references:
-                all_pins = locator.get_all_symbol_pins(sch_path, reference)
-                if not all_pins:
-                    components_result[reference] = {}
-                    continue
+            # Enrich with pin names and angles from the symbol definition
+            pins_def = (
+                locator.get_symbol_pins(
+                    Path(schematic_path),
+                    locator._get_lib_id(Path(schematic_path), reference),
+                )
+                if hasattr(locator, "_get_lib_id")
+                else {}
+            )
 
-                lib_id = locator._get_lib_id(sch_path, reference) if hasattr(locator, "_get_lib_id") else None
-                pins_def = locator.get_symbol_pins(sch_path, lib_id) if lib_id else {}
+            result = {}
+            for pin_num, coords in all_pins.items():
+                entry = {"x": coords[0], "y": coords[1]}
+                if pin_num in pins_def:
+                    entry["name"] = pins_def[pin_num].get("name", pin_num)
+                    entry["angle"] = (
+                        locator.get_pin_angle(Path(schematic_path), reference, pin_num) or 0
+                    )
+                result[pin_num] = entry
 
-                pins_out = {}
-                for pin_num, coords in all_pins.items():
-                    px, py = coords[0], coords[1]
-                    entry = {"x": px, "y": py}
-                    if pin_num in pins_def:
-                        entry["name"] = pins_def[pin_num].get("name", pin_num)
-                    # Near-boundary detection: check left and top boundaries
-                    near_left = px - left_b < near_threshold
-                    near_top = py - top_b < near_threshold
-                    if near_left or near_top:
-                        entry["near_boundary"] = True
-                        if near_left:
-                            # Leftward label (angle=180) extends left from pin; needs pin_x - label_len >= left_b
-                            min_pin_x = left_b + worst_case_label_mm
-                            entry["suggested_component_x_offset"] = round(max(0.0, min_pin_x - px), 2)
-                    else:
-                        entry["near_boundary"] = False
-                    pins_out[pin_num] = entry
-                components_result[reference] = pins_out
-
-            # For backwards compatibility: if single ref was requested, also populate 'pins'
-            if single_ref and not references_param:
-                pins = components_result.get(single_ref, {})
-                if not pins:
-                    available_refs = []
-                    try:
-                        from skip import Schematic as SkipSchematic
-                        sch = SkipSchematic(schematic_path)
-                        available_refs = [
-                            s.property.Reference.value
-                            for s in sch.symbol
-                            if hasattr(s.property, "Reference")
-                            and not s.property.Reference.value.startswith("_TEMPLATE")
-                        ]
-                    except Exception:
-                        pass
-                    msg = f"No pins found for {single_ref} — check reference and schematic path"
-                    if available_refs:
-                        msg += f". Available references: {', '.join(sorted(set(available_refs)))}"
-                    return {"success": False, "message": msg}
-                return {"success": True, "reference": single_ref, "pins": pins, "components": components_result}
-
-            return {"success": True, "components": components_result}
+            return {"success": True, "reference": reference, "pins": result}
 
         except Exception as e:
             logger.error(f"Error getting pin locations: {e}")
@@ -3608,90 +2106,11 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_get_schematic_view(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Get a rasterised image of the schematic (SVG export → PNG conversion).
-
-        Always renders on a white background so the image is immediately readable.
-        """
+        """Get a rasterised image of the schematic (SVG export → optional PNG conversion)"""
         logger.info("Getting schematic view")
         import base64
         import subprocess
         import tempfile
-        import base64
-        import re as _re
-
-        # Target pixels-per-mm for auto-sizing.  10 px/mm ≈ 254 DPI on a standard
-        # schematic — sharp enough to read labels without being excessively large.
-        _PX_PER_MM = 10
-
-        def _inject_white_background(svg_text):
-            """Insert a white <rect> covering the full viewBox as the first drawn element.
-            Returns (modified_svg_text, viewbox_width_mm, viewbox_height_mm)."""
-            vb_w = vb_h = None
-            m = _re.search(r'viewBox="([^"]+)"', svg_text)
-            if m:
-                parts = m.group(1).split()
-                try:
-                    vb_w, vb_h = float(parts[2]), float(parts[3])
-                    rect = f'<rect x="0" y="0" width="{vb_w}" height="{vb_h}" fill="white"/>'
-                    svg_text = _re.sub(r'(<(?:g|path|text|circle|rect|line|polyline|polygon)[^>]*>)', rect + r'\1', svg_text, count=1)
-                except (IndexError, ValueError):
-                    pass
-            return svg_text, vb_w, vb_h
-
-        def _crop_svg_to_content(svg_text, schematic_path_str, margin_mm=10.0):
-            """Rewrite the SVG viewBox/width/height to tightly fit schematic content.
-
-            Derives the content bounding box from component body_bboxes, component
-            positions, and label positions — which are reliable and exclude the
-            page-border frame drawn by KiCAD.  Falls back to the original SVG if
-            data cannot be obtained.
-            Returns (modified_svg, new_w_mm, new_h_mm) or the original string on failure.
-            """
-            xs, ys = [], []
-            try:
-                comp_result = self._handle_list_schematic_components({"schematicPath": schematic_path_str})
-                for comp in comp_result.get("components", []):
-                    ref = comp.get("reference", "")
-                    if ref.startswith("#") or ref.startswith("_"):
-                        continue
-                    bb = comp.get("body_bbox")
-                    if bb:
-                        xs += [bb["x_min"], bb["x_max"]]
-                        ys += [bb["y_min"], bb["y_max"]]
-                    else:
-                        px, py = comp["position"]["x"], comp["position"]["y"]
-                        xs.append(px); ys.append(py)
-                    # Include field text positions
-                    for fkey in ("ref_field", "value_field"):
-                        f = comp.get(fkey, {})
-                        if f.get("x") is not None:
-                            xs.append(f["x"]); ys.append(f["y"])
-
-                lbl_result = self._handle_list_schematic_labels({"schematicPath": schematic_path_str})
-                for lbl in lbl_result.get("labels", []):
-                    pos = lbl.get("position", {})
-                    if pos.get("x") is not None:
-                        xs.append(pos["x"]); ys.append(pos["y"])
-            except Exception:
-                pass
-
-            if not xs or not ys:
-                return svg_text
-
-            x_min = min(xs) - margin_mm
-            y_min = min(ys) - margin_mm
-            new_w = round(max(xs) - min(xs) + 2 * margin_mm, 4)
-            new_h = round(max(ys) - min(ys) + 2 * margin_mm, 4)
-
-            svg_text = _re.sub(r'viewBox="[^"]+"', f'viewBox="{x_min:.4f} {y_min:.4f} {new_w:.4f} {new_h:.4f}"', svg_text, count=1)
-            svg_text = _re.sub(r'(<svg[^>]*\s)width="[^"]+"', rf'\1width="{new_w:.4f}mm"', svg_text, count=1)
-            svg_text = _re.sub(r'(<svg[^>]*\s)height="[^"]+"', rf'\1height="{new_h:.4f}mm"', svg_text, count=1)
-            svg_text = _re.sub(
-                r'<rect x="[^"]*" y="[^"]*" width="[^"]*" height="[^"]*" fill="white"/>',
-                f'<rect x="{x_min:.4f}" y="{y_min:.4f}" width="{new_w:.4f}" height="{new_h:.4f}" fill="white"/>',
-                svg_text, count=1,
-            )
-            return svg_text, new_w, new_h
 
         try:
             schematic_path = params.get("schematicPath")
@@ -3702,14 +2121,12 @@ class KiCADInterface:
                 }
 
             fmt = params.get("format", "png")
-            # width/height are optional — if omitted, auto-sized from the SVG viewBox
-            explicit_width = params.get("width")
-            explicit_height = params.get("height")
-            # crop=True by default: trim the A4/letter page whitespace down to content
-            crop = params.get("crop", True)
+            width = params.get("width", 1200)
+            height = params.get("height", 900)
 
-            # Step 1: Export schematic to SVG via kicad-cli (transparent background)
+            # Step 1: Export schematic to SVG via kicad-cli
             with tempfile.TemporaryDirectory() as tmpdir:
+                svg_path = os.path.join(tmpdir, "schematic.svg")
                 cmd = [
                     "kicad-cli",
                     "sch",
@@ -3728,7 +2145,9 @@ class KiCADInterface:
                         "message": f"kicad-cli SVG export failed: {result.stderr}",
                     }
 
+                # kicad-cli may name the file after the schematic, find it
                 import glob
+
                 svg_files = glob.glob(os.path.join(tmpdir, "*.svg"))
                 if not svg_files:
                     return {
@@ -3737,75 +2156,26 @@ class KiCADInterface:
                     }
                 svg_path = svg_files[0]
 
-                with open(svg_path, "r", encoding="utf-8") as f:
-                    svg_data = f.read()
-
-                # Inject white background so the SVG is readable (transparent → black in cairosvg)
-                svg_data_white, vb_w, vb_h = _inject_white_background(svg_data)
-
-                # Crop SVG viewBox to content bounds (trims A4/letter page whitespace)
-                if crop:
-                    try:
-                        result_crop = _crop_svg_to_content(svg_data_white, schematic_path)
-                        if isinstance(result_crop, tuple):
-                            svg_data_white, vb_w, vb_h = result_crop
-                    except Exception as crop_svg_err:
-                        logger.warning(f"SVG crop failed: {crop_svg_err}")
-
                 if fmt == "svg":
-                    return {"success": True, "imageData": svg_data_white, "format": "svg"}
+                    with open(svg_path, "r", encoding="utf-8") as f:
+                        svg_data = f.read()
+                    return {"success": True, "imageData": svg_data, "format": "svg"}
 
                 # Step 2: Convert SVG to PNG using cairosvg
                 try:
                     from cairosvg import svg2png
                 except ImportError:
+                    # Fallback: return SVG data with a note
+                    with open(svg_path, "r", encoding="utf-8") as f:
+                        svg_data = f.read()
                     return {
                         "success": True,
-                        "imageData": svg_data_white,
+                        "imageData": svg_data,
                         "format": "svg",
                         "message": "cairosvg not installed — returning SVG instead of PNG. Install with: pip install cairosvg",
                     }
 
-                # Auto-size: scale so 1 mm = _PX_PER_MM pixels, preserving aspect ratio.
-                # Explicit width/height override this.
-                if explicit_width or explicit_height:
-                    width = int(explicit_width) if explicit_width else None
-                    height = int(explicit_height) if explicit_height else None
-                elif vb_w and vb_h:
-                    width = int(round(vb_w * _PX_PER_MM))
-                    height = int(round(vb_h * _PX_PER_MM))
-                else:
-                    width, height = 2400, 1800  # safe fallback
-
-                png_data = svg2png(
-                    bytestring=svg_data_white.encode("utf-8"),
-                    output_width=width,
-                    output_height=height,
-                )
-
-                # Crop to component bounding box if requested
-                if crop:
-                    try:
-                        from PIL import Image, ImageChops
-                        import io as _io
-                        img = Image.open(_io.BytesIO(png_data)).convert("RGB")
-                        bg = Image.new("RGB", img.size, (255, 255, 255))
-                        diff = ImageChops.difference(img, bg)
-                        bbox = diff.getbbox()
-                        if bbox:
-                            margin_px = max(20, int(min(img.width, img.height) * 0.04))
-                            left = max(0, bbox[0] - margin_px)
-                            top = max(0, bbox[1] - margin_px)
-                            right = min(img.width, bbox[2] + margin_px)
-                            bottom = min(img.height, bbox[3] + margin_px)
-                            img = img.crop((left, top, right, bottom))
-                        buf = _io.BytesIO()
-                        img.save(buf, format="PNG")
-                        png_data = buf.getvalue()
-                    except ImportError:
-                        logger.info("Pillow not installed — returning uncropped image (pip install Pillow to enable crop)")
-                    except Exception as crop_err:
-                        logger.warning(f"Crop failed: {crop_err}")
+                png_data = svg2png(url=svg_path, output_width=width, output_height=height)
 
                 return {
                     "success": True,
@@ -3825,7 +2195,6 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_list_schematic_components(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """List all components in a schematic"""
         logger.info("Listing schematic components")
         try:
@@ -3848,15 +2217,10 @@ class KiCADInterface:
             if not schematic:
                 return {"success": False, "message": "Failed to load schematic"}
 
-            # Read raw content once for property extraction
-            with open(sch_file, "r", encoding="utf-8") as f:
-                raw_content = f.read()
-
-            # Optional filters and display options
+            # Optional filters
             filter_params = params.get("filter", {})
             lib_id_filter = filter_params.get("libId", "")
             ref_prefix_filter = filter_params.get("referencePrefix", "")
-            compact = bool(params.get("compact", False))
 
             locator = PinLocator()
             components = []
@@ -3894,28 +2258,6 @@ class KiCADInterface:
                     "uuid": str(uuid_val),
                 }
 
-                if not compact:
-                    # Extract all KiCad properties (MPN, Description, Manufacturer, etc.)
-                    # and Reference/Value field positions
-                    try:
-                        block_text, _, _ = KiCADInterface._find_placed_symbol_block(
-                            raw_content, ref
-                        )
-                        if block_text:
-                            comp["properties"] = KiCADInterface._extract_component_properties(
-                                block_text
-                            )
-                            ref_pos = KiCADInterface._extract_property_position(block_text, "Reference")
-                            if ref_pos:
-                                ref_pos["visible"] = KiCADInterface._extract_property_visible(block_text, "Reference")
-                                comp["ref_field"] = ref_pos
-                            val_pos = KiCADInterface._extract_property_position(block_text, "Value")
-                            if val_pos:
-                                val_pos["visible"] = KiCADInterface._extract_property_visible(block_text, "Value")
-                                comp["value_field"] = val_pos
-                    except Exception:
-                        pass
-
                 # Get pins if available
                 try:
                     all_pins = locator.get_all_symbol_pins(sch_file, ref)
@@ -3931,16 +2273,6 @@ class KiCADInterface:
                                 pin_info["name"] = pins_def[pin_num].get("name", pin_num)
                             pin_list.append(pin_info)
                         comp["pins"] = pin_list
-                        if pin_list:
-                            xs = [p["position"]["x"] for p in pin_list]
-                            ys = [p["position"]["y"] for p in pin_list]
-                            if not compact:
-                                comp["bounds"] = {"minX": min(xs), "maxX": max(xs), "minY": min(ys), "maxY": max(ys)}
-                            pad = 1.27
-                            comp["body_bbox"] = {
-                                "x_min": min(xs) - pad, "y_min": min(ys) - pad,
-                                "x_max": max(xs) + pad, "y_max": max(ys) + pad,
-                            }
                 except Exception:
                     pass  # Pin lookup is best-effort
 
@@ -3955,763 +2287,20 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
-    def _handle_check_schematic_layout(self, params):
-        """Analyze a schematic for layout violations: out-of-bounds, overlaps, misplaced text."""
-        logger.info("Checking schematic layout")
-        try:
-            from pathlib import Path
-
-            schematic_path = params.get("schematicPath")
-            autofix = params.get("autofix", False)
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-
-            sch_file = Path(schematic_path)
-            if not sch_file.exists():
-                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
-
-            # Get sheet usable area
-            left_b, top_b, right_b, bottom_b = KiCADInterface._get_sheet_usable_area(schematic_path)
-
-            # Load components (re-use list handler logic)
-            comp_result = self._handle_list_schematic_components({"schematicPath": schematic_path})
-            if not comp_result.get("success"):
-                return comp_result
-            components = comp_result.get("components", [])
-
-            # Load labels for out-of-bounds label check
-            labels_result = self._handle_list_schematic_labels({"schematicPath": schematic_path})
-            labels = labels_result.get("labels", []) if labels_result.get("success") else []
-
-            violations = []
-            chars_per_mm = 1.5  # approximate mm per character
-            worst_case_chars = 10
-
-            def bbox_overlaps(a, b, margin=0.0):
-                return (a["x_min"] - margin < b["x_max"] and a["x_max"] + margin > b["x_min"] and
-                        a["y_min"] - margin < b["y_max"] and a["y_max"] + margin > b["y_min"])
-
-            def point_in_bbox(px, py, bbox):
-                return bbox["x_min"] <= px <= bbox["x_max"] and bbox["y_min"] <= py <= bbox["y_max"]
-
-            # Build index of body_bbox per component
-            comp_bboxes = {}
-            for c in components:
-                if "body_bbox" in c:
-                    comp_bboxes[c["reference"]] = c["body_bbox"]
-                else:
-                    # Fall back to position ± small pad
-                    cx, cy = c["position"]["x"], c["position"]["y"]
-                    comp_bboxes[c["reference"]] = {"x_min": cx - 2.54, "y_min": cy - 2.54, "x_max": cx + 2.54, "y_max": cy + 2.54}
-
-            # 1. Out-of-bounds components
-            for c in components:
-                bb = comp_bboxes.get(c["reference"])
-                if bb:
-                    if bb["x_min"] < left_b or bb["x_max"] > right_b or bb["y_min"] < top_b or bb["y_max"] > bottom_b:
-                        violations.append({
-                            "type": "out_of_bounds_component",
-                            "affected_refs": [c["reference"]],
-                            "position": c["position"],
-                            "description": f"{c['reference']} body bbox [{bb['x_min']:.1f},{bb['y_min']:.1f},{bb['x_max']:.1f},{bb['y_max']:.1f}] extends outside sheet usable area [{left_b},{top_b},{right_b},{bottom_b}]",
-                        })
-
-            # 2. Out-of-bounds labels (estimate text endpoint based on angle and length)
-            for lbl in labels:
-                if lbl.get("type") not in ("net", "global"):
-                    continue
-                name = lbl.get("name", "")
-                lx = lbl["position"]["x"]
-                ly = lbl["position"]["y"]
-                angle = lbl.get("angle", 0)
-                text_len = len(name) * chars_per_mm
-                import math
-                rad = math.radians(angle)
-                end_x = lx + text_len * math.cos(rad)
-                end_y = ly + text_len * math.sin(rad)
-                out = (
-                    min(lx, end_x) < left_b or max(lx, end_x) > right_b or
-                    min(ly, end_y) < top_b or max(ly, end_y) > bottom_b
-                )
-                if out:
-                    violations.append({
-                        "type": "out_of_bounds_label",
-                        "affected_refs": [name],
-                        "position": lbl["position"],
-                        "description": f"Label '{name}' at ({lx:.1f},{ly:.1f}) angle={angle} estimated endpoint ({end_x:.1f},{end_y:.1f}) extends outside sheet boundary",
-                    })
-
-            # 3. Overlapping component bodies (within 2mm)
-            ref_list = list(comp_bboxes.keys())
-            for i in range(len(ref_list)):
-                for j in range(i + 1, len(ref_list)):
-                    ra, rb = ref_list[i], ref_list[j]
-                    if bbox_overlaps(comp_bboxes[ra], comp_bboxes[rb], margin=2.0):
-                        violations.append({
-                            "type": "overlapping_components",
-                            "affected_refs": [ra, rb],
-                            "position": None,
-                            "description": f"{ra} and {rb} body bounding boxes overlap or are within 2mm of each other",
-                        })
-
-            # 4. Ref/Val text inside parent component body.
-            # For all components, use the actual body_bbox (derived from pin extents).
-            # The suggested_fix mirrors the auto_position_fields logic: perpendicular to pin
-            # axis for 2-pin components; above/below body extent for multi-pin components.
-            for c in components:
-                parent_bb = comp_bboxes.get(c["reference"])
-                if not parent_bb:
-                    continue
-                cx_c = c["position"]["x"]
-                cy_c = c["position"]["y"]
-                _OFF = 2.54
-                _num_pins_c = len(c.get("pins", []))
-                # Determine suggested fix direction: same logic as auto_position_fields.
-                # 2-pin: check pin axis via bbox aspect ratio; multi-pin: above/below.
-                _bb_width = parent_bb["x_max"] - parent_bb["x_min"]
-                _bb_height = parent_bb["y_max"] - parent_bb["y_min"]
-                _vertical_axis = _bb_height > _bb_width  # True → pins top/bottom → labels left/right
-                for field_key, label in [("ref_field", "Reference"), ("value_field", "Value")]:
-                    field = c.get(field_key)
-                    if field and point_in_bbox(field["x"], field["y"], parent_bb):
-                        if _num_pins_c == 2 and _vertical_axis:
-                            # Vertical pin axis → labels left/right at angle=0
-                            _fix_x = round(cx_c - _OFF, 4) if label == "Reference" else round(cx_c + _OFF, 4)
-                            _fix_y = cy_c
-                            _fix_angle = 0
-                        elif _num_pins_c == 2 and not _vertical_axis:
-                            # Horizontal pin axis → labels above/below at angle=0
-                            _fix_x = cx_c
-                            _fix_y = round(cy_c - _OFF, 4) if label == "Reference" else round(cy_c + _OFF, 4)
-                            _fix_angle = 0
-                        else:
-                            # Multi-pin: above topmost / below bottommost
-                            _fix_x = cx_c
-                            _fix_y = round(parent_bb["y_min"] - _OFF, 4) if label == "Reference" else round(parent_bb["y_max"] + _OFF, 4)
-                            _fix_angle = 0
-                        violations.append({
-                            "type": "text_inside_parent_body",
-                            "affected_refs": [c["reference"]],
-                            "position": {"x": field["x"], "y": field["y"]},
-                            "description": f"{c['reference']} {label} text at ({field['x']},{field['y']}) is inside its own body bbox",
-                            "suggested_fix": {"reference": c["reference"], "property": label,
-                                              "x": _fix_x, "y": _fix_y, "angle": _fix_angle},
-                        })
-
-            # 5. Ref/Val text overlapping another component's body
-            for c in components:
-                for field_key, label in [("ref_field", "Reference"), ("value_field", "Value")]:
-                    field = c.get(field_key)
-                    if not field:
-                        continue
-                    for other_ref, other_bb in comp_bboxes.items():
-                        if other_ref == c["reference"]:
-                            continue
-                        if point_in_bbox(field["x"], field["y"], other_bb):
-                            violations.append({
-                                "type": "text_overlaps_other_body",
-                                "affected_refs": [c["reference"], other_ref],
-                                "position": {"x": field["x"], "y": field["y"]},
-                                "description": f"{c['reference']} {label} text at ({field['x']},{field['y']}) overlaps body of {other_ref}",
-                            })
-
-            # 6. Field text bounding-box overlap between different components.
-            # Estimate text bbox: width ≈ num_chars × 0.75mm (at 1.27mm font), height = 1.5mm.
-            # Only checks Reference and Value fields (hidden fields are excluded).
-            # Uses a simple axis-aligned bbox — text angle is ignored for speed.
-            CHAR_WIDTH_MM = 0.75  # approx glyph advance for 1.27mm KiCAD font
-            TEXT_HEIGHT_MM = 1.5  # generous height including descenders
-            FIELD_OVERLAP_MARGIN = 0.5  # mm gap still triggers a warning
-
-            def field_text_bbox(fx, fy, text):
-                half_w = max(len(str(text)) * CHAR_WIDTH_MM / 2.0, 1.0)
-                half_h = TEXT_HEIGHT_MM / 2.0
-                return {
-                    "x_min": fx - half_w,
-                    "x_max": fx + half_w,
-                    "y_min": fy - half_h,
-                    "y_max": fy + half_h,
-                }
-
-            # Build flat list of (ref, field_label, text_value, x, y) for visible fields
-            all_fields = []
-            for c in components:
-                for field_key, label in [("ref_field", "Reference"), ("value_field", "Value")]:
-                    field = c.get(field_key)
-                    if not field:
-                        continue
-                    if field.get("visible") is False:
-                        continue
-                    text_val = c["reference"] if label == "Reference" else c.get("value", "")
-                    all_fields.append((c["reference"], label, text_val, field["x"], field["y"]))
-
-            for i in range(len(all_fields)):
-                ref_a, lbl_a, txt_a, fx_a, fy_a = all_fields[i]
-                bb_a = field_text_bbox(fx_a, fy_a, txt_a)
-                for j in range(i + 1, len(all_fields)):
-                    ref_b, lbl_b, txt_b, fx_b, fy_b = all_fields[j]
-                    bb_b = field_text_bbox(fx_b, fy_b, txt_b)
-                    if bbox_overlaps(bb_a, bb_b, margin=FIELD_OVERLAP_MARGIN):
-                        # Suggest moving field_a away from field_b by 2.54mm
-                        import math as _math
-                        _dx = fx_a - fx_b
-                        _dy = fy_a - fy_b
-                        _dist = _math.sqrt(_dx * _dx + _dy * _dy) or 1.0
-                        _sep = 3.0  # mm to separate them
-                        _fix_x_a = round(fx_a + _sep * _dx / _dist, 4)
-                        _fix_y_a = round(fy_a + _sep * _dy / _dist, 4)
-                        violations.append({
-                            "type": "field_text_overlap",
-                            "affected_refs": [ref_a, ref_b],
-                            "position": {"x": (fx_a + fx_b) / 2, "y": (fy_a + fy_b) / 2},
-                            "description": (
-                                f"{ref_a}.{lbl_a} text at ({fx_a},{fy_a}) overlaps "
-                                f"{ref_b}.{lbl_b} text at ({fx_b},{fy_b})"
-                            ),
-                            "suggested_fix": {"reference": ref_a, "property": lbl_a,
-                                              "x": _fix_x_a, "y": _fix_y_a, "angle": 0},
-                        })
-
-            # 7. Net label proximity / overlap.
-            # Estimate the text bounding box for each net/global label based on its
-            # position, text length, and angle.  Flag pairs whose text boxes overlap
-            # or are within LABEL_GAP_MM of each other — these render as illegible
-            # clutter (e.g. two "VBUS" labels facing each other on adjacent pin tips).
-            LABEL_CHAR_WIDTH = 1.27   # mm per character at KiCad default 1.27mm font
-            LABEL_HALF_HEIGHT = 0.7   # half the label text height (generous)
-            LABEL_GAP_MM = 0.5        # minimum required gap between label text boxes
-
-            def label_text_bbox(lx, ly, name, angle):
-                tw = max(len(name), 1) * LABEL_CHAR_WIDTH
-                hh = LABEL_HALF_HEIGHT
-                a = int(round(angle)) % 360
-                if a == 0:    # text extends right
-                    return {"x_min": lx,      "y_min": ly - hh, "x_max": lx + tw,  "y_max": ly + hh}
-                if a == 180:  # text extends left
-                    return {"x_min": lx - tw, "y_min": ly - hh, "x_max": lx,       "y_max": ly + hh}
-                if a == 90:   # text extends upward (smaller y)
-                    return {"x_min": lx - hh, "y_min": ly - tw, "x_max": lx + hh,  "y_max": ly}
-                if a == 270:  # text extends downward (larger y)
-                    return {"x_min": lx - hh, "y_min": ly,      "x_max": lx + hh,  "y_max": ly + tw}
-                # Arbitrary angle: use a square approximation
-                import math
-                rad = math.radians(angle)
-                ex = lx + tw * math.cos(rad)
-                ey = ly + tw * math.sin(rad)
-                return {
-                    "x_min": min(lx, ex) - hh, "y_min": min(ly, ey) - hh,
-                    "x_max": max(lx, ex) + hh, "y_max": max(ly, ey) + hh,
-                }
-
-            net_labels_for_check = [l for l in labels if l.get("type") in ("net", "global")]
-            label_bb_list = [
-                (lbl, label_text_bbox(
-                    lbl["position"]["x"], lbl["position"]["y"],
-                    lbl.get("name", ""), lbl.get("angle", 0)))
-                for lbl in net_labels_for_check
-            ]
-            for i in range(len(label_bb_list)):
-                lbl_a, bb_a = label_bb_list[i]
-                for j in range(i + 1, len(label_bb_list)):
-                    lbl_b, bb_b = label_bb_list[j]
-                    if bbox_overlaps(bb_a, bb_b, margin=LABEL_GAP_MM):
-                        same_net = lbl_a.get("name") == lbl_b.get("name")
-                        # For exact-coordinate duplicates (same net, within 0.3mm):
-                        # suggest deleting one of the labels.
-                        _dist = ((lbl_a["position"]["x"] - lbl_b["position"]["x"]) ** 2 +
-                                 (lbl_a["position"]["y"] - lbl_b["position"]["y"]) ** 2) ** 0.5
-                        is_duplicate = same_net and _dist < 0.3
-
-                        violation: dict = {
-                            "type": "label_overlap",
-                            "affected_refs": [lbl_a.get("name"), lbl_b.get("name")],
-                            "position": {
-                                "x": (lbl_a["position"]["x"] + lbl_b["position"]["x"]) / 2,
-                                "y": (lbl_a["position"]["y"] + lbl_b["position"]["y"]) / 2,
-                            },
-                            "description": (
-                                f"Label '{lbl_a['name']}' at "
-                                f"({lbl_a['position']['x']},{lbl_a['position']['y']}) "
-                                f"angle={lbl_a.get('angle',0)} overlaps or is too close to "
-                                f"label '{lbl_b['name']}' at "
-                                f"({lbl_b['position']['x']},{lbl_b['position']['y']}) "
-                                f"angle={lbl_b.get('angle',0)} — "
-                                + ("exact duplicate label: delete one using delete_schematic_net_label"
-                                   if is_duplicate else
-                                   "move the components further apart or use a shared net label")
-                            ),
-                        }
-                        if is_duplicate:
-                            # Suggest deleting the second label (lbl_b)
-                            violation["suggested_delete_label"] = {
-                                "net": lbl_b.get("name"),
-                                "position": lbl_b["position"],
-                                "angle": lbl_b.get("angle", 0),
-                                "action": "delete_schematic_net_label",
-                            }
-                        violations.append(violation)
-
-            # 8. Stray wire detection.
-            # Parse all wire segments from the schematic; collect every endpoint.
-            # A wire endpoint is "dangling" if no other wire endpoint, pin tip, net
-            # label, junction, or no_connect marker sits within tolerance of it.
-            # An isolated wire (both endpoints dangling) is reported as stray_wire.
-            try:
-                import sexpdata as _swd
-                from sexpdata import Symbol as _SwSym
-                with open(schematic_path, "r", encoding="utf-8") as _wf:
-                    _sch_sexp = _swd.loads(_wf.read())
-
-                _WIRE_TOL = 0.3  # mm — snap-grid tolerance
-
-                # Collect wire endpoints: list of (x, y) tuples
-                wire_segments = []  # [(x1,y1,x2,y2), ...]
-                wire_endpoints = []
-                for _item in _sch_sexp:
-                    if not (isinstance(_item, list) and len(_item) > 0
-                            and _item[0] == _SwSym("wire")):
-                        continue
-                    _pts = next(
-                        (p for p in _item if isinstance(p, list) and len(p) > 0
-                         and p[0] == _SwSym("pts")), None
-                    )
-                    if not _pts:
-                        continue
-                    xy_items = [p for p in _pts if isinstance(p, list) and len(p) >= 3
-                                and p[0] == _SwSym("xy")]
-                    if len(xy_items) >= 2:
-                        x1, y1 = float(xy_items[0][1]), float(xy_items[0][2])
-                        x2, y2 = float(xy_items[1][1]), float(xy_items[1][2])
-                        wire_segments.append((x1, y1, x2, y2))
-                        wire_endpoints.append((x1, y1))
-                        wire_endpoints.append((x2, y2))
-
-                if wire_segments:
-                    # Build connected-point set: all pin tips + label positions + junctions
-                    connected_pts: set = set()
-
-                    # Pin tips for all placed components
-                    try:
-                        from commands.pin_locator import PinLocator as _SPL
-                        _sl = _SPL()
-                        for _sc in schematic.symbol:
-                            if not hasattr(_sc.property, "Reference"):
-                                continue
-                            _sref = _sc.property.Reference.value
-                            if _sref.startswith("_TEMPLATE") or _sref.startswith("#"):
-                                continue
-                            _spins = _sl.get_all_symbol_pins(sch_path, _sref) or {}
-                            for _sp in _spins.values():
-                                _spx = float(_sp[0]) if isinstance(_sp, (list, tuple)) else float(_sp["x"])
-                                _spy = float(_sp[1]) if isinstance(_sp, (list, tuple)) else float(_sp["y"])
-                                connected_pts.add((round(_spx, 2), round(_spy, 2)))
-                    except Exception as _pe:
-                        logger.warning(f"Stray wire: pin collection failed: {_pe}")
-
-                    # Label positions
-                    for _lbl in labels:
-                        connected_pts.add((
-                            round(_lbl["position"]["x"], 2),
-                            round(_lbl["position"]["y"], 2),
-                        ))
-
-                    # Junctions
-                    for _item in _sch_sexp:
-                        if (isinstance(_item, list) and len(_item) > 0
-                                and _item[0] == _SwSym("junction")):
-                            _at = next(
-                                (p for p in _item if isinstance(p, list) and len(p) >= 3
-                                 and p[0] == _SwSym("at")), None
-                            )
-                            if _at:
-                                connected_pts.add((round(float(_at[1]), 2), round(float(_at[2]), 2)))
-
-                    # All other wire endpoints are also valid connection points
-                    all_wire_pt_keys = {(round(x, 2), round(y, 2)) for x, y in wire_endpoints}
-
-                    def _is_connected(ex, ey):
-                        """True if (ex, ey) has any connection other than just being a wire endpoint."""
-                        ex_r, ey_r = round(ex, 2), round(ey, 2)
-                        # Check against pins and labels
-                        for cx, cy in connected_pts:
-                            if abs(ex_r - cx) <= _WIRE_TOL and abs(ey_r - cy) <= _WIRE_TOL:
-                                return True
-                        # Count how many wire endpoints share this coordinate
-                        count = sum(
-                            1 for (wx, wy) in wire_endpoints
-                            if abs(round(wx, 2) - ex_r) <= _WIRE_TOL
-                            and abs(round(wy, 2) - ey_r) <= _WIRE_TOL
-                        )
-                        # Connected if 2+ wire endpoints share this point (T/cross junction)
-                        return count >= 2
-
-                    for x1, y1, x2, y2 in wire_segments:
-                        d1 = _is_connected(x1, y1)
-                        d2 = _is_connected(x2, y2)
-                        if not d1 and not d2:
-                            violations.append({
-                                "type": "stray_wire",
-                                "affected_refs": [],
-                                "position": {"x": (x1 + x2) / 2, "y": (y1 + y2) / 2},
-                                "description": (
-                                    f"Isolated wire from ({x1:.2f},{y1:.2f}) to ({x2:.2f},{y2:.2f}) "
-                                    "has no connection at either endpoint — likely a leftover from a deleted component. "
-                                    "Delete it with delete_schematic_wire."
-                                ),
-                            })
-                        elif not d1:
-                            violations.append({
-                                "type": "stray_wire",
-                                "affected_refs": [],
-                                "position": {"x": x1, "y": y1},
-                                "description": (
-                                    f"Wire endpoint at ({x1:.2f},{y1:.2f}) has no connection "
-                                    "(no pin, label, junction, or other wire). "
-                                    "Delete the wire or extend it to connect to a pin."
-                                ),
-                            })
-                        elif not d2:
-                            violations.append({
-                                "type": "stray_wire",
-                                "affected_refs": [],
-                                "position": {"x": x2, "y": y2},
-                                "description": (
-                                    f"Wire endpoint at ({x2:.2f},{y2:.2f}) has no connection "
-                                    "(no pin, label, junction, or other wire). "
-                                    "Delete the wire or extend it to connect to a pin."
-                                ),
-                            })
-            except Exception as _we:
-                logger.warning(f"Stray wire check failed: {_we}")
-
-            autofix_applied = []
-            autofix_failed = []
-            if autofix:
-                fixable = [v["suggested_fix"] for v in violations if "suggested_fix" in v]
-                if fixable:
-                    fix_result = self._handle_batch_set_schematic_property_positions({
-                        "schematicPath": schematic_path,
-                        "updates": fixable,
-                    })
-                    autofix_applied = fix_result.get("applied", [])
-                    autofix_failed = fix_result.get("failed", [])
-                    # Remove violations whose fix was applied
-                    applied_keys = {(a["reference"], a["property"]) for a in autofix_applied}
-                    violations = [
-                        v for v in violations
-                        if "suggested_fix" not in v or
-                        (v["suggested_fix"]["reference"], v["suggested_fix"]["property"]) not in applied_keys
-                    ]
-
-            result = {
-                "success": True,
-                "violations": violations,
-                "violation_count": len(violations),
-                "sheet_usable_area": {"left": left_b, "top": top_b, "right": right_b, "bottom": bottom_b},
-            }
-            if autofix:
-                result["autofix_applied_count"] = len(autofix_applied)
-                result["autofix_failed_count"] = len(autofix_failed)
-                if autofix_failed:
-                    result["autofix_failed"] = autofix_failed
-            return result
-
-        except Exception as e:
-            logger.error(f"Error in check_schematic_layout: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
-    def _handle_autoplace_schematic_fields(self, params):
-        """Re-position Reference and Value fields so they sit outside the component body
-        AND outside any net labels hanging off its pins.
-
-        Algorithm for each component:
-        1. Compute the 'extended body bbox' = body_bbox union the bboxes of all net labels
-           whose connection point (at) is within 0.5 mm of a pin tip.
-        2. For 2-pin components: use pin-axis direction (same heuristic as batch_add_components).
-           For multi-pin: prefer above/below; if that collides with another component's
-           extended bbox, try left/right.
-        3. Field centres are placed at extended_bbox_edge + CLEARANCE, snapped to the 50-mil grid.
-        """
-        logger.info("Auto-placing schematic fields")
-        try:
-            from pathlib import Path
-            from commands.pin_locator import PinLocator
-
-            _GRID = 1.27  # 50-mil KiCad schematic grid (mm)
-            def _snap(val: float) -> float:
-                return round(round(val / _GRID) * _GRID, 4)
-
-            schematic_path = params.get("schematicPath")
-            references_filter = params.get("references")  # optional list of refs to limit scope
-            clearance = float(params.get("clearance", _GRID))  # mm gap between ext bbox edge and field text; default one grid unit
-
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-
-            sch_path = Path(schematic_path)
-            if not sch_path.exists():
-                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
-
-            # --- helpers ---
-            CHARS_PER_MM = 1.5      # conservative label extent per character
-            TEXT_HEIGHT = 1.27      # mm — KiCad default font height
-
-            def _label_bbox(lx, ly, angle, name):
-                """Estimate the bounding box of a net label's text."""
-                length = max(len(name), 1) * CHARS_PER_MM
-                # Add a small stub/chevron allowance (≈ 1 mm)
-                length += 1.0
-                half_h = TEXT_HEIGHT / 2.0
-                a = round(angle / 90) * 90 % 360
-                if a == 0:    # extends right
-                    return {"x_min": lx, "y_min": ly - half_h, "x_max": lx + length, "y_max": ly + half_h}
-                elif a == 90:  # extends up (smaller Y)
-                    return {"x_min": lx - half_h, "y_min": ly - length, "x_max": lx + half_h, "y_max": ly}
-                elif a == 180: # extends left
-                    return {"x_min": lx - length, "y_min": ly - half_h, "x_max": lx, "y_max": ly + half_h}
-                else:          # 270 — extends down (larger Y)
-                    return {"x_min": lx - half_h, "y_min": ly, "x_max": lx + half_h, "y_max": ly + length}
-
-            def _union(bb, other):
-                return {
-                    "x_min": min(bb["x_min"], other["x_min"]),
-                    "y_min": min(bb["y_min"], other["y_min"]),
-                    "x_max": max(bb["x_max"], other["x_max"]),
-                    "y_max": max(bb["y_max"], other["y_max"]),
-                }
-
-            def _overlaps(bb_a, bb_b, margin=0.0):
-                return (bb_a["x_min"] - margin < bb_b["x_max"] and
-                        bb_a["x_max"] + margin > bb_b["x_min"] and
-                        bb_a["y_min"] - margin < bb_b["y_max"] and
-                        bb_a["y_max"] + margin > bb_b["y_min"])
-
-            def _field_bbox(fx, fy, text):
-                half_w = max(len(str(text)), 1) * 0.75 / 2.0
-                half_h = TEXT_HEIGHT / 2.0
-                return {"x_min": fx - half_w, "y_min": fy - half_h,
-                        "x_max": fx + half_w, "y_max": fy + half_h}
-
-            # --- load data ---
-            comp_result = self._handle_list_schematic_components({"schematicPath": schematic_path})
-            if not comp_result.get("success"):
-                return comp_result
-            components = comp_result.get("components", [])
-            if references_filter:
-                components = [c for c in components if c["reference"] in references_filter]
-
-            labels_result = self._handle_list_schematic_labels({"schematicPath": schematic_path})
-            all_labels = labels_result.get("labels", []) if labels_result.get("success") else []
-            # Only consider net and global labels (not power symbols)
-            net_labels = [l for l in all_labels if l.get("type") in ("net", "global")]
-
-            locator = PinLocator()
-
-            # --- build extended bboxes ---
-            comp_ext_bboxes = {}   # ref -> extended bbox (body + label extents)
-            comp_body_bboxes = {}  # ref -> body bbox only (for collision avoidance)
-            comp_pin_map = {}      # ref -> {pin_num: [x, y]}
-
-            for comp in components:
-                ref = comp["reference"]
-                cx = comp["position"]["x"]
-                cy = comp["position"]["y"]
-                body_bb = comp.get("body_bbox") or {
-                    "x_min": cx - 2.54, "y_min": cy - 2.54,
-                    "x_max": cx + 2.54, "y_max": cy + 2.54
-                }
-                comp_body_bboxes[ref] = body_bb
-                ext_bb = dict(body_bb)
-
-                # Get pin positions (from cached list result if available, else locator)
-                pin_list = comp.get("pins", [])
-                all_pins = {}
-                if pin_list:
-                    for p in pin_list:
-                        pnum = str(p.get("number", p.get("name", "")))
-                        px = p.get("x", p.get("position", {}).get("x", cx))
-                        py = p.get("y", p.get("position", {}).get("y", cy))
-                        all_pins[pnum] = [float(px), float(py)]
-                else:
-                    all_pins = locator.get_all_symbol_pins(sch_path, ref) or {}
-
-                comp_pin_map[ref] = all_pins
-
-                # Expand ext_bb with each net label that sits at one of this component's pins
-                for lbl in net_labels:
-                    lx = lbl["position"]["x"]
-                    ly = lbl["position"]["y"]
-                    langle = lbl.get("angle", 0)
-                    lname = lbl.get("name", "")
-                    for pin_coords in all_pins.values():
-                        px = pin_coords[0] if isinstance(pin_coords, (list, tuple)) else pin_coords["x"]
-                        py = pin_coords[1] if isinstance(pin_coords, (list, tuple)) else pin_coords["y"]
-                        if abs(lx - px) < 0.6 and abs(ly - py) < 0.6:
-                            lb = _label_bbox(lx, ly, langle, lname)
-                            ext_bb = _union(ext_bb, lb)
-                            break
-
-                comp_ext_bboxes[ref] = ext_bb
-
-            # --- compute field positions ---
-            updates = []
-            # Track bboxes of fields already committed, so later components avoid them.
-            placed_field_bboxes = []
-
-            def _has_collision(ref_bb, val_bb, exclude_ref):
-                """Return True if ref_bb or val_bb overlaps any other component extended
-                bbox (body + attached labels) or any already-placed field."""
-                for other_ref, other_ext in comp_ext_bboxes.items():
-                    if other_ref == exclude_ref:
-                        continue
-                    if _overlaps(ref_bb, other_ext, 0.3) or _overlaps(val_bb, other_ext, 0.3):
-                        return True
-                for fb in placed_field_bboxes:
-                    if _overlaps(ref_bb, fb, 0.2) or _overlaps(val_bb, fb, 0.2):
-                        return True
-                return False
-
-            for comp in components:
-                ref = comp["reference"]
-                lib_id = comp.get("libId", "")
-                # Skip internal power net symbols (hidden by design)
-                if ref.startswith("#") or ref.startswith("_TEMPLATE"):
-                    continue
-
-                cx = comp["position"]["x"]
-                cy = comp["position"]["y"]
-                val_text = comp.get("value", ref)
-
-                # Determine effective bounding box and pin count.
-                # Power symbols have no net labels and tiny bodies — use body_bb directly.
-                # Regular components use the pre-computed ext_bb (body + adjacent label extents).
-                is_power = lib_id.startswith("kicad_power:") or lib_id.startswith("power:")
-                if is_power:
-                    pwr_body = comp.get("body_bbox") or {
-                        "x_min": cx - 1.27, "y_min": cy - 1.27,
-                        "x_max": cx + 1.27, "y_max": cy + 1.27
-                    }
-                    ext_bb = dict(pwr_body)
-                    num_pins = 0  # no pin axis to consider; default to above/below
-                else:
-                    ext_bb = comp_ext_bboxes[ref]
-                    all_pins = comp_pin_map[ref]
-                    num_pins = len(all_pins)
-
-                # Determine priority order of sides to try.
-                # Both ref and val are placed on the SAME side, stacked (like KiCAD's built-in).
-                # 2-pin components: prefer the axis perpendicular to the pin axis so fields
-                # don't overlap the wires.  Multi-pin / power: prefer above/below.
-                if num_pins == 2:
-                    coords = list(all_pins.values())
-                    p1x = float(coords[0][0]) if isinstance(coords[0], (list, tuple)) else float(coords[0]["x"])
-                    p1y = float(coords[0][1]) if isinstance(coords[0], (list, tuple)) else float(coords[0]["y"])
-                    p2x = float(coords[1][0]) if isinstance(coords[1], (list, tuple)) else float(coords[1]["x"])
-                    p2y = float(coords[1][1]) if isinstance(coords[1], (list, tuple)) else float(coords[1]["y"])
-                    if abs(p1y - p2y) > abs(p1x - p2x):
-                        # Vertical pin axis → prefer right/left (fields beside the component)
-                        sides = ["right", "left", "above", "below"]
-                    else:
-                        # Horizontal pin axis → prefer above/below
-                        sides = ["above", "below", "right", "left"]
-                else:
-                    sides = ["above", "below", "right", "left"]
-
-                # Place both fields on the same side, stacked.
-                # For above/below: both centered at cx, ref closer to body, val further out.
-                # For right/left: both at same x offset, stacked around cy (ref above, val below).
-                def _try_side(side):
-                    half_ref_h = TEXT_HEIGHT / 2.0
-                    half_ref_w = max(len(ref), 1) * 0.75 / 2.0
-                    half_val_w = max(len(str(val_text)), 1) * 0.75 / 2.0
-                    # center-to-center distance between stacked fields
-                    stack = TEXT_HEIGHT
-
-                    if side == "above":
-                        ref_x = cx
-                        ref_y = _snap(ext_bb["y_min"] - half_ref_h - clearance)
-                        val_x = cx
-                        val_y = ref_y - stack      # exactly one stack-unit above ref
-                    elif side == "below":
-                        ref_x = cx
-                        ref_y = _snap(ext_bb["y_max"] + half_ref_h + clearance)
-                        val_x = cx
-                        val_y = ref_y + stack      # exactly one stack-unit below ref
-                    elif side == "right":
-                        x0 = ext_bb["x_max"] + clearance
-                        ref_x = _snap(x0 + half_ref_w)
-                        ref_y = _snap(cy)          # snap to grid at component centre
-                        val_x = _snap(x0 + half_val_w)
-                        val_y = ref_y + stack      # exactly one stack-unit below (both on grid)
-                    else:  # left
-                        x0 = ext_bb["x_min"] - clearance
-                        ref_x = _snap(x0 - half_ref_w)
-                        ref_y = _snap(cy)
-                        val_x = _snap(x0 - half_val_w)
-                        val_y = ref_y + stack
-                    return ref_x, ref_y, val_x, val_y
-
-                # Try sides in priority order; take the first collision-free one.
-                ref_x = ref_y = val_x = val_y = ref_bb = val_bb = None
-                for side in sides:
-                    rx, ry, vx, vy = _try_side(side)
-                    rb = _field_bbox(rx, ry, ref)
-                    vb = _field_bbox(vx, vy, val_text)
-                    if not _has_collision(rb, vb, ref):
-                        ref_x, ref_y, val_x, val_y = rx, ry, vx, vy
-                        ref_bb, val_bb = rb, vb
-                        break
-                if ref_x is None:
-                    # Fall back to preferred side even with collision
-                    ref_x, ref_y, val_x, val_y = _try_side(sides[0])
-                    ref_bb = _field_bbox(ref_x, ref_y, ref)
-                    val_bb = _field_bbox(val_x, val_y, val_text)
-
-                # Commit these positions — future components will avoid them.
-                placed_field_bboxes.append(ref_bb)
-                placed_field_bboxes.append(val_bb)
-
-                updates.append({"reference": ref, "property": "Reference", "x": ref_x, "y": ref_y, "angle": 0})
-                updates.append({"reference": ref, "property": "Value",     "x": val_x, "y": val_y, "angle": 0})
-
-            if not updates:
-                return {"success": True, "message": "No components to update.", "updated_count": 0}
-
-            batch_result = self._handle_batch_set_schematic_property_positions({
-                "schematicPath": schematic_path,
-                "updates": updates,
-            })
-
-            applied = batch_result.get("applied_count", 0)
-            failed = batch_result.get("failed_count", 0)
-            return {
-                "success": batch_result.get("success", False),
-                "message": f"Auto-placed fields for {applied // 2} component(s) ({applied} fields updated{', ' + str(failed) + ' failed' if failed else ''}).",
-                "updated_count": applied,
-                "failed_count": failed,
-                "failed": batch_result.get("failed", []),
-            }
-
-        except Exception as e:
-            logger.error(f"Error in autoplace_schematic_fields: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
     def _handle_list_schematic_nets(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """List all NAMED nets in a schematic.
-
-        NOTE: Only lists nets that have at least one local or global net label.
-        Pins wired together via unlabeled wire segments will NOT appear here.
-        Use list_schematic_wires to verify physical connectivity of unlabeled wires,
-        or get_net_topology for full per-net trace.
-        """
+        """List all nets in a schematic with their connections"""
         logger.info("Listing schematic nets")
         try:
-            from pathlib import Path
-            from commands.pin_locator import PinLocator
+            from commands.wire_connectivity import (
+                _build_adjacency,
+                _discover_sub_sheets,
+                _load_sexp,
+                _parse_labels_sexp,
+                _parse_virtual_connections,
+                _parse_wires,
+                count_pins_on_net,
+                get_connections_for_net,
+            )
 
             schematic_path = params.get("schematicPath")
             if not schematic_path:
@@ -4721,61 +2310,66 @@ class KiCADInterface:
             if not schematic:
                 return {"success": False, "message": "Failed to load schematic"}
 
-            sch_path = Path(schematic_path)
-            locator = PinLocator()
+            # Collect net names from the top-level sheet using sexpdata.
+            # Falls back to kicad-skip's label collections when the file
+            # cannot be read (e.g. mocked schematics in unit tests).
+            net_names: set = set()
+            sexp_loaded = False
+            try:
+                sexp = _load_sexp(schematic_path)
+                sexp_loaded = True
+                _, label_to_points = _parse_labels_sexp(sexp)
+                net_names.update(label_to_points.keys())
+            except Exception as e:
+                logger.debug(
+                    f"Could not parse labels from {schematic_path} via sexp ({e}); "
+                    "falling back to kicad-skip label collections"
+                )
+                for attr in ("label", "global_label"):
+                    if not hasattr(schematic, attr):
+                        continue
+                    for label in getattr(schematic, attr):
+                        if hasattr(label, "value"):
+                            net_names.add(label.value)
 
-            # Get all net names from labels and global labels, tracking type
-            local_label_names = set()
-            global_label_names = set()
-            power_net_names = set()
-            if hasattr(schematic, "label"):
-                for label in schematic.label:
-                    if hasattr(label, "value"):
-                        local_label_names.add(label.value)
-            if hasattr(schematic, "global_label"):
-                for label in schematic.global_label:
-                    if hasattr(label, "value"):
-                        global_label_names.add(label.value)
-            if hasattr(schematic, "symbol"):
-                for sym in schematic.symbol:
+            # Collect net names from all sub-sheets (only when the parent
+            # sheet was readable; fake/mock paths skip recursion entirely).
+            if sexp_loaded:
+                sub_sheets = _discover_sub_sheets(schematic_path)
+                for sub_path in sub_sheets:
                     try:
-                        if (hasattr(sym, "property") and
-                                hasattr(sym.property, "Reference") and
-                                sym.property.Reference.value.startswith("#PWR") and
-                                hasattr(sym.property, "Value")):
-                            power_net_names.add(sym.property.Value.value)
-                    except Exception:
-                        pass
-            net_names = local_label_names | global_label_names
+                        sub_sexp = _load_sexp(sub_path)
+                        _, sub_label_to_points = _parse_labels_sexp(sub_sexp)
+                        net_names.update(sub_label_to_points.keys())
+                    except Exception as e:
+                        logger.warning(f"Error reading sub-sheet {sub_path}: {e}")
 
-            def _get_label_type(name):
-                if name in power_net_names:
-                    return "power"
-                if name in global_label_names:
-                    return "global"
-                return "local"
+            # Pre-build shared wire graph structures for efficiency
+            all_wires = _parse_wires(schematic)
+            if all_wires:
+                adjacency, iu_to_wires = _build_adjacency(all_wires)
+            else:
+                adjacency, iu_to_wires = [], {}
+            point_to_label, label_to_points = _parse_virtual_connections(schematic, schematic_path)
 
             nets = []
             for net_name in sorted(net_names):
-                connections = ConnectionManager.get_net_connections(
-                    schematic, net_name, sch_path
+                connections = get_connections_for_net(schematic, schematic_path, net_name)
+                pin_count = count_pins_on_net(
+                    schematic,
+                    schematic_path,
+                    net_name,
+                    all_wires,
+                    iu_to_wires,
+                    adjacency,
+                    point_to_label,
+                    label_to_points,
                 )
-                # Enrich each connection with pin name and type
-                for conn in connections:
-                    try:
-                        meta = locator.get_pin_metadata(
-                            sch_path, conn["component"], str(conn["pin"])
-                        )
-                        conn["pinName"] = meta.get("name", str(conn["pin"]))
-                        conn["pinType"] = meta.get("type", "unknown")
-                    except Exception:
-                        conn["pinName"] = str(conn["pin"])
-                        conn["pinType"] = "unknown"
                 nets.append(
                     {
                         "name": net_name,
-                        "labelType": _get_label_type(net_name),
                         "connections": connections,
+                        "connected_pin_count": pin_count,
                     }
                 )
 
@@ -4788,450 +2382,13 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
-    def _handle_find_single_pin_nets(self, params):
-        """Return all nets that have exactly one connected pin (dangling connections)."""
-        logger.info("Finding single-pin nets")
-        try:
-            from pathlib import Path
-            from commands.pin_locator import PinLocator
-
-            schematic_path = params.get("schematicPath")
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-
-            sch_path = Path(schematic_path)
-            if not sch_path.exists():
-                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
-
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
-
-            net_names = set()
-            for label in getattr(schematic, "label", []):
-                if hasattr(label, "value"):
-                    net_names.add(label.value)
-            for label in getattr(schematic, "global_label", []):
-                if hasattr(label, "value"):
-                    net_names.add(label.value)
-
-            locator = PinLocator()
-            single_pin_nets = []
-            for net_name in sorted(net_names):
-                connections = ConnectionManager.get_net_connections(
-                    schematic, net_name, sch_path
-                )
-                if len(connections) == 1:
-                    conn = connections[0]
-                    try:
-                        meta = locator.get_pin_metadata(
-                            sch_path, conn["component"], str(conn["pin"])
-                        )
-                        pin_name = meta.get("name", str(conn["pin"]))
-                    except Exception:
-                        pin_name = str(conn["pin"])
-                    single_pin_nets.append({
-                        "netName": net_name,
-                        "component": conn["component"],
-                        "pinNumber": str(conn["pin"]),
-                        "pinName": pin_name,
-                    })
-
-            return {
-                "success": True,
-                "singlePinNets": single_pin_nets,
-                "count": len(single_pin_nets),
-            }
-
-        except Exception as e:
-            logger.error(f"Error finding single-pin nets: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
-    def _handle_classify_nets(self, params):
-        """Classify all nets by type and return driver/load pin counts."""
-        logger.info("Classifying nets")
-        try:
-            import re
-            from pathlib import Path
-            from commands.pin_locator import PinLocator
-            from commands.connection_schematic import ConnectionManager as CM
-
-            schematic_path = params.get("schematicPath")
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-
-            sch_path = Path(schematic_path)
-            if not sch_path.exists():
-                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
-
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
-
-            # Build full netmap and invert to net_name -> [(ref, pin_num)]
-            netmap = CM.build_full_netmap(schematic, schematic_path)
-            nets_to_conns = {}
-            for (ref, pin_num), net_name in netmap.items():
-                nets_to_conns.setdefault(net_name, []).append((ref, pin_num))
-
-            # Also collect nets that may have labels but no matched pins
-            all_net_names = set()
-            for label in getattr(schematic, "label", []):
-                if hasattr(label, "value"):
-                    all_net_names.add(label.value)
-            for label in getattr(schematic, "global_label", []):
-                if hasattr(label, "value"):
-                    all_net_names.add(label.value)
-            # Add any nets found via netmap
-            all_net_names.update(nets_to_conns.keys())
-
-            locator = PinLocator()
-            _DRIVER_TYPES = {"output", "power_out", "tri_state", "open_collector", "open_emitter"}
-            _LOAD_TYPES = {"input", "passive", "power_in", "no_connect"}
-
-            classified = []
-            for net_name in sorted(all_net_names):
-                conns = nets_to_conns.get(net_name, [])
-                fanout = len(conns)
-                driver_count = 0
-                load_count = 0
-                has_pwr_symbol = False
-
-                for ref, pin_num in conns:
-                    if ref.startswith("#PWR") or ref.startswith("#FLG"):
-                        has_pwr_symbol = True
-                        continue
-                    try:
-                        meta = locator.get_pin_metadata(sch_path, ref, pin_num)
-                        ptype = meta.get("type", "")
-                        if ptype in _DRIVER_TYPES:
-                            driver_count += 1
-                        elif ptype in _LOAD_TYPES:
-                            load_count += 1
-                    except Exception:
-                        pass
-
-                # Classify (priority order: ground > power_rail > clock > diff_pair > signal)
-                net_upper = net_name.upper()
-                if re.match(r'^(A?D?P?S?GND|EARTH|AGND|DGND|PGND|SGND)', net_upper):
-                    net_type = "ground"
-                elif (
-                    has_pwr_symbol
-                    or re.match(
-                        r'^(\+?[\d]+V[\d]*[A-Z0-9_]*|VCC|VDD|VIN|VBAT|VREF|AVCC|DVCC|PVCC|3V3|5V|1V8|3\.3V|5\.0V)',
-                        net_upper,
-                    )
-                ):
-                    net_type = "power_rail"
-                elif re.search(r'(CLK|SCK|MCLK|XTAL|OSC)', net_upper):
-                    net_type = "clock"
-                elif (net_name.endswith("_P") or net_name.endswith("_N")) and (
-                    net_name[:-2] + "_N" in all_net_names
-                    or net_name[:-2] + "_P" in all_net_names
-                ):
-                    net_type = "differential_pair"
-                elif (net_name.endswith("+") or net_name.endswith("-")) and (
-                    net_name[:-1] + "-" in all_net_names
-                    or net_name[:-1] + "+" in all_net_names
-                ):
-                    net_type = "differential_pair"
-                else:
-                    net_type = "signal"
-
-                classified.append({
-                    "netName": net_name,
-                    "type": net_type,
-                    "fanout": fanout,
-                    "driverCount": driver_count,
-                    "loadCount": load_count,
-                })
-
-            return {"success": True, "nets": classified, "count": len(classified)}
-
-        except Exception as e:
-            logger.error(f"Error classifying nets: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
-    def _handle_get_net_graph(self, params):
-        """Return a compact component-to-component adjacency graph via named nets."""
-        logger.info("Building net graph")
-        try:
-            import re
-            from pathlib import Path
-            from commands.pin_locator import PinLocator
-
-            schematic_path = params.get("schematicPath")
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-
-            skip_power = params.get("skipPower", True)
-
-            sch_path = Path(schematic_path)
-            if not sch_path.exists():
-                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
-
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
-
-            net_names = set()
-            for label in getattr(schematic, "label", []):
-                if hasattr(label, "value"):
-                    net_names.add(label.value)
-            for label in getattr(schematic, "global_label", []):
-                if hasattr(label, "value"):
-                    net_names.add(label.value)
-
-            locator = PinLocator()
-            _DRIVER_TYPES = {"output", "power_out", "tri_state", "open_collector", "open_emitter"}
-
-            def _is_power_or_ground(name):
-                n = name.upper()
-                return bool(
-                    re.match(r'^(A?D?P?S?GND|EARTH|AGND|DGND|PGND|SGND)', n)
-                    or re.match(
-                        r'^(\+?[\d]+V[\d]*[A-Z0-9_]*|VCC|VDD|VIN|VBAT|VREF|AVCC|DVCC|PVCC|3V3|5V|1V8)',
-                        n,
-                    )
-                )
-
-            lines = []
-            for net_name in sorted(net_names):
-                connections = ConnectionManager.get_net_connections(
-                    schematic, net_name, sch_path
-                )
-
-                # Filter out power symbols (#PWR, #FLG)
-                real_conns = [c for c in connections if not c["component"].startswith("#")]
-
-                if skip_power and _is_power_or_ground(net_name) and len(real_conns) < 3:
-                    continue
-
-                if len(real_conns) < 2:
-                    continue  # Nothing to show for isolated or single-pin nets
-
-                # Enrich with pin names and types
-                enriched = []
-                for conn in real_conns:
-                    try:
-                        meta = locator.get_pin_metadata(
-                            sch_path, conn["component"], str(conn["pin"])
-                        )
-                        enriched.append((
-                            conn["component"],
-                            meta.get("name", str(conn["pin"])),
-                            meta.get("type", ""),
-                        ))
-                    except Exception:
-                        enriched.append((conn["component"], str(conn["pin"]), ""))
-
-                drivers = [
-                    (ref, pin) for ref, pin, ptype in enriched if ptype in _DRIVER_TYPES
-                ]
-                non_drivers = [
-                    (ref, pin) for ref, pin, ptype in enriched if ptype not in _DRIVER_TYPES
-                ]
-
-                if drivers:
-                    src_ref, src_pin = drivers[0]
-                    dests = ", ".join(f"{r}({p})" for r, p in non_drivers)
-                    if len(drivers) > 1:
-                        extra_drivers = ", ".join(f"{r}({p})" for r, p in drivers[1:])
-                        dests = (extra_drivers + ", " + dests).strip(", ")
-                    lines.append(f"{src_ref}({src_pin}) --[{net_name}]--> {dests}")
-                else:
-                    all_nodes = ", ".join(f"{r}({p})" for r, p, _ in enriched)
-                    lines.append(f"[{net_name}]: {all_nodes}")
-
-            graph_text = "\n".join(lines)
-            return {"success": True, "graph": graph_text, "netCount": len(lines)}
-
-        except Exception as e:
-            logger.error(f"Error building net graph: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
-    def _handle_get_schematic_summary(self, params):
-        """Return a compact, LLM-optimised text summary of the entire schematic."""
-        logger.info("Getting schematic summary")
-        try:
-            import re
-            from pathlib import Path
-            from commands.pin_locator import PinLocator
-            from commands.connection_schematic import ConnectionManager as CM
-
-            schematic_path = params.get("schematicPath")
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-
-            sch_path = Path(schematic_path)
-            if not sch_path.exists():
-                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
-
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
-
-            with open(sch_path, "r", encoding="utf-8") as f:
-                raw_content = f.read()
-
-            locator = PinLocator()
-
-            # ── Components table ──────────────────────────────────────────────
-            rows = []
-            for symbol in schematic.symbol:
-                if not hasattr(symbol.property, "Reference"):
-                    continue
-                ref = symbol.property.Reference.value
-                if ref.startswith("_TEMPLATE") or ref.startswith("#"):
-                    continue
-                lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
-                if lib_id.lower().startswith("power:"):
-                    continue  # Skip pure power symbols from component table
-
-                value = (
-                    symbol.property.Value.value
-                    if hasattr(symbol.property, "Value") else ""
-                )
-                footprint = (
-                    symbol.property.Footprint.value
-                    if hasattr(symbol.property, "Footprint") else ""
-                )
-                # Abbreviate footprint to just the last component
-                fp_short = footprint.split(":")[-1] if footprint else "-"
-
-                props = {}
-                try:
-                    block_text, _, _ = KiCADInterface._find_placed_symbol_block(
-                        raw_content, ref
-                    )
-                    if block_text:
-                        props = KiCADInterface._extract_component_properties(block_text)
-                except Exception:
-                    pass
-
-                rows.append({
-                    "ref": ref,
-                    "value": value or "-",
-                    "mpn": props.get("MPN", "-"),
-                    "description": props.get("Description", "-"),
-                    "footprint": fp_short,
-                })
-
-            # Sort by reference prefix then number
-            def _ref_sort_key(r):
-                m = re.match(r'^([A-Za-z_]+)(\d+)', r["ref"])
-                return (m.group(1), int(m.group(2))) if m else (r["ref"], 0)
-
-            rows.sort(key=_ref_sort_key)
-
-            # ── Net adjacency list ────────────────────────────────────────────
-            netmap = CM.build_full_netmap(schematic, schematic_path)
-            nets_to_conns = {}
-            for (ref, pin_num), net_name in netmap.items():
-                nets_to_conns.setdefault(net_name, []).append((ref, pin_num))
-
-            # Classification helper (same heuristics as classify_nets)
-            all_net_names = set(nets_to_conns.keys())
-            for label in getattr(schematic, "label", []):
-                if hasattr(label, "value"):
-                    all_net_names.add(label.value)
-            for label in getattr(schematic, "global_label", []):
-                if hasattr(label, "value"):
-                    all_net_names.add(label.value)
-
-            def _classify(net_name, conns):
-                n = net_name.upper()
-                has_pwr = any(
-                    r.startswith("#PWR") or r.startswith("#FLG") for r, _ in conns
-                )
-                if re.match(r'^(A?D?P?S?GND|EARTH|AGND|DGND|PGND|SGND)', n):
-                    return "ground"
-                if has_pwr or re.match(
-                    r'^(\+?[\d]+V[\d]*[A-Z0-9_]*|VCC|VDD|VIN|VBAT|VREF|AVCC|DVCC|PVCC|3V3|5V|1V8)',
-                    n,
-                ):
-                    return "power_rail"
-                if re.search(r'(CLK|SCK|MCLK|XTAL|OSC)', n):
-                    return "clock"
-                if (net_name.endswith("_P") or net_name.endswith("_N")) and (
-                    net_name[:-2] + "_N" in all_net_names
-                    or net_name[:-2] + "_P" in all_net_names
-                ):
-                    return "differential_pair"
-                if (net_name.endswith("+") or net_name.endswith("-")) and (
-                    net_name[:-1] + "-" in all_net_names
-                    or net_name[:-1] + "+" in all_net_names
-                ):
-                    return "differential_pair"
-                return "signal"
-
-            # ── Format text output ────────────────────────────────────────────
-            out = []
-
-            # Component table
-            out.append(f"=== COMPONENTS ({len(rows)}) ===")
-            out.append(
-                f"{'REF':<8} {'VALUE':<14} {'MPN':<22} {'DESCRIPTION':<26} FOOTPRINT"
-            )
-            out.append("-" * 90)
-            for r in rows:
-                out.append(
-                    f"{r['ref']:<8} {r['value']:<14} {r['mpn']:<22} {r['description']:<26} {r['footprint']}"
-                )
-
-            # Net adjacency list
-            out.append("")
-            out.append(f"=== NETS ({len(all_net_names)}) ===")
-            out.append(f"{'TYPE':<16} {'NAME':<22} CONNECTIONS")
-            out.append("-" * 90)
-
-            for net_name in sorted(all_net_names):
-                conns = nets_to_conns.get(net_name, [])
-                net_type = _classify(net_name, conns)
-
-                conn_strs = []
-                for ref, pin_num in sorted(conns):
-                    if ref.startswith("#"):
-                        continue
-                    try:
-                        meta = locator.get_pin_metadata(sch_path, ref, pin_num)
-                        pin_label = meta.get("name", pin_num)
-                    except Exception:
-                        pin_label = pin_num
-                    conn_strs.append(f"{ref}/{pin_label}")
-
-                conn_str = ", ".join(conn_strs)
-                if len(conn_str) > 64:
-                    conn_str = conn_str[:61] + "..."
-
-                out.append(f"{net_type:<16} {net_name:<22} {conn_str}")
-
-            summary_text = "\n".join(out)
-            return {"success": True, "summary": summary_text}
-
-        except Exception as e:
-            logger.error(f"Error getting schematic summary: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
     def _handle_list_schematic_wires(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
-        """List wires in a schematic. Optional netName filter returns only wires reachable from that net's labels."""
+        """List all wires in a schematic"""
         logger.info("Listing schematic wires")
         try:
             schematic_path = params.get("schematicPath")
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
-
-            net_name_filter = params.get("netName")
-            annotate_nets = params.get("annotate_nets", False)
 
             schematic = SchematicManager.load_schematic(schematic_path)
             if not schematic:
@@ -5259,78 +2416,6 @@ class KiCADInterface:
                                 }
                             )
 
-            TOL = 0.5
-
-            def pts_coincide(a, b):
-                return abs(a[0] - b[0]) < TOL and abs(a[1] - b[1]) < TOL
-
-            def _bfs_seeds(seed_pts, all_segs):
-                """BFS from seed_pts; return set of reachable wire indices."""
-                reachable_pts = list(seed_pts)
-                reachable_indices = set()
-                changed = True
-                while changed:
-                    changed = False
-                    for i, (x1, y1, x2, y2) in enumerate(all_segs):
-                        if i in reachable_indices:
-                            continue
-                        for rx, ry in reachable_pts:
-                            if pts_coincide((rx, ry), (x1, y1)) or pts_coincide((rx, ry), (x2, y2)):
-                                reachable_indices.add(i)
-                                new_pt = (x2, y2) if pts_coincide((rx, ry), (x1, y1)) else (x1, y1)
-                                if not any(pts_coincide(new_pt, (ex, ey)) for ex, ey in reachable_pts):
-                                    reachable_pts.append(new_pt)
-                                changed = True
-                                break
-                return reachable_indices
-
-            if net_name_filter:
-                # Collect seed points from net labels and global labels
-                seeds = []
-                if hasattr(schematic, "label"):
-                    for lbl in schematic.label:
-                        if hasattr(lbl, "value") and lbl.value == net_name_filter:
-                            if hasattr(lbl, "at") and hasattr(lbl.at, "value"):
-                                pos = lbl.at.value
-                                seeds.append((float(pos[0]), float(pos[1])))
-                if hasattr(schematic, "global_label"):
-                    for lbl in schematic.global_label:
-                        if hasattr(lbl, "value") and lbl.value == net_name_filter:
-                            if hasattr(lbl, "at") and hasattr(lbl.at, "value"):
-                                pos = lbl.at.value
-                                seeds.append((float(pos[0]), float(pos[1])))
-
-                if seeds:
-                    all_segs = [(w["start"]["x"], w["start"]["y"], w["end"]["x"], w["end"]["y"]) for w in wires]
-                    reachable_indices = _bfs_seeds(seeds, all_segs)
-                    wires = [wires[i] for i in sorted(reachable_indices)]
-
-            if annotate_nets:
-                # Build a label_name -> seed positions map from all labels
-                all_segs = [(w["start"]["x"], w["start"]["y"], w["end"]["x"], w["end"]["y"]) for w in wires]
-                net_seeds: dict = {}
-                for lbl_attr in ("label", "global_label"):
-                    if hasattr(schematic, lbl_attr):
-                        for lbl in getattr(schematic, lbl_attr):
-                            if hasattr(lbl, "value") and hasattr(lbl, "at") and hasattr(lbl.at, "value"):
-                                pos = lbl.at.value
-                                net_seeds.setdefault(lbl.value, []).append((float(pos[0]), float(pos[1])))
-
-                # For each net, find wire indices reachable from its seeds
-                wire_net: dict = {}  # wire index -> net name
-                for net_name_candidate, seed_pts in net_seeds.items():
-                    for idx in _bfs_seeds(seed_pts, all_segs):
-                        if idx not in wire_net:
-                            wire_net[idx] = net_name_candidate
-
-                # Annotate each wire
-                annotated_wires = []
-                for i, w in enumerate(wires):
-                    entry = dict(w)
-                    entry["net"] = wire_net.get(i, "UNKNOWN")
-                    annotated_wires.append(entry)
-                wires = annotated_wires
-
             return {"success": True, "wires": wires, "count": len(wires)}
 
         except Exception as e:
@@ -5341,19 +2426,19 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_list_schematic_labels(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """List all net labels and power flags in a schematic"""
         logger.info("Listing schematic labels")
         try:
             schematic_path = params.get("schematicPath")
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
-            filter_params = params.get("filter") or {}
-            filter_net_name = filter_params.get("netName")
-            filter_comp_ref = filter_params.get("componentRef")
-            filter_bbox = filter_params.get("boundingBox")  # {x_min,y_min,x_max,y_max}
-            filter_use_body_box = filter_params.get("useBodyBox", False)
-            filter_body_box_expand = float(filter_params.get("bodyBoxExpand", 2.0))
+
+            net_name = params.get("netName")
+            label_type = params.get("labelType")
+
+            _valid_label_types = {"net", "global", "power"}
+            if label_type is not None and label_type not in _valid_label_types:
+                return {"success": False, "message": "labelType must be one of: net, global, power"}
 
             schematic = SchematicManager.load_schematic(schematic_path)
             if not schematic:
@@ -5375,7 +2460,6 @@ class KiCADInterface:
                                 "name": label.value,
                                 "type": "net",
                                 "position": {"x": float(pos[0]), "y": float(pos[1])},
-                                "angle": float(pos[2]) if len(pos) > 2 else 0,
                             }
                         )
 
@@ -5393,12 +2477,10 @@ class KiCADInterface:
                                 "name": label.value,
                                 "type": "global",
                                 "position": {"x": float(pos[0]), "y": float(pos[1])},
-                                "angle": float(pos[2]) if len(pos) > 2 else 0,
                             }
                         )
 
             # Power symbols (components with power flag)
-            # Note: [power] entries are PWR_FLAG component instances, not net labels.
             if hasattr(schematic, "symbol"):
                 for symbol in schematic.symbol:
                     if not hasattr(symbol.property, "Reference"):
@@ -5420,80 +2502,11 @@ class KiCADInterface:
                         }
                     )
 
-            # No-connect markers — kicad-skip does not expose these, so parse with sexpdata
-            try:
-                import sexpdata as _sexpdata
-                from sexpdata import Symbol as _Sym
-                with open(schematic_path, "r", encoding="utf-8") as _f:
-                    _sch_data = _sexpdata.loads(_f.read())
-                for _item in _sch_data:
-                    if not (isinstance(_item, list) and len(_item) > 0 and _item[0] == _Sym("no_connect")):
-                        continue
-                    _at = next(
-                        (p for p in _item if isinstance(p, list) and len(p) >= 3 and p[0] == _Sym("at")),
-                        None,
-                    )
-                    if _at:
-                        labels.append({
-                            "name": "no_connect",
-                            "type": "no_connect",
-                            "position": {"x": float(_at[1]), "y": float(_at[2])},
-                        })
-            except Exception as _e:
-                logger.warning(f"Could not parse no_connect markers: {_e}")
-
             # Apply filters
-            if filter_net_name:
-                labels = [l for l in labels if l.get("name") == filter_net_name]
-
-            if filter_bbox:
-                x_min = float(filter_bbox.get("x_min", float("-inf")))
-                y_min = float(filter_bbox.get("y_min", float("-inf")))
-                x_max = float(filter_bbox.get("x_max", float("inf")))
-                y_max = float(filter_bbox.get("y_max", float("inf")))
-                labels = [
-                    l for l in labels
-                    if x_min <= l["position"]["x"] <= x_max
-                    and y_min <= l["position"]["y"] <= y_max
-                ]
-
-            if filter_comp_ref:
-                # Keep only labels near the pin tips (or body box) of the specified component
-                try:
-                    from pathlib import Path as _Path2
-                    from commands.pin_locator import PinLocator as _PL2
-                    _loc2 = _PL2()
-                    _comp_pins = _loc2.get_all_symbol_pins(_Path2(schematic_path), filter_comp_ref) or {}
-                    _pin_tips = [
-                        (float(v[0]) if isinstance(v, (list, tuple)) else float(v["x"]),
-                         float(v[1]) if isinstance(v, (list, tuple)) else float(v["y"]))
-                        for v in _comp_pins.values()
-                    ]
-                    if filter_use_body_box and _pin_tips:
-                        # Use component body bbox (pin extents ± 1.27mm) expanded by bodyBoxExpand
-                        _xs = [p[0] for p in _pin_tips]
-                        _ys = [p[1] for p in _pin_tips]
-                        _exp = filter_body_box_expand + 1.27
-                        _bx_min = min(_xs) - _exp
-                        _bx_max = max(_xs) + _exp
-                        _by_min = min(_ys) - _exp
-                        _by_max = max(_ys) + _exp
-                        labels = [
-                            l for l in labels
-                            if _bx_min <= l["position"]["x"] <= _bx_max
-                            and _by_min <= l["position"]["y"] <= _by_max
-                        ]
-                    else:
-                        _LABEL_TOL = 3.0  # mm — 3mm catches labels on wires a few mm from pin tips
-                        def _near_any_pin(lbl):
-                            lx, ly = lbl["position"]["x"], lbl["position"]["y"]
-                            return any(
-                                abs(lx - px) < _LABEL_TOL and abs(ly - py) < _LABEL_TOL
-                                for px, py in _pin_tips
-                            )
-                        labels = [l for l in labels if _near_any_pin(l)]
-                except Exception as _fe:
-                    logger.warning(f"componentRef filter failed: {_fe}")
+            if net_name is not None:
+                labels = [lbl for lbl in labels if lbl["name"] == net_name]
+            if label_type is not None:
+                labels = [lbl for lbl in labels if lbl["type"] == label_type]
 
             return {"success": True, "labels": labels, "count": len(labels)}
 
@@ -5504,233 +2517,7 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
-    def _handle_get_net_topology(self, params):
-        """Trace a complete net and return all wire segments, labels, pins, and dangling endpoints."""
-        logger.info("Getting net topology")
-        try:
-            from pathlib import Path
-            from commands.pin_locator import PinLocator
-
-            schematic_path = params.get("schematicPath")
-            net_name = params.get("netName")
-            if not schematic_path or not net_name:
-                return {"success": False, "message": "schematicPath and netName are required"}
-
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
-
-            sch_path = Path(schematic_path)
-            TOL = 0.5  # mm
-
-            def pts_coincide(a, b):
-                return abs(a[0] - b[0]) < TOL and abs(a[1] - b[1]) < TOL
-
-            # 1. Collect label positions for this net
-            labels_out = []
-            seed_pts = []
-            if hasattr(schematic, "label"):
-                for lbl in schematic.label:
-                    if hasattr(lbl, "value") and lbl.value == net_name:
-                        pos = lbl.at.value if hasattr(lbl, "at") and hasattr(lbl.at, "value") else [0, 0]
-                        x, y = float(pos[0]), float(pos[1])
-                        labels_out.append({
-                            "name": net_name,
-                            "type": "local",
-                            "position": {"x": x, "y": y},
-                            "angle": float(pos[2]) if len(pos) > 2 else 0,
-                        })
-                        seed_pts.append((x, y))
-            if hasattr(schematic, "global_label"):
-                for lbl in schematic.global_label:
-                    if hasattr(lbl, "value") and lbl.value == net_name:
-                        pos = lbl.at.value if hasattr(lbl, "at") and hasattr(lbl.at, "value") else [0, 0]
-                        x, y = float(pos[0]), float(pos[1])
-                        labels_out.append({
-                            "name": net_name,
-                            "type": "global",
-                            "position": {"x": x, "y": y},
-                            "angle": float(pos[2]) if len(pos) > 2 else 0,
-                        })
-                        seed_pts.append((x, y))
-
-            if not seed_pts:
-                return {
-                    "success": True,
-                    "net": net_name,
-                    "wire_segments": [],
-                    "labels": [],
-                    "pins": [],
-                    "dangling_endpoints": [],
-                    "message": f"No labels found for net '{net_name}'",
-                }
-
-            # 2. Collect all wire segments from schematic
-            all_segs = []
-            if hasattr(schematic, "wire"):
-                for wire in schematic.wire:
-                    if hasattr(wire, "pts") and hasattr(wire.pts, "xy"):
-                        pts = []
-                        for pt in wire.pts.xy:
-                            if hasattr(pt, "value"):
-                                pts.append((float(pt.value[0]), float(pt.value[1])))
-                        for i in range(len(pts) - 1):
-                            all_segs.append((pts[i], pts[i + 1]))
-
-            # 3. BFS from seed points to find reachable wire segments
-            reachable_pts = list(seed_pts)
-            reachable_seg_indices = set()
-
-            changed = True
-            while changed:
-                changed = False
-                for i, (wa, wb) in enumerate(all_segs):
-                    if i in reachable_seg_indices:
-                        continue
-                    for rx, ry in reachable_pts:
-                        if pts_coincide((rx, ry), wa):
-                            reachable_seg_indices.add(i)
-                            if not any(pts_coincide(wb, (ex, ey)) for ex, ey in reachable_pts):
-                                reachable_pts.append(wb)
-                            changed = True
-                            break
-                        elif pts_coincide((rx, ry), wb):
-                            reachable_seg_indices.add(i)
-                            if not any(pts_coincide(wa, (ex, ey)) for ex, ey in reachable_pts):
-                                reachable_pts.append(wa)
-                            changed = True
-                            break
-
-            wire_segments_out = [
-                {"start": {"x": all_segs[i][0][0], "y": all_segs[i][0][1]},
-                 "end":   {"x": all_segs[i][1][0], "y": all_segs[i][1][1]}}
-                for i in sorted(reachable_seg_indices)
-            ]
-
-            # 4. Find component pins at reachable points
-            locator = PinLocator()
-            pins_out = []
-            reachable_pt_set = reachable_pts  # list for tolerance-based lookup
-
-            if hasattr(schematic, "symbol"):
-                for symbol in schematic.symbol:
-                    if not hasattr(symbol.property, "Reference"):
-                        continue
-                    ref = symbol.property.Reference.value
-                    if ref.startswith("_TEMPLATE") or ref.startswith("#"):
-                        continue
-                    try:
-                        all_pins = locator.get_all_symbol_pins(sch_path, ref)
-                        lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
-                        pins_def = locator.get_symbol_pins(sch_path, lib_id) if lib_id else {}
-                        for pin_num, coords in all_pins.items():
-                            px, py = float(coords[0]), float(coords[1])
-                            if any(pts_coincide((px, py), (rx, ry)) for rx, ry in reachable_pt_set):
-                                pd = pins_def.get(str(pin_num), {})
-                                pins_out.append({
-                                    "ref": ref,
-                                    "pin_number": pin_num,
-                                    "pin_name": pd.get("name", pin_num),
-                                    "pin_type": pd.get("type", "unknown"),
-                                    "position": {"x": px, "y": py},
-                                })
-                    except Exception as _pe:
-                        logger.debug(f"Pin lookup failed for {ref}: {_pe}")
-
-            # 5. Find dangling wire endpoints (no other wire, no label, no pin at that point)
-            # Count how many reachable wire endpoints coincide with each reachable point
-            endpoint_count: dict = {}  # key: index into reachable_pts, count of wires touching it
-            reachable_pts_indexed = list(enumerate(reachable_pts))
-
-            for i in reachable_seg_indices:
-                wa, wb = all_segs[i]
-                for ep in (wa, wb):
-                    for idx, rpt in reachable_pts_indexed:
-                        if pts_coincide(ep, rpt):
-                            endpoint_count[idx] = endpoint_count.get(idx, 0) + 1
-                            break
-
-            pin_positions = [(p["position"]["x"], p["position"]["y"]) for p in pins_out]
-            label_positions_set = [(l["position"]["x"], l["position"]["y"]) for l in labels_out]
-
-            dangling_out = []
-            for idx, rpt in reachable_pts_indexed:
-                wire_count = endpoint_count.get(idx, 0)
-                if wire_count != 1:
-                    continue  # Not a stub end (0 = seed-only, 2+ = junction)
-                is_label = any(pts_coincide(rpt, lp) for lp in label_positions_set)
-                is_pin = any(pts_coincide(rpt, pp) for pp in pin_positions)
-                if not is_label and not is_pin:
-                    dangling_out.append({"x": rpt[0], "y": rpt[1]})
-
-            return {
-                "success": True,
-                "net": net_name,
-                "wire_segments": wire_segments_out,
-                "labels": labels_out,
-                "pins": pins_out,
-                "dangling_endpoints": dangling_out,
-            }
-
-        except Exception as e:
-            logger.error(f"Error getting net topology: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
-    def _handle_get_component_pin_positions(self, params):
-        """Return world coordinates for all pins of a component reference."""
-        logger.info("Getting component pin positions")
-        try:
-            from pathlib import Path
-            from commands.pin_locator import PinLocator
-
-            schematic_path = params.get("schematicPath")
-            reference = params.get("reference")
-            if not schematic_path or not reference:
-                return {"success": False, "message": "schematicPath and reference are required"}
-
-            sch_path = Path(schematic_path)
-            locator = PinLocator()
-
-            all_pins = locator.get_all_symbol_pins(sch_path, reference)
-            if not all_pins:
-                return {"success": False, "message": f"No pins found for {reference} — check reference designator"}
-
-            lib_id = locator._get_lib_id(sch_path, reference)
-            pins_def = locator.get_symbol_pins(sch_path, lib_id) if lib_id else {}
-
-            pins_out = []
-            for pin_num, coords in all_pins.items():
-                pd = pins_def.get(str(pin_num), {})
-                pin_info = {
-                    "pin_number": pin_num,
-                    "pin_name": pd.get("name", pin_num),
-                    "pin_type": pd.get("type", "unknown"),
-                    "position": {"x": float(coords[0]), "y": float(coords[1])},
-                }
-                try:
-                    angle = locator.get_pin_angle(sch_path, reference, str(pin_num))
-                    if angle is not None:
-                        pin_info["stub_direction_angle"] = angle
-                except Exception:
-                    pass
-                pins_out.append(pin_info)
-
-            return {
-                "success": True,
-                "reference": reference,
-                "pins": pins_out,
-                "count": len(pins_out),
-            }
-
-        except Exception as e:
-            logger.error(f"Error getting component pin positions: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
-    def _handle_move_schematic_component(self, params: Dict[str, Any]) -> Dict[str, Any]:        
+    def _handle_move_schematic_component(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Move a schematic component to a new position, dragging connected wires."""
         logger.info("Moving schematic component")
         try:
@@ -5815,7 +2602,6 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_rotate_schematic_component(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Rotate a schematic component"""
         logger.info("Rotating schematic component")
         try:
@@ -5865,309 +2651,13 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
-    def _handle_add_hierarchical_sheet(self, params):
-        """Insert a hierarchical sheet reference block into a parent schematic."""
-        logger.info("Adding hierarchical sheet")
-        try:
-            import uuid as _uuid
-            import re as _re
-
-            schematic_path = params.get("schematicPath")
-            subsheet_path = params.get("subsheetPath")
-            sheet_name = params.get("sheetName", "Sheet")
-            position = params.get("position", {})
-            size = params.get("size", {})
-
-            if not schematic_path or not subsheet_path:
-                return {"success": False, "message": "schematicPath and subsheetPath are required"}
-
-            x = float(position.get("x", 50))
-            y = float(position.get("y", 50))
-            w = float(size.get("width", 80))
-            h = float(size.get("height", 50))
-
-            parent_file = Path(schematic_path)
-            # Compute relative path from parent schematic's directory to the sub-sheet
-            try:
-                sub_abs = Path(subsheet_path).resolve()
-                rel_path = sub_abs.relative_to(parent_file.parent.resolve())
-                rel_str = str(rel_path).replace("\\", "/")
-            except ValueError:
-                # Not relative — use as-is
-                rel_str = str(subsheet_path).replace("\\", "/")
-
-            sheet_block_uuid = str(_uuid.uuid4())
-
-            # Property label positions: name above top-left, file below bottom-left
-            name_x = round(x + 2.54, 4)
-            name_y = round(y - 1.27, 4)
-            file_x = round(x + 2.54, 4)
-            file_y = round(y + h + 1.27, 4)
-
-            sheet_block = f"""  (sheet (at {x} {y}) (size {w} {h}) (fields_autoplaced yes)
-    (stroke (width 0.0006) (type default))
-    (fill (color 0 0 0 0.0000))
-    (uuid "{sheet_block_uuid}")
-    (property "Sheet name" "{sheet_name}" (at {name_x} {name_y} 0)
-      (effects (font (size 1.27 1.27)) (justify left bottom))
-    )
-    (property "Sheet file" "{rel_str}" (at {file_x} {file_y} 0)
-      (effects (font (size 1.27 1.27)) (justify left bottom))
-    )
-  )
-"""
-
-            with open(parent_file, "r", encoding="utf-8") as f:
-                content = f.read()
-
-            # Extract the parent schematic UUID for the sheet_instances path entry
-            parent_uuid_match = _re.search(r'\(uuid\s+([0-9a-fA-F-]+)\)', content)
-            parent_uuid = parent_uuid_match.group(1) if parent_uuid_match else ""
-
-            # Determine the next available page number
-            existing_pages = _re.findall(r'\(page\s+"(\d+)"\)', content)
-            next_page = max((int(p) for p in existing_pages), default=0) + 1
-
-            # Build path entry for sheet_instances
-            instance_path = f'/{parent_uuid}/{sheet_block_uuid}' if parent_uuid else f'/{sheet_block_uuid}'
-            path_entry = f'    (path "{instance_path}" (page "{next_page}"))\n'
-
-            # Insert sheet block before (sheet_instances
-            insert_marker = "(sheet_instances"
-            insert_at = content.rfind(insert_marker)
-            if insert_at == -1:
-                return {"success": False, "message": "Could not find (sheet_instances in schematic"}
-
-            content = content[:insert_at] + sheet_block + "  " + content[insert_at:]
-
-            # Insert path entry inside (sheet_instances ... ) block
-            # Find the closing ) of the sheet_instances block after the insertion
-            si_start = content.rfind("(sheet_instances")
-            si_close = content.find(")", si_start)
-            # Walk to find the matching close paren
-            depth = 0
-            for i in range(si_start, len(content)):
-                if content[i] == "(":
-                    depth += 1
-                elif content[i] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        si_close = i
-                        break
-            content = content[:si_close] + path_entry + "  " + content[si_close:]
-
-            with open(parent_file, "w", encoding="utf-8") as f:
-                f.write(content)
-
-            # Fix sub-sheet component instances so the hierarchical path entry
-            # is present for every component (required for ERC to resolve references
-            # correctly when the parent schematic is open in KiCad GUI).
-            self._fix_subsheet_instances(str(parent_file), content)
-
-            return {
-                "success": True,
-                "sheet_uuid": sheet_block_uuid,
-                "sheet_name": sheet_name,
-                "subsheet_path": rel_str,
-                "page": next_page,
-            }
-
-        except Exception as e:
-            logger.error(f"Error adding hierarchical sheet: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
-    def _handle_create_hierarchical_subsheet(self, params):
-        """Create a new sub-sheet file and link it into a parent schematic in one call.
-
-        Combines create_schematic (sub-sheet) + add_hierarchical_sheet in a single tool,
-        eliminating the 3-step workflow when building hierarchical designs.
-        """
-        logger.info("Creating hierarchical subsheet")
-        try:
-            parent_path = params.get("parentSchematicPath")
-            subsheet_path = params.get("subsheetPath")
-            sheet_name = params.get("sheetName", "Sheet")
-            position = params.get("position", {})
-            size = params.get("size", {})
-            metadata = params.get("metadata", {})
-
-            if not parent_path or not subsheet_path:
-                return {"success": False, "message": "parentSchematicPath and subsheetPath are required"}
-
-            # Step 1: create the sub-sheet schematic file
-            create_result = self._handle_create_schematic({
-                "filename": subsheet_path,
-                "metadata": metadata,
-            })
-            if not create_result.get("success"):
-                return {"success": False, "message": f"Failed to create sub-sheet: {create_result.get('message')}"}
-
-            # Step 2: link the sub-sheet into the parent schematic
-            link_result = self._handle_add_hierarchical_sheet({
-                "schematicPath": parent_path,
-                "subsheetPath": subsheet_path,
-                "sheetName": sheet_name,
-                "position": position,
-                "size": size,
-            })
-            if not link_result.get("success"):
-                return {"success": False,
-                        "message": f"Created sub-sheet but failed to link: {link_result.get('message')}",
-                        "subsheet_created": create_result.get("file_path", subsheet_path)}
-
-            return {
-                "success": True,
-                "subsheet_path": create_result.get("file_path", subsheet_path),
-                "subsheet_uuid": create_result.get("schematic_uuid"),
-                "sheet_block_uuid": link_result.get("sheet_uuid"),
-                "sheet_name": sheet_name,
-                "page": link_result.get("page"),
-                "message": (
-                    f"Created sub-sheet '{sheet_name}' at {subsheet_path} "
-                    f"and linked it into {parent_path} (page {link_result.get('page')})"
-                ),
-            }
-        except Exception as e:
-            logger.error(f"Error in create_hierarchical_subsheet: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"success": False, "message": str(e)}
-
-    def _fix_subsheet_instances(self, parent_path: str, parent_content: str) -> list:
-        """Walk all (sheet ...) blocks in the parent schematic and ensure each component
-        in the referenced sub-sheet has an instances entry for the sheet-block UUID.
-
-        KiCAD 8 renders references from the instances block using the SHEET-BLOCK UUID
-        (the uuid inside the (sheet ...) block in the parent), NOT the sub-sheet file UUID.
-        This method adds the missing path entries so ERC shows correct references.
-
-        Returns a list of sub-sheet paths that were modified.
-        """
-        import sexpdata as _sx
-        from sexpdata import Symbol as _Sym
-        import re as _re
-
-        modified_sheets = []
-
-        try:
-            parent_file = Path(parent_path)
-            parent_data = _sx.loads(parent_content)
-
-            # Find all (sheet ...) blocks at the top level
-            for item in parent_data:
-                if not (isinstance(item, list) and len(item) > 0 and item[0] == _Sym("sheet")):
-                    continue
-
-                # Extract sheet-block UUID
-                sheet_block_uuid = None
-                for sub in item:
-                    if isinstance(sub, list) and len(sub) >= 2 and sub[0] == _Sym("uuid"):
-                        sheet_block_uuid = str(sub[1])
-                        break
-
-                # Extract Sheet file property
-                sheet_file_rel = None
-                for sub in item:
-                    if not (isinstance(sub, list) and len(sub) >= 3 and sub[0] == _Sym("property")):
-                        continue
-                    if sub[1] == "Sheet file":
-                        sheet_file_rel = str(sub[2])
-                        break
-
-                if not sheet_block_uuid or not sheet_file_rel:
-                    continue
-
-                # Resolve sub-sheet path relative to parent
-                sub_sheet_path = parent_file.parent / sheet_file_rel
-                if not sub_sheet_path.exists():
-                    logger.warning(f"Sub-sheet not found: {sub_sheet_path}")
-                    continue
-
-                parent_uuid_match = _re.search(r'\(uuid\s+([0-9a-fA-F-]+)\)', parent_content)
-                parent_uuid = parent_uuid_match.group(1) if parent_uuid_match else ""
-                target_path = f"/{parent_uuid}/{sheet_block_uuid}" if parent_uuid else f"/{sheet_block_uuid}"
-
-                # Read the sub-sheet
-                with open(sub_sheet_path, "r", encoding="utf-8") as f:
-                    sub_content = f.read()
-
-                # Get project name from parent's .kicad_pro
-                try:
-                    from commands.dynamic_symbol_loader import _find_project_root
-                    pro_files = list(_find_project_root(parent_file.parent).glob("*.kicad_pro"))
-                    project_name = pro_files[0].stem if pro_files else parent_file.stem
-                except Exception:
-                    project_name = parent_file.stem
-
-                # Patch each (instances ...) block using balance-counting so this works
-                # for both single-line (MCP-generated) and multi-line (KiCad-saved) files.
-                def _find_balanced_end(s: str, start: int) -> int:
-                    depth = 0
-                    for j in range(start, len(s)):
-                        if s[j] == "(":
-                            depth += 1
-                        elif s[j] == ")":
-                            depth -= 1
-                            if depth == 0:
-                                return j
-                    return len(s) - 1
-
-                result_parts = []
-                pos = 0
-                changed = False
-                while True:
-                    idx = sub_content.find("(instances", pos)
-                    if idx == -1:
-                        result_parts.append(sub_content[pos:])
-                        break
-                    result_parts.append(sub_content[pos:idx])
-                    end = _find_balanced_end(sub_content, idx)
-                    block = sub_content[idx : end + 1]
-
-                    if target_path not in block:
-                        existing = _re.search(
-                            r'\(reference\s+"([^"]+)"\)\s*\(unit\s+(\d+)\)', block
-                        )
-                        if existing:
-                            reference = existing.group(1)
-                            unit = existing.group(2)
-                            new_entry = f'(path "{target_path}" (reference "{reference}") (unit {unit}))'
-                            # Find the (project ...) sub-block and insert the new path entry
-                            # before its closing ')'. This works for both single-line
-                            # (MCP-generated) and multi-line (KiCad-saved) files, because
-                            # we use balanced-paren counting rather than assuming the block
-                            # ends with exactly ")) ".
-                            proj_start = block.find("(project ")
-                            if proj_start != -1:
-                                proj_end = _find_balanced_end(block, proj_start)
-                                block = block[:proj_end] + " " + new_entry + block[proj_end:]
-                                changed = True
-                    result_parts.append(block)
-                    pos = end + 1
-
-                if changed:
-                    with open(sub_sheet_path, "w", encoding="utf-8") as f:
-                        f.write("".join(result_parts))
-                    modified_sheets.append(str(sub_sheet_path))
-                    logger.info(f"Fixed instances in {sub_sheet_path} for sheet-block {sheet_block_uuid}")
-
-        except Exception as e:
-            logger.error(f"Error fixing sub-sheet instances: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-
-        return modified_sheets
-
-    def _handle_annotate_schematic(self, params: Dict[str, Any]) -> Dict[str, Any]:        
+    def _handle_annotate_schematic(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Annotate unannotated components in schematic (R? -> R1, R2, ...)"""
         logger.info("Annotating schematic")
         try:
             import re
 
             schematic_path = params.get("schematicPath")
-            hierarchical = params.get("hierarchical", False)
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
 
@@ -6198,71 +2688,39 @@ class KiCADInterface:
                     prefix = ref[:-1]
                     unannotated.append((symbol, prefix))
 
+            if not unannotated:
+                return {
+                    "success": True,
+                    "annotated": [],
+                    "message": "All components already annotated",
+                }
+
             annotated = []
-            if unannotated:
-                for symbol, prefix in unannotated:
-                    if prefix not in existing_refs:
-                        existing_refs[prefix] = set()
+            for symbol, prefix in unannotated:
+                if prefix not in existing_refs:
+                    existing_refs[prefix] = set()
 
-                    # Find next available number
-                    next_num = 1
-                    while next_num in existing_refs[prefix]:
-                        next_num += 1
+                # Find next available number
+                next_num = 1
+                while next_num in existing_refs[prefix]:
+                    next_num += 1
 
-                    old_ref = symbol.property.Reference.value
-                    new_ref = f"{prefix}{next_num}"
-                    # Update both property.Reference AND instances...reference so KiCad UI
-                    # reads the correct designator (KiCad 8+ authoritative source is instances).
-                    if hasattr(symbol, 'setAllReferences'):
-                        symbol.setAllReferences(new_ref)
-                    else:
-                        symbol.property.Reference.value = new_ref
-                    existing_refs[prefix].add(next_num)
+                old_ref = symbol.property.Reference.value
+                new_ref = f"{prefix}{next_num}"
+                symbol.setAllReferences(new_ref)
+                existing_refs[prefix].add(next_num)
 
-                    uuid_val = str(symbol.uuid.value) if hasattr(symbol, "uuid") else ""
-                    annotated.append(
-                        {
-                            "uuid": uuid_val,
-                            "oldReference": old_ref,
-                            "newReference": new_ref,
-                        }
-                    )
+                uuid_val = str(symbol.uuid.value) if hasattr(symbol, "uuid") else ""
+                annotated.append(
+                    {
+                        "uuid": uuid_val,
+                        "oldReference": old_ref,
+                        "newReference": new_ref,
+                    }
+                )
 
-                SchematicManager.save_schematic(schematic, schematic_path)
-
-            result: dict = {"success": True, "annotated": annotated}
-            if not annotated:
-                result["message"] = "All components already annotated"
-
-            # Always fix hierarchical instance paths — both for sub-sheets owned by
-            # this schematic AND for any parent schematic that references this file.
-            # This handles the common case where annotate is called on a sub-sheet
-            # (not the parent), which would otherwise leave instances with only the
-            # standalone path, causing '?' references in the parent-context ERC.
-            with open(schematic_path, "r", encoding="utf-8") as _f:
-                final_content = _f.read()
-
-            # Fix sub-sheets owned by this schematic
-            modified = self._fix_subsheet_instances(schematic_path, final_content)
-
-            # Fix instances if this schematic is itself a sub-sheet of another
-            sch_name = Path(schematic_path).name
-            parent_dir = Path(schematic_path).parent
-            for candidate in parent_dir.glob("*.kicad_sch"):
-                if candidate.resolve() == Path(schematic_path).resolve():
-                    continue
-                try:
-                    candidate_content = candidate.read_text(encoding="utf-8")
-                    if sch_name in candidate_content:
-                        extra = self._fix_subsheet_instances(str(candidate), candidate_content)
-                        modified = modified + extra
-                except Exception:
-                    pass
-
-            if modified:
-                result["subSheetsFixed"] = modified
-
-            return result
+            SchematicManager.save_schematic(schematic, schematic_path)
+            return {"success": True, "annotated": annotated}
 
         except Exception as e:
             logger.error(f"Error annotating schematic: {e}")
@@ -6272,7 +2730,6 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_delete_schematic_wire(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Delete a wire from the schematic matching start/end points"""
         logger.info("Deleting schematic wire")
         try:
@@ -6304,102 +2761,28 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_delete_schematic_net_label(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
-        """Delete a net label (or labels) from the schematic"""
+        """Delete a net label from the schematic"""
         logger.info("Deleting schematic net label")
         try:
             schematic_path = params.get("schematicPath")
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
+            net_name = params.get("netName")
+            position = params.get("position")
+
+            if not schematic_path or not net_name:
+                return {
+                    "success": False,
+                    "message": "schematicPath and netName are required",
+                }
 
             from pathlib import Path
 
             from commands.wire_manager import WireManager
 
-            sch_path = Path(schematic_path)
-
-            # Mode 1: deleteAll — remove every net label in the schematic
-            if params.get("deleteAll"):
-                count = WireManager.delete_all_labels(sch_path)
-                return {"success": True, "deleted": count}
-
-            # Mode 2: positions array — batch delete by (netName, optional position)
-            positions_list = params.get("positions")
-            if positions_list is not None:
-                result = WireManager.delete_labels_batch(sch_path, positions_list)
-                return {
-                    "success": True,
-                    "deleted": result["deleted"],
-                    "notFound": result["notFound"],
-                }
-
-            # Mode 3: componentRef + pinName — resolve pin tip via PinLocator
-            comp_ref = params.get("componentRef")
-            pin_name = params.get("pinName")
-            tolerance_mm = float(params.get("tolerance_mm", 0.5))
-            if comp_ref and pin_name:
-                from commands.pin_locator import PinLocator as _PL
-                _loc = _PL()
-                _pin_pos = _loc.get_pin_location(sch_path, comp_ref, str(pin_name))
-                if not _pin_pos:
-                    # Fallback: single-pin component
-                    _all = _loc.get_all_symbol_pins(sch_path, comp_ref) or {}
-                    if len(_all) == 1:
-                        _pin_pos = next(iter(_all.values()))
-                if not _pin_pos:
-                    return {
-                        "success": False,
-                        "message": f"Could not locate pin '{pin_name}' on {comp_ref}",
-                    }
-                # Delete whatever label sits at this pin tip (any net name)
-                try:
-                    import sexpdata as _sd2
-                    from sexpdata import Symbol as _Sym2
-                    with open(sch_path, "r", encoding="utf-8") as _rf2:
-                        _rd2 = _sd2.loads(_rf2.read())
-                    deleted_count = 0
-                    new_rd2 = []
-                    for _item2 in _rd2:
-                        if (isinstance(_item2, list) and len(_item2) > 0
-                                and _item2[0] == _Sym2("label")):
-                            _at2 = next(
-                                (p for p in _item2[1:] if isinstance(p, list)
-                                 and len(p) >= 3 and p[0] == _Sym2("at")),
-                                None,
-                            )
-                            if _at2:
-                                _lx2, _ly2 = float(_at2[1]), float(_at2[2])
-                                if (abs(_lx2 - float(_pin_pos[0])) < tolerance_mm
-                                        and abs(_ly2 - float(_pin_pos[1])) < tolerance_mm):
-                                    deleted_count += 1
-                                    continue
-                        new_rd2.append(_item2)
-                    if deleted_count:
-                        with open(sch_path, "w", encoding="utf-8") as _wf2:
-                            _wf2.write(_sd2.dumps(new_rd2))
-                        return {"success": True, "deleted": deleted_count}
-                    else:
-                        return {
-                            "success": False,
-                            "message": f"No label found at pin '{pin_name}' of {comp_ref} (pos={_pin_pos})",
-                        }
-                except Exception as _ce:
-                    return {"success": False, "message": f"componentRef delete failed: {_ce}"}
-
-            # Mode 4: single netName (original behaviour)
-            net_name = params.get("netName")
-            position = params.get("position")
-            if not net_name:
-                return {
-                    "success": False,
-                    "message": "Provide netName, componentRef+pinName, deleteAll, or positions",
-                }
-
             pos_list = None
             if position:
                 pos_list = [position.get("x", 0), position.get("y", 0)]
 
-            deleted = WireManager.delete_label(sch_path, net_name, pos_list, tolerance=tolerance_mm)
+            deleted = WireManager.delete_label(Path(schematic_path), net_name, pos_list)
             if deleted:
                 return {"success": True}
             else:
@@ -6412,8 +2795,93 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
+    def _handle_move_schematic_net_label(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Move a net label to a new position in the schematic."""
+        logger.info("Moving schematic net label")
+        try:
+            import sexpdata as _sexpdata
+            from sexpdata import Symbol
+
+            schematic_path = params.get("schematicPath")
+            net_name = params.get("netName")
+            new_position = params.get("newPosition", {})
+            new_x = new_position.get("x")
+            new_y = new_position.get("y")
+            current_position = params.get("currentPosition")
+            label_type = params.get("labelType")
+
+            if not schematic_path or not net_name:
+                return {"success": False, "message": "schematicPath and netName are required"}
+            if new_x is None or new_y is None:
+                return {"success": False, "message": "newPosition with x and y is required"}
+
+            _valid_types = {"label", "global_label", "hierarchical_label"}
+            if label_type is not None and label_type not in _valid_types:
+                return {
+                    "success": False,
+                    "message": f"labelType must be one of: {', '.join(sorted(_valid_types))}",
+                }
+
+            _SYM_AT = Symbol("at")
+            target_syms = (
+                {Symbol(label_type)}
+                if label_type is not None
+                else {Symbol(t) for t in _valid_types}
+            )
+
+            TOLERANCE = 0.5
+
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                sch_data = _sexpdata.loads(f.read())
+
+            for item in sch_data:
+                if not (isinstance(item, list) and len(item) >= 2 and item[0] in target_syms):
+                    continue
+                if item[1] != net_name:
+                    continue
+
+                at_idx = next(
+                    (
+                        j
+                        for j, p in enumerate(item)
+                        if isinstance(p, list) and len(p) >= 3 and p[0] == _SYM_AT
+                    ),
+                    None,
+                )
+                if at_idx is None:
+                    continue
+
+                at_entry = item[at_idx]
+                old_x, old_y = float(at_entry[1]), float(at_entry[2])
+
+                if current_position is not None:
+                    cx = current_position.get("x", 0)
+                    cy = current_position.get("y", 0)
+                    if not (abs(old_x - cx) < TOLERANCE and abs(old_y - cy) < TOLERANCE):
+                        continue
+
+                rotation = at_entry[3] if len(at_entry) > 3 else 0
+                item[at_idx] = [_SYM_AT, float(new_x), float(new_y), rotation]
+
+                with open(schematic_path, "w", encoding="utf-8") as f:
+                    f.write(_sexpdata.dumps(sch_data))
+
+                return {
+                    "success": True,
+                    "oldPosition": {"x": old_x, "y": old_y},
+                    "newPosition": {"x": float(new_x), "y": float(new_y)},
+                }
+
+            return {"success": False, "message": f"Label '{net_name}' not found"}
+
+        except Exception as e:
+            logger.error(f"Error moving schematic net label: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
     def _handle_export_schematic_svg(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Export schematic to SVG using kicad-cli"""
         logger.info("Exporting schematic SVG")
         import glob
@@ -6449,7 +2917,6 @@ class KiCADInterface:
                 "sch",
                 "export",
                 "svg",
-                "--no-background-color",
                 schematic_path,
                 "-o",
                 output_dir,
@@ -6489,10 +2956,11 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_get_net_connections(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Get all connections for a named net"""
         logger.info("Getting net connections")
         try:
+            from commands.wire_connectivity import get_connections_for_net
+
             schematic_path = params.get("schematicPath")
             net_name = params.get("netName")
 
@@ -6503,156 +2971,63 @@ class KiCADInterface:
             if not schematic:
                 return {"success": False, "message": "Failed to load schematic"}
 
-            connections = ConnectionManager.get_net_connections(schematic, net_name)
+            connections = get_connections_for_net(schematic, schematic_path, net_name)
             return {"success": True, "connections": connections}
         except Exception as e:
             logger.error(f"Error getting net connections: {str(e)}")
             return {"success": False, "message": str(e)}
 
-    @staticmethod
-    def _resolve_sym_lib_table_for_erc(schematic_path: str):
-        """
-        Temporarily write a resolved sym-lib-table with ${KIPRJMOD} substituted by
-        the absolute project directory so kicad-cli can open project-local libraries.
-
-        Returns a cleanup callable (call after kicad-cli finishes), or None if no
-        resolution was needed.
-        """
-        import shutil
-        from pathlib import Path
-
-        project_dir = Path(schematic_path).parent
-        sym_lib_table = project_dir / "sym-lib-table"
-
-        if not sym_lib_table.exists():
-            return None
-
-        with open(sym_lib_table, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        if "${KIPRJMOD}" not in content:
-            return None
-
-        project_abs = str(project_dir.resolve())
-        resolved = content.replace("${KIPRJMOD}", project_abs)
-
-        backup_path = sym_lib_table.with_suffix(".erc-backup")
-        shutil.copy2(sym_lib_table, backup_path)
-        try:
-            with open(sym_lib_table, "w", encoding="utf-8") as f:
-                f.write(resolved)
-            logger.info(f"Wrote resolved sym-lib-table for ERC (KIPRJMOD={project_abs})")
-        except Exception as e:
-            logger.warning(f"Could not write resolved sym-lib-table: {e}")
-            if backup_path.exists():
-                backup_path.unlink()
-            return None
-
-        def cleanup():
-            try:
-                if backup_path.exists():
-                    shutil.copy2(backup_path, sym_lib_table)
-                    backup_path.unlink()
-            except Exception as ex:
-                logger.warning(f"Could not restore sym-lib-table backup: {ex}")
-
-        return cleanup
-
-    def _handle_validate_schematic(self, params):
-        """Check parenthesis balance and basic structure of a .kicad_sch file without fully loading it."""
-        logger.info("Validating schematic syntax")
+    def _handle_get_wire_connections(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Find net name and all component pins reachable from a point or component pin."""
+        logger.info("Getting wire connections")
         try:
             from pathlib import Path
 
-            schematic_path = params.get("schematicPath")
-            if not schematic_path:
-                return {"success": False, "message": "schematicPath is required"}
-
-            sch_file = Path(schematic_path)
-            if not sch_file.exists():
-                return {"success": False, "message": f"File not found: {schematic_path}"}
-
-            with open(sch_file, "r", encoding="utf-8") as f:
-                content = f.read()
-
-            depth = 0
-            in_string = False
-            escape_next = False
-            error_line = None
-            error_char = None
-            line_num = 1
-
-            for i, ch in enumerate(content):
-                if escape_next:
-                    escape_next = False
-                    continue
-                if ch == "\n":
-                    line_num += 1
-                if in_string:
-                    if ch == "\\":
-                        escape_next = True
-                    elif ch == '"':
-                        in_string = False
-                    continue
-                if ch == '"':
-                    in_string = True
-                    continue
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                    if depth < 0:
-                        error_line = line_num
-                        error_char = i
-                        break
-
-            if error_line is not None:
-                return {
-                    "success": False,
-                    "valid": False,
-                    "error": f"Parenthesis underflow at line {error_line} (char {error_char}): unexpected ')'",
-                    "line": error_line,
-                }
-            if depth != 0:
-                return {
-                    "success": False,
-                    "valid": False,
-                    "error": f"Parenthesis mismatch: {depth} unclosed '(' at end of file",
-                    "unclosed": depth,
-                }
-            return {
-                "success": True,
-                "valid": True,
-                "message": f"Schematic syntax OK ({len(content)} bytes, {line_num} lines)",
-            }
-        except Exception as e:
-            logger.error(f"Error validating schematic: {e}")
-            return {"success": False, "message": str(e)}
-
-    def _handle_get_wire_connections(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
-        """Find all component pins reachable from a point via connected wires"""
-        logger.info("Getting wire connections")
-        try:
+            from commands.pin_locator import PinLocator
             from commands.wire_connectivity import get_wire_connections
 
             schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "Missing required parameter: schematicPath"}
+
+            reference = params.get("reference")
+            pin = params.get("pin")
             x = params.get("x")
             y = params.get("y")
 
-            if not (schematic_path and x is not None and y is not None):
+            has_ref_pin = reference is not None and pin is not None
+            has_coords = x is not None and y is not None
+
+            if has_ref_pin and has_coords:
                 return {
                     "success": False,
-                    "message": "Missing required parameters: schematicPath, x, y",
+                    "message": "Supply either {reference, pin} or {x, y}, not both",
                 }
 
-            try:
-                x, y = float(x), float(y)
-            except (TypeError, ValueError):
+            if not has_ref_pin and not has_coords:
+                if reference is not None or pin is not None:
+                    return {
+                        "success": False,
+                        "message": "Both reference and pin are required together",
+                    }
                 return {
                     "success": False,
-                    "message": "Parameters x and y must be numeric",
+                    "message": "Must supply either {reference, pin} or {x, y}",
                 }
+
+            if has_ref_pin:
+                location = PinLocator().get_pin_location(Path(schematic_path), reference, str(pin))
+                if location is None:
+                    return {
+                        "success": False,
+                        "message": f"Pin {pin} not found on {reference}",
+                    }
+                x, y = location[0], location[1]
+            else:
+                try:
+                    x, y = float(x), float(y)
+                except (TypeError, ValueError):
+                    return {"success": False, "message": "Parameters x and y must be numeric"}
 
             schematic = SchematicManager.load_schematic(schematic_path)
             if not schematic:
@@ -6665,7 +3040,7 @@ class KiCADInterface:
             if result is None:
                 return {
                     "success": False,
-                    "message": f"No wire found at ({x},{y}) within tolerance",
+                    "message": f"No wire found at ({x},{y}) — point may not be connected",
                 }
 
             return {"success": True, **result}
@@ -6677,8 +3052,253 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
+    def _handle_get_net_at_point(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the net name at a given (x, y) coordinate, or null if none found."""
+        logger.info("Getting net at point")
+        try:
+            from commands.wire_connectivity import get_net_at_point
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "Missing required parameter: schematicPath"}
+
+            x = params.get("x")
+            y = params.get("y")
+            if x is None or y is None:
+                return {"success": False, "message": "Missing required parameters: x and y"}
+
+            try:
+                x, y = float(x), float(y)
+            except (TypeError, ValueError):
+                return {"success": False, "message": "Parameters x and y must be numeric"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            result = get_net_at_point(schematic, schematic_path, x, y)
+            return {"success": True, **result}
+
+        except Exception as e:
+            logger.error(f"Error getting net at point: {str(e)}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_list_schematic_texts(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """List all free-form text annotations (SCH_TEXT) in a schematic."""
+        logger.info("Listing schematic text annotations")
+        try:
+            from commands.wire_manager import WireManager
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            sch_file = Path(schematic_path)
+            if not sch_file.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            texts = WireManager.list_texts(sch_file)
+            if texts is None:
+                return {"success": False, "message": "Failed to parse schematic"}
+
+            # Optional text filter
+            filter_text = params.get("text")
+            if filter_text is not None:
+                texts = [t for t in texts if filter_text.lower() in t["text"].lower()]
+
+            return {"success": True, "texts": texts, "count": len(texts)}
+
+        except Exception as e:
+            logger.error(f"Error listing schematic texts: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_add_schematic_text(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Add a free-form text annotation (SCH_TEXT) to a schematic."""
+        logger.info("Adding text annotation to schematic")
+        try:
+            from commands.wire_manager import WireManager
+
+            schematic_path = params.get("schematicPath")
+            text = params.get("text")
+            position = params.get("position")
+            angle = params.get("angle", 0)
+            font_size = params.get("fontSize", 1.27)
+            bold = params.get("bold", False)
+            italic = params.get("italic", False)
+            justify = params.get("justify", "left")
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not text:
+                return {"success": False, "message": "text is required"}
+            if not position or len(position) != 2:
+                return {"success": False, "message": "position [x, y] is required"}
+            if justify not in ("left", "center", "right"):
+                return {"success": False, "message": "justify must be left, center, or right"}
+            if font_size <= 0:
+                return {"success": False, "message": "fontSize must be positive"}
+
+            sch_file = Path(schematic_path)
+            if not sch_file.exists():
+                return {
+                    "success": False,
+                    "message": f"Schematic not found: {schematic_path}",
+                }
+
+            success = WireManager.add_text(
+                sch_file,
+                text,
+                position,
+                angle=angle,
+                font_size=font_size,
+                bold=bold,
+                italic=italic,
+                justify=justify,
+            )
+
+            if success:
+                return {
+                    "success": True,
+                    "message": f"Added text '{text}' at ({position[0]}, {position[1]})",
+                    "position": {"x": position[0], "y": position[1]},
+                    "angle": angle,
+                }
+            return {"success": False, "message": "Failed to add text annotation"}
+
+        except Exception as e:
+            logger.error(f"Error adding schematic text: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_add_schematic_hierarchical_label(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Add a hierarchical label to a sub-sheet schematic."""
+        logger.info("Adding hierarchical label to schematic")
+        try:
+            from commands.wire_manager import WireManager
+
+            schematic_path = params.get("schematicPath")
+            text = params.get("text")
+            position = params.get("position")
+            shape = params.get("shape", "bidirectional")
+            orientation = params.get("orientation", 0)
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not text:
+                return {"success": False, "message": "text is required"}
+            if not position or len(position) != 2:
+                return {"success": False, "message": "position [x, y] is required"}
+            if shape not in ("input", "output", "bidirectional"):
+                return {
+                    "success": False,
+                    "message": "shape must be input, output, or bidirectional",
+                }
+
+            sch_file = Path(schematic_path)
+            if not sch_file.exists():
+                return {
+                    "success": False,
+                    "message": f"Schematic not found: {schematic_path}",
+                }
+
+            success = WireManager.add_hierarchical_label(
+                sch_file, text, position, shape=shape, orientation=orientation
+            )
+
+            if success:
+                return {
+                    "success": True,
+                    "message": (
+                        f"Added hierarchical_label '{text}' " f"at {position} shape={shape}"
+                    ),
+                }
+            return {"success": False, "message": "Failed to add hierarchical label"}
+
+        except Exception as e:
+            logger.error(f"Error adding hierarchical label: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_add_sheet_pin(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Add a sheet pin to a sheet block on the parent schematic."""
+        logger.info("Adding sheet pin to schematic")
+        try:
+            from commands.wire_manager import WireManager
+
+            schematic_path = params.get("schematicPath")
+            sheet_name = params.get("sheetName")
+            pin_name = params.get("pinName")
+            pin_type = params.get("pinType", "bidirectional")
+            position = params.get("position")
+            orientation = params.get("orientation", 0)
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not sheet_name:
+                return {"success": False, "message": "sheetName is required"}
+            if not pin_name:
+                return {"success": False, "message": "pinName is required"}
+            if not position or len(position) != 2:
+                return {"success": False, "message": "position [x, y] is required"}
+            if pin_type not in ("input", "output", "bidirectional"):
+                return {
+                    "success": False,
+                    "message": "pinType must be input, output, or bidirectional",
+                }
+
+            sch_file = Path(schematic_path)
+            if not sch_file.exists():
+                return {
+                    "success": False,
+                    "message": f"Schematic not found: {schematic_path}",
+                }
+
+            with open(sch_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            modified, success = WireManager.add_sheet_pin(
+                content,
+                sheet_name,
+                pin_name,
+                pin_type,
+                position,
+                orientation=orientation,
+            )
+
+            if not success:
+                return {
+                    "success": False,
+                    "message": f"Sheet '{sheet_name}' not found in {schematic_path}",
+                }
+
+            with open(sch_file, "w", encoding="utf-8") as f:
+                f.write(modified)
+
+            return {
+                "success": True,
+                "message": (
+                    f"Added sheet pin '{pin_name}' ({pin_type}) " f"to sheet '{sheet_name}'"
+                ),
+            }
+
+        except Exception as e:
+            logger.error(f"Error adding sheet pin: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
     def _handle_run_erc(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Run Electrical Rules Check on a schematic via kicad-cli"""
         logger.info("Running ERC on schematic")
         import os
@@ -6687,65 +3307,11 @@ class KiCADInterface:
 
         try:
             schematic_path = params.get("schematicPath")
-            hierarchical = params.get("hierarchical", False)
-
             if not schematic_path or not os.path.exists(schematic_path):
                 return {
                     "success": False,
                     "message": "Schematic file not found",
                     "errorDetails": f"Path does not exist: {schematic_path}",
-                }
-
-            # Hierarchical mode: run ERC on every .kicad_sch in the project directory
-            if hierarchical:
-                from pathlib import Path as _Path
-                _proj_dir = _Path(schematic_path).parent
-                _sch_files = sorted(_proj_dir.glob("*.kicad_sch"))
-                _all_violations_by_sheet = {}
-                _all_notes = []
-                _total_violations = 0
-                _total_actionable = 0
-                _total_benign = 0
-                _severity_counts = {"error": 0, "warning": 0, "info": 0}
-                for _sch_file in _sch_files:
-                    _sheet_result = self._handle_run_erc({
-                        "schematicPath": str(_sch_file),
-                        "hierarchical": False,
-                    })
-                    _fname = _sch_file.name
-                    if _sheet_result.get("success"):
-                        _sheet_violations = _sheet_result.get("violations", [])
-                        for _v in _sheet_violations:
-                            _v["sheet"] = _fname
-                        _all_violations_by_sheet[_fname] = _sheet_violations
-                        _total_violations += len(_sheet_violations)
-                        _s = _sheet_result.get("summary", {})
-                        _total_actionable += _s.get("actionable", 0)
-                        _total_benign += _s.get("benign", 0)
-                        for _sev, _cnt in _s.get("by_severity", {}).items():
-                            _severity_counts[_sev] = _severity_counts.get(_sev, 0) + _cnt
-                        for _note in _sheet_result.get("notes", []):
-                            if _note not in _all_notes:
-                                _all_notes.append(_note)
-                    else:
-                        _all_violations_by_sheet[_fname] = [{"error": _sheet_result.get("message")}]
-                _all_violations_flat = [
-                    v for vs in _all_violations_by_sheet.values() for v in vs
-                ]
-                return {
-                    "success": True,
-                    "message": f"Hierarchical ERC complete: {_total_violations} violation(s) across {len(_sch_files)} sheet(s)",
-                    "coordinate_units": "mm",
-                    "notes": _all_notes,
-                    "sheets_checked": [f.name for f in _sch_files],
-                    "violations_by_sheet": _all_violations_by_sheet,
-                    "violations": _all_violations_flat,
-                    "summary": {
-                        "total": _total_violations,
-                        "actionable": _total_actionable,
-                        "benign": _total_benign,
-                        "by_severity": _severity_counts,
-                    },
                 }
 
             kicad_cli = self.design_rule_commands._find_kicad_cli()
@@ -6758,35 +3324,6 @@ class KiCADInterface:
 
             with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
                 json_output = tmp.name
-
-            # Pre-resolve ${KIPRJMOD} in the project sym-lib-table so kicad-cli
-            # can open project-local libraries that use relative paths.
-            erc_cleanup = self._resolve_sym_lib_table_for_erc(schematic_path)
-
-            # kicad-cli determines the project by finding a .kicad_pro file with
-            # the same basename as the input schematic. Sub-sheets don't have their
-            # own .kicad_pro, so kicad-cli falls back to the global library tables
-            # (which may resolve to wrong paths) and produces spurious warnings.
-            # Fix: temporarily symlink the parent .kicad_pro using the sub-sheet's
-            # basename so kicad-cli loads the correct project library tables.
-            from pathlib import Path
-            sch_path_obj = Path(schematic_path)
-            project_dir = sch_path_obj.parent
-            expected_pro = sch_path_obj.with_suffix(".kicad_pro")
-            is_sub_sheet = not expected_pro.exists()
-            tmp_pro_symlink = None
-            if not expected_pro.exists():
-                existing_pros = list(project_dir.glob("*.kicad_pro"))
-                if existing_pros:
-                    tmp_pro_symlink = expected_pro
-                    try:
-                        tmp_pro_symlink.symlink_to(existing_pros[0].name)
-                        logger.info(
-                            f"Created temporary project symlink {tmp_pro_symlink.name} -> {existing_pros[0].name}"
-                        )
-                    except Exception as _sym_err:
-                        logger.warning(f"Could not create project symlink: {_sym_err}")
-                        tmp_pro_symlink = None
 
             try:
                 cmd = [
@@ -6803,11 +3340,14 @@ class KiCADInterface:
 
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
-                if result.returncode != 0:
-                    logger.error(f"ERC command failed: {result.stderr}")
+                # kicad-cli returns non-zero when ERC violations are found —
+                # this is normal, not an error.  Only fail when no JSON was
+                # produced (genuine CLI failure).
+                if not os.path.exists(json_output) or os.path.getsize(json_output) == 0:
+                    logger.error(f"ERC command produced no output: {result.stderr}")
                     return {
                         "success": False,
-                        "message": "ERC command failed",
+                        "message": "ERC command failed - no output produced",
                         "errorDetails": result.stderr,
                     }
 
@@ -6817,277 +3357,46 @@ class KiCADInterface:
                 violations = []
                 severity_counts = {"error": 0, "warning": 0, "info": 0}
 
-                # BUG-3 fix: only suppress lib_symbol_issues for truly unresolvable
-                # global libraries. footprint_link_issues ("footprint library" /
-                # "footprint not found") are actionable and must NOT be filtered.
-                BENIGN_PATTERNS = [
-                    "symbol not found in global library",
-                    "not found in global",
-                ]
-                BENIGN_TYPES: set = set()
-
-                def _is_benign_violation(v):
-                    if v.get("type", "") in BENIGN_TYPES:
-                        return True
-                    desc = v.get("message", "").lower()
-                    return any(pat in desc for pat in BENIGN_PATTERNS)
-
-                all_violations = []
-                sheets_checked = []
+                # KiCad 9 nests violations under sheets[].violations
+                # instead of (or in addition to) the top-level violations
+                # array used by KiCad 8.
+                all_violations = erc_data.get("violations", [])
                 for sheet in erc_data.get("sheets", []):
                     all_violations.extend(sheet.get("violations", []))
-                    fname = sheet.get("filename") or sheet.get("source") or ""
-                    if fname:
-                        sheets_checked.append(os.path.basename(fname))
-
-                import re as _re_erc
-
-                def _get_comp_footprint(ref):
-                    """Return the Footprint property value for component 'ref' in the schematic."""
-                    try:
-                        _sch_content = open(schematic_path, encoding="utf-8").read()
-                        _ref_pat = _re_erc.compile(
-                            r'\(property\s+"Reference"\s+"' + _re_erc.escape(ref) + r'"'
-                        )
-                        for _rm in _ref_pat.finditer(_sch_content):
-                            _start = _sch_content.rfind("(symbol", 0, _rm.start())
-                            if _start == -1:
-                                continue
-                            _depth, _end = 0, _start
-                            for _i, _ch in enumerate(_sch_content[_start:], _start):
-                                _depth += (_ch == "(") - (_ch == ")")
-                                if _depth == 0:
-                                    _end = _i + 1
-                                    break
-                            _sym_block = _sch_content[_start:_end]
-                            _fp_m = _re_erc.search(
-                                r'\(property\s+"Footprint"\s+"([^"]+)"', _sym_block
-                            )
-                            if _fp_m:
-                                return _fp_m.group(1)
-                    except Exception:
-                        pass
-                    return None
-
-                def _fp_file_exists(fp_ref):
-                    """Return True if fp_ref (LibName:FPName) resolves to an existing .kicad_mod via
-                    the project fp-lib-table; False if resolvable but missing; None if indeterminate."""
-                    if not fp_ref or ":" not in fp_ref:
-                        return None
-                    _lib_name, _fp_name = fp_ref.split(":", 1)
-                    _fp_name = _fp_name.replace(".kicad_mod", "")
-                    _fp_lib_table = project_dir / "fp-lib-table"
-                    if not _fp_lib_table.exists():
-                        return None
-                    try:
-                        _tbl = _fp_lib_table.read_text(encoding="utf-8")
-                        for _line in _tbl.splitlines():
-                            if f'(name "{_lib_name}")' in _line or f"(name {_lib_name})" in _line:
-                                _uri_m = _re_erc.search(r'\(uri\s+"([^"]+)"\)', _line)
-                                if _uri_m:
-                                    _uri = _uri_m.group(1).replace(
-                                        "${KIPRJMOD}", str(project_dir)
-                                    )
-                                    return (Path(_uri) / f"{_fp_name}.kicad_mod").exists()
-                    except Exception:
-                        pass
-                    return None
 
                 for v in all_violations:
                     vseverity = v.get("severity", "error")
                     items = v.get("items", [])
                     loc = {}
-                    items_detail = []
-                    for item in items:
-                        item_info = {}
-                        if "pos" in item:
-                            # kicad-cli ERC JSON outputs positions in 1/100 mm
-                            # (KiCad internal schematic units). Multiply by 100
-                            # to convert to mm.
-                            item_info["pos"] = {
-                                "x": item["pos"].get("x", 0) * 100,
-                                "y": item["pos"].get("y", 0) * 100,
-                            }
-                        if "description" in item:
-                            item_info["description"] = item["description"]
-                        if "uuid" in item:
-                            item_info["uuid"] = item["uuid"]
-                        items_detail.append(item_info)
-                    if items_detail and "pos" in items_detail[0]:
-                        loc = items_detail[0]["pos"]
-                    violation_dict = {
-                        "type": v.get("type", "unknown"),
-                        "severity": vseverity,
-                        "message": v.get("description", ""),
-                        "items": items_detail,
-                        "location": loc,
-                    }
-                    violation_dict["benign"] = _is_benign_violation(violation_dict)
-                    if violation_dict.get("type") == "global_label_dangling":
-                        violation_dict["note"] = (
-                            "Fires when no matching global label exists on any other sheet "
-                            "in the project. The label may still be correctly wired on this "
-                            "sheet. This is expected for sub-sheets created before their peer "
-                            "sheet exists."
-                        )
-                    # WORKAROUND (kicad-cli v10): power_pin_not_driven fires spuriously
-                    # when ERC runs on a sub-sheet in isolation because kicad-cli cannot
-                    # see power drivers that live on other sheets without the full project
-                    # hierarchy.  Root-schematic ERC does not produce this violation.
-                    # TODO: re-evaluate and remove this workaround once kicad-cli correctly
-                    # resolves cross-sheet power drivers in sub-sheet ERC mode.
-                    # Track upstream fix at: https://gitlab.com/kicad/code/kicad/-/issues
-                    if violation_dict.get("type") == "power_pin_not_driven" and is_sub_sheet:
-                        violation_dict["benign"] = True
-                        violation_dict["note"] = (
-                            "Likely spurious (kicad-cli v10 sub-sheet isolation): power "
-                            "drivers on other sheets are not visible when ERC runs on a "
-                            "sub-sheet without the full project hierarchy. Confirm by "
-                            "running ERC on the root schematic."
-                        )
-                    # WORKAROUND (kicad-cli v10): footprint_link_issues fires spuriously
-                    # because kicad-cli v10 fails to load the project fp-lib-table
-                    # (injecting bogus entries into the table has no effect on violations,
-                    # confirming the table is not read).  We independently verify by
-                    # resolving the footprint through the fp-lib-table ourselves and
-                    # checking that the .kicad_mod file exists on disk.
-                    # TODO: re-evaluate and remove this workaround once kicad-cli correctly
-                    # loads the project fp-lib-table during ERC.
-                    # Track upstream fix at: https://gitlab.com/kicad/code/kicad/-/issues
-                    if violation_dict.get("type") == "footprint_link_issues":
-                        _v_refs = []
-                        for _v_item in violation_dict.get("items", []):
-                            _dm = _re_erc.search(
-                                r"Symbol\s+(\S+)", _v_item.get("description", "")
-                            )
-                            if _dm:
-                                _v_refs.append(_dm.group(1))
-                        _fp_ref = _get_comp_footprint(_v_refs[0]) if _v_refs else None
-                        _exists = _fp_file_exists(_fp_ref)
-                        if _exists is True:
-                            violation_dict["benign"] = True
-                            violation_dict["note"] = (
-                                f"Likely spurious: footprint '{_fp_ref}' exists on disk "
-                                "but kicad-cli v10 failed to resolve the project "
-                                "fp-lib-table (known kicad-cli v10 regression). "
-                                "Verify the footprint assignment in KiCad GUI."
-                            )
-                        elif _exists is None:
-                            violation_dict.setdefault(
-                                "note",
-                                "Could not independently verify footprint existence. "
-                                "kicad-cli v10 may have failed to load the project "
-                                "fp-lib-table; check footprint assignment in KiCad GUI.",
-                            )
-                    violations.append(violation_dict)
+                    if items and "pos" in items[0]:
+                        loc = {
+                            "x": items[0]["pos"].get("x", 0),
+                            "y": items[0]["pos"].get("y", 0),
+                        }
+                    violations.append(
+                        {
+                            "type": v.get("type", "unknown"),
+                            "severity": vseverity,
+                            "message": v.get("description", ""),
+                            "location": loc,
+                        }
+                    )
                     if vseverity in severity_counts:
                         severity_counts[vseverity] += 1
 
-                notes = [
-                    "All coordinates are in millimeters (mm).",
-                    "ERC reads the saved file on disk. If the schematic is open in KiCad UI with unsaved changes, reload it in KiCad to sync before comparing results.",
-                ]
-                if any(v["type"] == "lib_symbol_issues" for v in violations):
-                    notes.append(
-                        "lib_symbol_issues can be false-positives if project .kicad_sym "
-                        "files contain ; lines with (, ), or [ characters. KiCAD's "
-                        "s-expression parser treats ; lines as data, not comments — "
-                        "such lines corrupt the parse tree. Remove ; lines from the "
-                        "affected library files to resolve."
-                    )
-                if any(
-                    v.get("benign") and v["type"] == "power_pin_not_driven"
-                    for v in violations
-                ):
-                    notes.append(
-                        "One or more power_pin_not_driven violations were marked benign: "
-                        "kicad-cli v10 cannot resolve power drivers from other sheets when "
-                        "running ERC on a sub-sheet in isolation. Run ERC on the root "
-                        "schematic to see the authoritative result for power net continuity."
-                    )
-                if any(
-                    v.get("benign") and v["type"] == "footprint_link_issues"
-                    for v in violations
-                ):
-                    notes.append(
-                        "One or more footprint_link_issues violations were marked benign: "
-                        "the footprint file was found on disk via the project fp-lib-table, "
-                        "but kicad-cli v10 failed to load that table (known regression). "
-                        "These are not real missing-footprint errors."
-                    )
-
-                # Build PWR_FLAG suggestions for pin_not_driven violations.
-                # Each undriven power pin needs a PWR_FLAG placed at its coordinate
-                # on the same net.  The ERC violation items contain the pin position.
-                pwr_flag_suggestions = []
-                try:
-                    _seen_pwr_nets: set = set()
-                    for v in violations:
-                        if v.get("type") != "pin_not_driven":
-                            continue
-                        msg = v.get("message", "")
-                        loc = v.get("location", {})
-                        if not loc:
-                            continue
-                        # Extract net name from violation message (KiCAD format:
-                        # "Pin ... of ... is not driven" — net name appears in items)
-                        net_name = None
-                        for item in v.get("items", []):
-                            desc = item.get("description", "")
-                            # Typical desc: "Pin ~ of PWR_FLAG, net VBUS"
-                            import re as _re2
-                            m = _re2.search(r'\bnet\s+(\S+)', desc, _re2.IGNORECASE)
-                            if m:
-                                net_name = m.group(1).rstrip(".,;")
-                                break
-                        if not net_name:
-                            # Fallback: parse from violation message
-                            m = _re2.search(r'net\s+["\']?(\S+?)["\']?[\s,.]', msg, _re2.IGNORECASE)
-                            net_name = m.group(1) if m else f"net_at_{loc.get('x',0):.1f}_{loc.get('y',0):.1f}"
-
-                        if net_name in _seen_pwr_nets:
-                            continue
-                        _seen_pwr_nets.add(net_name)
-                        pwr_flag_suggestions.append({
-                            "net": net_name,
-                            "suggested_position": {"x": loc.get("x", 0), "y": loc.get("y", 0)},
-                            "action": (
-                                f"Place a PWR_FLAG (power:PWR_FLAG) near ({loc.get('x',0):.2f}, {loc.get('y',0):.2f}) "
-                                f"and connect it to net '{net_name}' using batch_add_and_connect or batch_add_components + batch_connect"
-                            ),
-                        })
-                except Exception as _pwr_err:
-                    logger.warning(f"PWR_FLAG suggestion generation failed: {_pwr_err}")
-
-                result_dict = {
+                return {
                     "success": True,
                     "message": f"ERC complete: {len(violations)} violation(s)",
-                    "coordinate_units": "mm",
-                    "notes": notes,
-                    "sheets_checked": sheets_checked,
                     "summary": {
                         "total": len(violations),
-                        "actionable": sum(1 for v in violations if not v.get("benign")),
-                        "benign": sum(1 for v in violations if v.get("benign")),
                         "by_severity": severity_counts,
                     },
                     "violations": violations,
                 }
-                if pwr_flag_suggestions:
-                    result_dict["pwr_flag_suggestions"] = pwr_flag_suggestions
-                return result_dict
 
             finally:
                 if os.path.exists(json_output):
                     os.unlink(json_output)
-                if erc_cleanup:
-                    erc_cleanup()
-                if tmp_pro_symlink is not None and tmp_pro_symlink.is_symlink():
-                    try:
-                        tmp_pro_symlink.unlink()
-                        logger.info(f"Removed temporary project symlink {tmp_pro_symlink.name}")
-                    except Exception as _del_err:
-                        logger.warning(f"Could not remove project symlink: {_del_err}")
 
         except subprocess.TimeoutExpired:
             return {"success": False, "message": "ERC timed out after 120 seconds"}
@@ -7095,25 +3404,333 @@ class KiCADInterface:
             logger.error(f"Error running ERC: {str(e)}")
             return {"success": False, "message": str(e)}
 
-    def _handle_generate_netlist(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
-        """Generate netlist from schematic"""
-        logger.info("Generating netlist from schematic")
+    # ------------------------------------------------------------------
+    # kicad-cli helper shared by netlist handlers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_kicad_cli_static() -> Optional[str]:
+        """Return path to kicad-cli executable, or None."""
+        import platform
+        import shutil
+
+        cli = shutil.which("kicad-cli")
+        if cli:
+            return cli
+
+        system = platform.system()
+        if system == "Windows":
+            candidates = [
+                r"C:\Program Files\KiCad\9.0\bin\kicad-cli.exe",
+                r"C:\Program Files\KiCad\8.0\bin\kicad-cli.exe",
+                r"C:\Program Files (x86)\KiCad\9.0\bin\kicad-cli.exe",
+                r"C:\Program Files (x86)\KiCad\8.0\bin\kicad-cli.exe",
+            ]
+        elif system == "Darwin":
+            candidates = [
+                "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli",
+                "/usr/local/bin/kicad-cli",
+            ]
+        else:
+            candidates = [
+                "/usr/bin/kicad-cli",
+                "/usr/local/bin/kicad-cli",
+            ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return None
+
+    # ------------------------------------------------------------------
+
+    def _handle_export_netlist(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Export netlist to a file using kicad-cli."""
+        import subprocess
+
+        logger.info("Exporting netlist via kicad-cli")
         try:
             schematic_path = params.get("schematicPath")
+            output_path = params.get("outputPath")
+            fmt = params.get("format", "KiCad")
 
             if not schematic_path:
-                return {"success": False, "message": "Schematic path is required"}
+                return {"success": False, "message": "schematicPath is required"}
+            if not output_path:
+                return {"success": False, "message": "outputPath is required"}
+            if not os.path.exists(schematic_path):
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
 
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
+            kicad_cli = self._find_kicad_cli_static()
+            if not kicad_cli:
+                return {"success": False, "message": "kicad-cli not found in PATH"}
 
-            netlist = ConnectionManager.generate_netlist(schematic, schematic_path=schematic_path)
-            return {"success": True, "netlist": netlist}
+            fmt_map = {
+                "KiCad": "kicadxml",
+                "Spice": "spice",
+                "Cadstar": "cadstar",
+                "OrcadPCB2": "orcadpcb2",
+            }
+            cli_format = fmt_map.get(fmt, "kicadxml")
+
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+            cmd = [
+                kicad_cli,
+                "sch",
+                "export",
+                "netlist",
+                "--format",
+                cli_format,
+                "--output",
+                output_path,
+                schematic_path,
+            ]
+            logger.info(f"Running: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+            if result.returncode == 0:
+                return {"success": True, "outputPath": output_path, "format": fmt}
+            else:
+                return {
+                    "success": False,
+                    "message": f"kicad-cli failed (exit {result.returncode}): {result.stderr.strip()}",
+                }
+
+        except FileNotFoundError:
+            return {"success": False, "message": "kicad-cli not found in PATH"}
+        except subprocess.TimeoutExpired:
+            return {"success": False, "message": "kicad-cli timed out after 60 seconds"}
         except Exception as e:
-            logger.error(f"Error generating netlist: {str(e)}")
+            logger.error(f"Error exporting netlist: {e}")
             return {"success": False, "message": str(e)}
+
+    def _handle_generate_netlist(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate netlist from schematic and return structured JSON.
+
+        Uses kicad-cli to export KiCad XML netlist to a temp file, then
+        parses it into {components, nets} structure expected by the TS handler.
+        """
+        import subprocess
+        import tempfile
+        import xml.etree.ElementTree as ET
+
+        logger.info("Generating netlist from schematic via kicad-cli")
+        try:
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "Schematic path is required"}
+            if not os.path.exists(schematic_path):
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            kicad_cli = self._find_kicad_cli_static()
+            if not kicad_cli:
+                return {"success": False, "message": "kicad-cli not found in PATH"}
+
+            with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            try:
+                cmd = [
+                    kicad_cli,
+                    "sch",
+                    "export",
+                    "netlist",
+                    "--format",
+                    "kicadxml",
+                    "--output",
+                    tmp_path,
+                    schematic_path,
+                ]
+                logger.info(f"Running: {' '.join(cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+                if result.returncode != 0:
+                    return {
+                        "success": False,
+                        "message": f"kicad-cli failed (exit {result.returncode}): {result.stderr.strip()}",
+                    }
+
+                tree = ET.parse(tmp_path)
+                root = tree.getroot()
+
+                components = []
+                for comp in root.findall("./components/comp"):
+                    ref = comp.get("ref", "")
+                    value = comp.findtext("value", "")
+                    footprint = comp.findtext("footprint", "")
+                    components.append({"reference": ref, "value": value, "footprint": footprint})
+
+                nets = []
+                for net in root.findall("./nets/net"):
+                    net_name = net.get("name", "")
+                    connections = []
+                    for node in net.findall("node"):
+                        connections.append(
+                            {
+                                "component": node.get("ref", ""),
+                                "pin": node.get("pin", ""),
+                            }
+                        )
+                    nets.append({"name": net_name, "connections": connections})
+
+                logger.info(f"Generated netlist: {len(components)} components, {len(nets)} nets")
+                return {"success": True, "netlist": {"components": components, "nets": nets}}
+
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+        except FileNotFoundError:
+            return {"success": False, "message": "kicad-cli not found in PATH"}
+        except subprocess.TimeoutExpired:
+            return {"success": False, "message": "kicad-cli timed out after 60 seconds"}
+        except Exception as e:
+            logger.error(f"Error generating netlist: {e}")
+            return {"success": False, "message": str(e)}
+
+    def _build_hierarchical_pad_net_map(self, project_sch_path: str):
+        """Walk all .kicad_sch files in the project and build a {(ref, pin_num): net_name} map.
+
+        Handles hierarchical schematics by scanning every sub-sheet file.  Net names
+        from global_label / hierarchical_label / local label / power symbols are all
+        collected.  Wire connectivity is traced via BFS so labels not placed directly
+        on a pin endpoint still reach through wire segments.
+
+        Returns: (pad_net_map, net_names_set)
+        """
+        from collections import defaultdict
+        from pathlib import Path
+
+        from commands.pin_locator import PinLocator
+        from skip import Schematic
+
+        TOLERANCE = 0.5  # mm; schematic grid is 1.27 mm so 0.5 is safe
+
+        def snap(x, y):
+            """Round to 2 dp to use exact dict lookup instead of O(n²) scan."""
+            return (round(float(x), 2), round(float(y), 2))
+
+        def nearby_net(pt, point_net, tol=TOLERANCE):
+            """Return net name for the nearest occupied grid point, or None."""
+            x, y = pt
+            # Try exact snap first (fast path)
+            key = snap(x, y)
+            if key in point_net:
+                return point_net[key]
+            # Slow fallback for off-grid placements
+            for (lx, ly), name in point_net.items():
+                if abs(x - lx) < tol and abs(y - ly) < tol:
+                    return name
+            return None
+
+        project_dir = Path(project_sch_path).parent
+        pad_net_map: dict = {}
+        all_net_names: set = set()
+        pin_locator = PinLocator()
+
+        sch_files = sorted(project_dir.rglob("*.kicad_sch"))
+        logger.info(f"_build_hierarchical_pad_net_map: scanning {len(sch_files)} schematic files")
+
+        for sch_path in sch_files:
+            try:
+                sch = Schematic(str(sch_path))
+            except Exception as e:
+                logger.warning(f"Could not load {sch_path}: {e}")
+                continue
+
+            # ── 1. Collect explicit label positions → net name ──────────────
+            point_net: dict = {}  # snap(x,y) -> net_name
+
+            for attr in ("label", "global_label", "hierarchical_label"):
+                for lbl in getattr(sch, attr, None) or []:
+                    try:
+                        pos = lbl.at.value
+                        name = lbl.value
+                        if name:
+                            k = snap(pos[0], pos[1])
+                            point_net[k] = name
+                            all_net_names.add(name)
+                    except Exception:
+                        pass
+
+            # Power symbols (#PWR / #FLG): value property IS the net name; use pin 1 pos
+            for sym in getattr(sch, "symbol", None) or []:
+                try:
+                    ref = sym.property.Reference.value
+                    if not (ref.startswith("#PWR") or ref.startswith("#FLG")):
+                        continue
+                    net_name = sym.property.Value.value
+                    if not net_name:
+                        continue
+                    all_pins = pin_locator.get_all_symbol_pins(sch_path, ref)
+                    for _pin_num, (px, py) in all_pins.items():
+                        k = snap(px, py)
+                        point_net[k] = net_name
+                        all_net_names.add(net_name)
+                except Exception:
+                    pass
+
+            # ── 2. Build wire adjacency and BFS-propagate net names ──────────
+            wire_segments = []
+            for wire in getattr(sch, "wire", None) or []:
+                try:
+                    pts = []
+                    for pt in wire.pts.xy:
+                        pts.append(snap(pt.value[0], pt.value[1]))
+                    if len(pts) >= 2:
+                        wire_segments.append(pts)
+                except Exception:
+                    pass
+
+            # Adjacency: connect endpoints of different segments that share a grid point
+            point_adj: dict = defaultdict(set)
+            for seg in wire_segments:
+                # Connect consecutive points within the segment
+                for i in range(len(seg) - 1):
+                    point_adj[seg[i]].add(seg[i + 1])
+                    point_adj[seg[i + 1]].add(seg[i])
+
+            # All unique wire points
+            all_wire_pts = set()
+            for seg in wire_segments:
+                all_wire_pts.update(seg)
+
+            # BFS: propagate known net names through wire connections
+            queue = [pt for pt in all_wire_pts if pt in point_net]
+            visited = set(queue)
+            while queue:
+                pt = queue.pop()
+                net = point_net[pt]
+                for neighbor in point_adj[pt]:
+                    if neighbor not in point_net:
+                        point_net[neighbor] = net
+                        all_net_names.add(net)
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+
+            # ── 3. Match component pin positions to net names ────────────────
+            for sym in getattr(sch, "symbol", None) or []:
+                try:
+                    ref = sym.property.Reference.value
+                    if ref.startswith("#"):
+                        continue
+                except Exception:
+                    continue
+
+                pin_positions = pin_locator.get_all_symbol_pins(sch_path, ref)
+                for pin_num, (px, py) in pin_positions.items():
+                    net = nearby_net((px, py), point_net)
+                    if net:
+                        pad_net_map[(ref, pin_num)] = net
+
+        logger.info(
+            f"_build_hierarchical_pad_net_map: {len(pad_net_map)} pin→net assignments, "
+            f"{len(all_net_names)} unique nets"
+        )
+        return pad_net_map, all_net_names
 
     def _handle_sync_schematic_to_board(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Sync schematic netlist to PCB board (equivalent to KiCAD F8 'Update PCB from Schematic').
@@ -7159,24 +3776,8 @@ class KiCADInterface:
                     "message": f"Schematic not found. Provide schematicPath. Tried: {schematic_path}",
                 }
 
-            # Generate netlist from schematic
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
-
-            netlist = ConnectionManager.generate_netlist(schematic, schematic_path=schematic_path)
-
-            # Build (reference, pad_number) -> net_name map
-            pad_net_map = {}  # {(ref, pin_str): net_name}
-            net_names = set()
-            for net_entry in netlist.get("nets", []):
-                net_name = net_entry["name"]
-                net_names.add(net_name)
-                for conn in net_entry.get("connections", []):
-                    ref = conn.get("component", "")
-                    pin = str(conn.get("pin", ""))
-                    if ref and pin and pin != "unknown":
-                        pad_net_map[(ref, pin)] = net_name
+            # Build hierarchical pad→net map (walks all sub-sheets)
+            pad_net_map, net_names = self._build_hierarchical_pad_net_map(schematic_path)
 
             # Add all nets to board
             netinfo = board.GetNetInfo()
@@ -7239,7 +3840,6 @@ class KiCADInterface:
     # ===================================================================
 
     def _handle_get_schematic_view_region(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Export a cropped region of the schematic as an image"""
         logger.info("Exporting schematic view region")
         import base64
@@ -7355,7 +3955,6 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_find_overlapping_elements(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Detect spatially overlapping symbols, wires, and labels"""
         logger.info("Finding overlapping elements in schematic")
         try:
@@ -7382,7 +3981,6 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_get_elements_in_region(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """List all wires, labels, and symbols within a rectangular region"""
         logger.info("Getting elements in schematic region")
         try:
@@ -7413,7 +4011,6 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_find_wires_crossing_symbols(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Find wires that cross over component symbol bodies"""
         logger.info("Finding wires crossing symbols in schematic")
         try:
@@ -7439,8 +4036,92 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
+    def _handle_find_orphaned_wires(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Find wire segments with at least one dangling (unconnected) endpoint"""
+        logger.info("Finding orphaned wires in schematic")
+        try:
+            from pathlib import Path
+
+            from commands.schematic_analysis import find_orphaned_wires
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            result = find_orphaned_wires(Path(schematic_path))
+            return {
+                "success": True,
+                **result,
+                "message": f"Found {result['count']} orphaned wire(s)",
+            }
+        except Exception as e:
+            logger.error(f"Error finding orphaned wires: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_list_floating_labels(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """List net labels that are not connected to any component pin"""
+        logger.info("Listing floating net labels in schematic")
+        try:
+            from commands.wire_connectivity import list_floating_labels
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            labels = list_floating_labels(schematic, schematic_path)
+            return {
+                "success": True,
+                "floating_labels": labels,
+                "count": len(labels),
+                "message": f"Found {len(labels)} floating label(s)",
+            }
+        except Exception as e:
+            logger.error(f"Error listing floating labels: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_snap_to_grid(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Snap schematic element coordinates to the nearest grid point"""
+        logger.info("Snapping schematic elements to grid")
+        try:
+            from pathlib import Path
+
+            from commands.schematic_snap import snap_to_grid
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            grid_size = float(params.get("gridSize", 1.27))
+            elements = params.get("elements")  # None → defaults inside snap_to_grid
+
+            result = snap_to_grid(Path(schematic_path), grid_size=grid_size, elements=elements)
+            total = result["snapped"] + result["already_on_grid"]
+            return {
+                "success": True,
+                **result,
+                "message": (
+                    f"Snapped {result['snapped']} element(s) to {grid_size} mm grid "
+                    f"({result['already_on_grid']} of {total} were already on grid)"
+                ),
+            }
+        except Exception as e:
+            logger.error(f"Error snapping to grid: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
     def _handle_import_svg_logo(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Import an SVG file as PCB graphic polygons on the silkscreen"""
         logger.info("Importing SVG logo into PCB")
         try:
@@ -7488,7 +4169,6 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_snapshot_project(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Copy the entire project folder to a snapshot directory for checkpoint/resume."""
         import shutil
         from datetime import datetime
@@ -7573,7 +4253,6 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_check_kicad_ui(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Check if KiCAD UI is running"""
         logger.info("Checking if KiCAD UI is running")
         try:
@@ -7592,7 +4271,6 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_launch_kicad_ui(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Launch KiCAD UI"""
         logger.info("Launching KiCAD UI")
         try:
@@ -7699,7 +4377,6 @@ print("ok")
     # =========================================================================
 
     def _ipc_route_trace(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for route_trace - adds track with real-time UI update"""
         try:
             # Extract parameters matching the existing route_trace interface
@@ -7743,7 +4420,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_add_via(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for add_via - adds via with real-time UI update"""
         try:
             position = params.get("position", {})
@@ -7777,7 +4453,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_add_net(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for add_net"""
         # Note: Net creation via IPC is limited - nets are typically created
         # when components are placed. Return success for compatibility.
@@ -7790,7 +4465,6 @@ print("ok")
         }
 
     def _ipc_add_copper_pour(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for add_copper_pour - adds zone with real-time UI update"""
         try:
             layer = params.get("layer", "F.Cu")
@@ -7846,7 +4520,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_refill_zones(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for refill_zones - refills all zones with real-time UI update"""
         try:
             success = self.ipc_board_api.refill_zones()
@@ -7862,7 +4535,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_add_text(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for add_text/add_board_text - adds text with real-time UI update"""
         try:
             text = params.get("text", "")
@@ -7890,7 +4562,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_set_board_size(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for set_board_size"""
         try:
             width = params.get("width", 100)
@@ -7913,7 +4584,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_get_board_info(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for get_board_info"""
         try:
             size = self.ipc_board_api.get_size()
@@ -7939,7 +4609,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_place_component(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for place_component - places component with real-time UI update"""
         try:
             reference = params.get("reference", params.get("componentId", ""))
@@ -7981,7 +4650,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_move_component(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for move_component - moves component with real-time UI update"""
         try:
             reference = params.get("reference", params.get("componentId", ""))
@@ -8007,7 +4675,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_delete_component(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for delete_component - deletes component with real-time UI update"""
         try:
             reference = params.get("reference", params.get("componentId", ""))
@@ -8027,7 +4694,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_get_component_list(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for get_component_list"""
         try:
             components = self.ipc_board_api.list_components()
@@ -8038,7 +4704,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_save_project(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for save_project"""
         try:
             success = self.ipc_board_api.save()
@@ -8052,7 +4717,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_delete_trace(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for delete_trace - Note: IPC doesn't support direct trace deletion yet"""
         # IPC API doesn't have a direct delete track method
         # Fall back to SWIG for this operation
@@ -8060,7 +4724,6 @@ print("ok")
         return self.routing_commands.delete_trace(params)
 
     def _ipc_get_nets_list(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for get_nets_list - gets nets with real-time data"""
         try:
             nets = self.ipc_board_api.get_nets()
@@ -8134,7 +4797,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_add_mounting_hole(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for add_mounting_hole - adds mounting hole with real-time UI update"""
         try:
             from kipy.board_types import BoardCircle
@@ -8170,7 +4832,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_get_layer_list(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for get_layer_list - gets enabled layers"""
         try:
             layers = self.ipc_board_api.get_enabled_layers()
@@ -8181,7 +4842,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_rotate_component(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for rotate_component - rotates component with real-time UI update"""
         try:
             reference = params.get("reference", params.get("componentId", ""))
@@ -8224,7 +4884,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _ipc_get_component_properties(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """IPC handler for get_component_properties - gets detailed component info"""
         try:
             reference = params.get("reference", params.get("componentId", ""))
@@ -8249,7 +4908,6 @@ print("ok")
     # =========================================================================
 
     def _handle_get_backend_info(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Get information about the current backend"""
         return {
             "success": True,
@@ -8265,7 +4923,6 @@ print("ok")
         }
 
     def _handle_ipc_add_track(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Add a track using IPC backend (real-time)"""
         if not self.use_ipc or not self.ipc_board_api:
             return {"success": False, "message": "IPC backend not available"}
@@ -8292,7 +4949,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _handle_ipc_add_via(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Add a via using IPC backend (real-time)"""
         if not self.use_ipc or not self.ipc_board_api:
             return {"success": False, "message": "IPC backend not available"}
@@ -8316,7 +4972,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _handle_ipc_add_text(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Add text using IPC backend (real-time)"""
         if not self.use_ipc or not self.ipc_board_api:
             return {"success": False, "message": "IPC backend not available"}
@@ -8342,7 +4997,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _handle_ipc_list_components(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """List components using IPC backend"""
         if not self.use_ipc or not self.ipc_board_api:
             return {"success": False, "message": "IPC backend not available"}
@@ -8355,7 +5009,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _handle_ipc_get_tracks(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Get tracks using IPC backend"""
         if not self.use_ipc or not self.ipc_board_api:
             return {"success": False, "message": "IPC backend not available"}
@@ -8368,7 +5021,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _handle_ipc_get_vias(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Get vias using IPC backend"""
         if not self.use_ipc or not self.ipc_board_api:
             return {"success": False, "message": "IPC backend not available"}
@@ -8381,7 +5033,6 @@ print("ok")
             return {"success": False, "message": str(e)}
 
     def _handle_ipc_save_board(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Save board using IPC backend"""
         if not self.use_ipc or not self.ipc_board_api:
             return {"success": False, "message": "IPC backend not available"}
@@ -8399,7 +5050,6 @@ print("ok")
     # JLCPCB API handlers
 
     def _handle_download_jlcpcb_database(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Download JLCPCB parts database from JLCSearch API"""
         try:
             force = params.get("force", False)
@@ -8451,50 +5101,37 @@ print("ok")
             }
 
     def _handle_search_jlcpcb_parts(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
-        """Search JLCPCB parts using the local database (FTS + parametric filters)"""
+        """Search JLCPCB parts database"""
         try:
-            query = params.get("query") or None
+            query = params.get("query")
+            category = params.get("category")
             package = params.get("package")
-            library_type = params.get("library_type")
+            library_type = params.get("library_type", "All")
+            manufacturer = params.get("manufacturer")
             in_stock = params.get("in_stock", True)
             limit = params.get("limit", 20)
-            category = params.get("category")
-            subcategory = params.get("subcategory")
-            manufacturer = params.get("manufacturer")
 
-            # Normalise library_type: treat "All" or missing as no filter
-            lt_filter = library_type if library_type and library_type != "All" else None
+            # Adjust library_type filter
+            if library_type == "All":
+                library_type = None
 
-            rows = self.jlcpcb_parts.search_parts(
+            parts = self.jlcpcb_parts.search_parts(
                 query=query,
                 category=category,
-                subcategory=subcategory,
                 package=package,
-                library_type=lt_filter,
+                library_type=library_type,
                 manufacturer=manufacturer,
                 in_stock=in_stock,
                 limit=limit,
             )
 
-            parts = []
-            for row in rows:
-                try:
-                    price_breaks = json.loads(row.get("price_json") or "[]")
-                except Exception:
-                    price_breaks = []
-                parts.append({
-                    "lcsc": row["lcsc"],
-                    "mfr_part": row.get("mfr_part", ""),
-                    "manufacturer": row.get("manufacturer", ""),
-                    "description": row.get("description") or row.get("derived_description", ""),
-                    "package": row.get("package", ""),
-                    "library_type": row.get("library_type", ""),
-                    "stock": row.get("stock", 0),
-                    "price_breaks": price_breaks,
-                    "price_approximate": True,
-                    "source": "local_db",
-                })
+            # Add price breaks and footprints to each part
+            for part in parts:
+                if part.get("price_json"):
+                    try:
+                        part["price_breaks"] = json.loads(part["price_json"])
+                    except:
+                        part["price_breaks"] = []
 
             return {"success": True, "parts": parts, "count": len(parts)}
 
@@ -8503,57 +5140,18 @@ print("ok")
             return {"success": False, "message": f"Search failed: {str(e)}"}
 
     def _handle_get_jlcpcb_part(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
-        """Get detailed information for a specific JLCPCB part via live JLCPCB API (getComponentDetailByCode)"""
+        """Get detailed information for a specific JLCPCB part"""
         try:
             lcsc_number = params.get("lcsc_number")
             if not lcsc_number:
                 return {"success": False, "message": "Missing lcsc_number parameter"}
 
-            r = self.jlcpcb_client.get_part_by_lcsc(lcsc_number)
-            if not r:
+            part = self.jlcpcb_parts.get_part_info(lcsc_number)
+            if not part:
                 return {"success": False, "message": f"Part not found: {lcsc_number}"}
 
-            lib_map = {"base": "Basic", "expand": "Extended", "preferred": "Preferred"}
-            lib_type = lib_map.get((r.get("libraryType") or "").lower(), r.get("libraryType", "Extended"))
-
-            price_breaks = [
-                {"qty": pb["startQuantity"], "price": pb["unitPrice"]}
-                for pb in (r.get("priceRanges") or [])
-            ]
-
-            # Flatten parameters list into a dict
-            parameters = {}
-            for p in (r.get("parameters") or []):
-                name = p.get("parameterName", "")
-                val = p.get("parameterValue", "")
-                if name:
-                    # Append multiple values for the same parameter name
-                    if name in parameters:
-                        existing = parameters[name]
-                        parameters[name] = f"{existing}, {val}" if isinstance(existing, str) else val
-                    else:
-                        parameters[name] = val
-
-            part = {
-                "lcsc": r.get("componentCode", lcsc_number),
-                "mfr_part": r.get("componentModel", ""),
-                "package": r.get("componentSpecification", ""),
-                "category": r.get("firstTypeName", ""),
-                "subcategory": r.get("secondTypeName", ""),
-                "description": r.get("description", ""),
-                "library_type": lib_type,
-                "stock": r.get("stockCount", 0),
-                "datasheet": r.get("dataManualUrl") or r.get("datasheetUrl", ""),
-                "price_breaks": price_breaks,
-                "parameters": parameters,
-                "rohs": r.get("rohsFlag", False),
-                "eccn": r.get("eccnCode", ""),
-                "assembly_component": r.get("assemblyComponentFlag", False),
-                "source": "live",
-            }
-
-            footprints = self.jlcpcb_parts.map_package_to_footprint(part["package"])
+            # Get suggested KiCAD footprints
+            footprints = self.jlcpcb_parts.map_package_to_footprint(part.get("package", ""))
 
             return {"success": True, "part": part, "footprints": footprints}
 
@@ -8562,7 +5160,6 @@ print("ok")
             return {"success": False, "message": f"Failed to get part info: {str(e)}"}
 
     def _handle_get_jlcpcb_database_stats(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Get statistics about JLCPCB database"""
         try:
             stats = self.jlcpcb_parts.get_database_stats()
@@ -8572,19 +5169,8 @@ print("ok")
             logger.error(f"Error getting database stats: {e}", exc_info=True)
             return {"success": False, "message": f"Failed to get stats: {str(e)}"}
 
-    def _handle_get_jlcpcb_categories(self, params):
-        """Return category or subcategory list from the local DB"""
-        try:
-            category = params.get("category") or None
-            data = self.jlcpcb_parts.get_categories(category=category)
-            return {"success": True, **data}
-        except Exception as e:
-            logger.error(f"Error getting JLCPCB categories: {e}", exc_info=True)
-            return {"success": False, "message": str(e)}
-
     def _handle_suggest_jlcpcb_alternatives(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
-        """Suggest alternative JLCPCB parts (live reference via JLCPCB API, alternatives from local DB)"""
+        """Suggest alternative JLCPCB parts"""
         try:
             lcsc_number = params.get("lcsc_number")
             limit = params.get("limit", 5)
@@ -8592,68 +5178,29 @@ print("ok")
             if not lcsc_number:
                 return {"success": False, "message": "Missing lcsc_number parameter"}
 
-            # Fetch reference part live for accurate stock/price
-            ref_raw = self.jlcpcb_client.get_part_by_lcsc(lcsc_number)
-            if not ref_raw:
-                return {"success": False, "message": f"Reference part not found: {lcsc_number}"}
-
-            lib_map = {"base": "Basic", "expand": "Extended", "preferred": "Preferred"}
-            ref_lib_type = lib_map.get((ref_raw.get("libraryType") or "").lower(), "Extended")
-            ref_price_breaks = [
-                {"qty": pb["startQuantity"], "price": pb["unitPrice"]}
-                for pb in (ref_raw.get("priceRanges") or [])
-            ]
-            reference_price = ref_price_breaks[0]["price"] if ref_price_breaks else None
-
-            # Search local DB for alternatives by category + package
-            # firstTypeName → DB's category column; secondTypeName → DB's subcategory column
-            package = ref_raw.get("componentSpecification", "")
-            category = ref_raw.get("firstTypeName", "")
-            subcategory = ref_raw.get("secondTypeName", "")
-            original_lcsc = ref_raw.get("componentCode", lcsc_number)
-
-            alt_rows = self.jlcpcb_parts.search_parts(
-                category=category,
-                subcategory=subcategory,
-                package=package,
-                in_stock=True,
-                limit=limit * 3,
-            )
-
-            alternatives = []
-            for row in alt_rows:
-                if row["lcsc"] == original_lcsc:
-                    continue
+            # Get original part for price comparison
+            original_part = self.jlcpcb_parts.get_part_info(lcsc_number)
+            reference_price = None
+            if original_part and original_part.get("price_breaks"):
                 try:
-                    price_breaks = json.loads(row.get("price_json") or "[]")
-                except Exception:
-                    price_breaks = []
-                alternatives.append({
-                    "lcsc": row["lcsc"],
-                    "mfr_part": row.get("mfr_part", ""),
-                    "description": row.get("description", ""),
-                    "package": row.get("package", ""),
-                    "library_type": row.get("library_type", ""),
-                    "stock": row.get("stock", 0),
-                    "price_breaks": price_breaks,
-                    "price_approximate": True,
-                    "source": "local_db",
-                })
-                if len(alternatives) >= limit:
-                    break
+                    reference_price = float(original_part["price_breaks"][0].get("price", 0))
+                except:
+                    pass
+
+            alternatives = self.jlcpcb_parts.suggest_alternatives(lcsc_number, limit)
+
+            # Add price breaks to alternatives
+            for part in alternatives:
+                if part.get("price_json"):
+                    try:
+                        part["price_breaks"] = json.loads(part["price_json"])
+                    except:
+                        part["price_breaks"] = []
 
             return {
                 "success": True,
-                "reference": {
-                    "lcsc": original_lcsc,
-                    "mfr_part": ref_raw.get("componentModel", ""),
-                    "package": package,
-                    "library_type": ref_lib_type,
-                    "stock": ref_raw.get("stockCount", 0),
-                    "price_breaks": ref_price_breaks,
-                },
-                "reference_price": reference_price,
                 "alternatives": alternatives,
+                "reference_price": reference_price,
             }
 
         except Exception as e:
@@ -8664,7 +5211,6 @@ print("ok")
             }
 
     def _handle_enrich_datasheets(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Enrich schematic Datasheet fields from LCSC numbers"""
         try:
             from pathlib import Path
@@ -8683,7 +5229,6 @@ print("ok")
             }
 
     def _handle_get_datasheet_url(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        
         """Return LCSC datasheet and product URLs for a part number"""
         try:
             lcsc = params.get("lcsc", "")
@@ -8779,22 +5324,32 @@ def main() -> None:
                         # Return list of available tools with proper schemas
                         tools = []
                         for cmd_name in interface.command_routes.keys():
-                            # Get schema from TOOL_SCHEMAS if available
                             if cmd_name in TOOL_SCHEMAS:
-                                tool_def = TOOL_SCHEMAS[cmd_name].copy()
+                                # Enrich the existing schema with IPC annotation data
+                                # (adds description/blocking hints where the schema lacks them)
+                                tool_def = _annotation_loader.enrich_schema(
+                                    cmd_name, TOOL_SCHEMAS[cmd_name]
+                                )
                                 tools.append(tool_def)
                             else:
-                                # Fallback for tools without schemas
-                                logger.warning(f"No schema defined for tool: {cmd_name}")
+                                # Build a best-effort schema from IPC annotations
+                                ann_desc = _annotation_loader.description(cmd_name)
+                                if ann_desc:
+                                    logger.debug(f"Using IPC annotation for tool: {cmd_name}")
+                                else:
+                                    logger.warning(f"No schema or annotation for tool: {cmd_name}")
                                 tools.append(
-                                    {
-                                        "name": cmd_name,
-                                        "description": f"KiCAD command: {cmd_name}",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {},
+                                    _annotation_loader.enrich_schema(
+                                        cmd_name,
+                                        {
+                                            "name": cmd_name,
+                                            "description": ann_desc or f"KiCAD command: {cmd_name}",
+                                            "inputSchema": {
+                                                "type": "object",
+                                                "properties": {},
+                                            },
                                         },
-                                    }
+                                    )
                                 )
 
                         logger.info(f"Returning {len(tools)} tools")

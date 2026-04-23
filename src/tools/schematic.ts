@@ -16,21 +16,13 @@ export function registerSchematicTools(server: McpServer, callKicadScript: Funct
     },
     async (args: { name: string; path?: string }) => {
       const result = await callKicadScript("create_schematic", args);
-      if (result.success) {
-        const uuidNote = result.schematic_uuid ? `\nschematic_uuid: ${result.schematic_uuid}` : "";
-        const templateNote = result.note ? `\n${result.note}` : "";
-        return {
-          content: [{
-            type: "text",
-            text: `Created schematic: ${result.file_path}${uuidNote}${templateNote}`,
-          }],
-        };
-      }
       return {
-        content: [{
-          type: "text",
-          text: `Failed to create schematic: ${result.message || JSON.stringify(result)}`,
-        }],
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
       };
     },
   );
@@ -38,7 +30,7 @@ export function registerSchematicTools(server: McpServer, callKicadScript: Funct
   // Add component to schematic
   server.tool(
     "add_schematic_component",
-    "Add a component to the schematic. Symbol format is 'Library:SymbolName' (e.g., 'Device:R', 'EDA-MCP:ESP32-C3'). The position is auto-snapped to the KiCAD 50mil (1.27mm) grid. The response includes the snapped position and pin coordinates so a separate get_schematic_pin_locations call is not needed. Use list_symbol_pins to discover pin names before placement. If symbol is not found, close-match suggestions are returned.",
+    "Add a component to the schematic. Symbol format is 'Library:SymbolName' (e.g., 'Device:R', 'EDA-MCP:ESP32-C3')",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       symbol: z
@@ -46,7 +38,10 @@ export function registerSchematicTools(server: McpServer, callKicadScript: Funct
         .describe("Symbol library:name reference (e.g., Device:R, EDA-MCP:ESP32-C3)"),
       reference: z.string().describe("Component reference (e.g., R1, U1)"),
       value: z.string().optional().describe("Component value"),
-      footprint: z.string().optional().describe("KiCAD footprint (e.g. Resistor_SMD:R_0603_1608Metric). Applied directly to the placed instance's Footprint property field — no separate edit_schematic_component call needed."),
+      footprint: z
+        .string()
+        .optional()
+        .describe("KiCAD footprint (e.g. Resistor_SMD:R_0603_1608Metric)"),
       position: z
         .object({
           x: z.number(),
@@ -54,8 +49,12 @@ export function registerSchematicTools(server: McpServer, callKicadScript: Funct
         })
         .optional()
         .describe("Position on schematic"),
-      rotation: z.number().optional().describe("Rotation in degrees, CCW positive, multiples of 90 (0, 90, 180, 270). Default 0. Use 90 for horizontal resistors/capacitors in a left-to-right power path."),
-      includePins: z.boolean().optional().describe("Return pin coordinates in the response (default false). Set true for ICs where pin coordinate planning is needed."),
+      unit: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("Unit number for multi-unit symbols (1=A, 2=B, 3=C, …). Defaults to 1."),
     },
     async (args: {
       schematicPath: string;
@@ -64,8 +63,7 @@ export function registerSchematicTools(server: McpServer, callKicadScript: Funct
       value?: string;
       footprint?: string;
       position?: { x: number; y: number };
-      rotation?: number;
-      includePins?: boolean;
+      unit?: number;
     }) => {
       // Transform to what Python backend expects
       const [library, symbolName] = args.symbol.includes(":")
@@ -83,32 +81,17 @@ export function registerSchematicTools(server: McpServer, callKicadScript: Funct
           // Python expects flat x, y not nested position
           x: args.position?.x ?? 0,
           y: args.position?.y ?? 0,
-          rotation: args.rotation ?? 0,
-          includePins: args.includePins === true,
+          unit: args.unit ?? 1,
         },
       };
 
       const result = await callKicadScript("add_schematic_component", transformed);
       if (result.success) {
-        const pos = result.snapped_position;
-        const snappedNote = pos
-          ? ` (snapped to grid: ${pos.x}, ${pos.y})`
-          : "";
-        const pins: Record<string, any> = result.pins || {};
-        const pinLines = Object.entries(pins).map(
-          ([num, p]: [string, any]) =>
-            `  Pin ${num} (${p.name}): x=${p.x}, y=${p.y}`,
-        );
-        const pinSection =
-          pinLines.length > 0
-            ? `\nPin locations:\n${pinLines.join("\n")}`
-            : "";
-        const footprintNote = result.footprint ? `\nFootprint: ${result.footprint}` : "";
         return {
           content: [
             {
               type: "text",
-              text: `Added ${args.reference} (${args.symbol})${snappedNote}${footprintNote}${pinSection}`,
+              text: `Successfully added ${args.reference} (${args.symbol}) to schematic`,
             },
           ],
         };
@@ -122,143 +105,6 @@ export function registerSchematicTools(server: McpServer, callKicadScript: Funct
           ],
         };
       }
-    },
-  );
-
-  // Batch add multiple components in one call
-  server.tool(
-    "batch_add_components",
-    "Place multiple schematic components in a single call. Prefer this over calling add_schematic_component repeatedly — it injects all symbol definitions and creates all instances in one round-trip. Each component uses 'Library:SymbolName' format. If any component fails, the rest are still placed and errors are reported per-component. NOTE: includePins defaults to false and should stay false in almost all cases — batch_connect and connect_to_net accept pin name or number directly and never need pin coordinates. Only set includePins:true if you specifically need absolute schematic coordinates for manual wire routing.\n\noptional origin_x/origin_y: when provided, every per-component position is treated as an mm offset from this origin. Set x=0,y=0 for the anchor component and positive offsets for others. DO NOT mix with absolute coordinates from list_schematic_components — use one coordinate system per call. When not provided positions are absolute sheet coordinates. The response includes a placement_bbox covering all placed components.",
-    {
-      schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      origin_x: z.number().optional().describe("X coordinate of the placement origin (mm). All per-component x values are offsets from this point. Use x=0 for the anchor component. DO NOT mix with absolute sheet coordinates."),
-      origin_y: z.number().optional().describe("Y coordinate of the placement origin (mm). All per-component y values are offsets from this point. Use y=0 for the anchor component. DO NOT mix with absolute sheet coordinates."),
-      components: z.array(z.object({
-        symbol: z.string().describe("Symbol in 'Library:SymbolName' format (e.g., Device:R, power:GND)"),
-        reference: z.string().describe("Reference designator (e.g., R1, C3, U2)"),
-        value: z.string().optional().describe("Component value (e.g., 10k, 100nF, AP63203WU-7)"),
-        footprint: z.string().optional().describe("KiCAD footprint (e.g., Resistor_SMD:R_0603_1608Metric). Applied directly to the placed instance's Footprint property — no separate edit_schematic_component call needed. A footprint_warning in the response means library validation failed, NOT that the footprint was omitted."),
-        position: z.object({ x: z.number(), y: z.number() }).optional().describe("Position in mm. If origin_x/origin_y is set, this is an offset from origin; otherwise absolute sheet coordinates (auto-snapped to 50mil grid)"),
-        rotation: z.number().optional().describe("Rotation in degrees CCW, multiples of 90. Use 90 for horizontal resistors/capacitors."),
-        includePins: z.boolean().optional().describe("Include pin coordinates in response (default false). Set true for ICs where pin coordinate planning is needed."),
-      })).describe("List of components to place"),
-    },
-    async (args: {
-      schematicPath: string;
-      origin_x?: number;
-      origin_y?: number;
-      components: Array<{
-        symbol: string;
-        reference: string;
-        value?: string;
-        footprint?: string;
-        position?: { x: number; y: number };
-        rotation?: number;
-        includePins?: boolean;
-      }>;
-    }) => {
-      const result = await callKicadScript("batch_add_components", args);
-      if (result.added_count > 0 || result.error_count === 0) {
-        const lines: string[] = [`Placed ${result.added_count} component(s)${result.error_count > 0 ? `, ${result.error_count} failed` : ""}:`];
-        for (const comp of (result.added || [])) {
-          const pos = comp.snapped_position;
-          const pinLines = Object.entries(comp.pins || {}).map(
-            ([num, p]: [string, any]) => `      Pin ${num} (${p.name}): x=${p.x}, y=${p.y}`
-          );
-          lines.push(`  ${comp.reference} (${comp.symbol}) @ (${pos?.x}, ${pos?.y})`);
-          if (pinLines.length) lines.push(...pinLines);
-          if (comp.footprint_warning) lines.push(`      [footprint_warning] ${comp.footprint_warning}`);
-          if (comp.pins_error) lines.push(`      [pins_error] ${comp.pins_error}`);
-        }
-        if (result.placement_bbox) {
-          const bb = result.placement_bbox;
-          lines.push(`Placement bbox: x=[${bb.x_min}, ${bb.x_max}] y=[${bb.y_min}, ${bb.y_max}]`);
-        }
-        if (result.errors?.length) {
-          lines.push("Errors:");
-          result.errors.forEach((e: any) => lines.push(`  ${e.reference} (${e.symbol}): ${e.error}`));
-        }
-        return { content: [{ type: "text", text: lines.join("\n") }] };
-      }
-      return {
-        content: [{
-          type: "text",
-          text: `batch_add_components failed: ${result.message || "Unknown error"}\n` +
-            (result.errors || []).map((e: any) => `  ${e.reference}: ${e.error}`).join("\n"),
-        }],
-      };
-    },
-  );
-
-  // Combined place + connect in one call
-  server.tool(
-    "batch_add_and_connect",
-    `Place multiple schematic components AND assign their net labels in a single round-trip.
-
-This is the preferred tool for subcircuit placement — it replaces the common two-step pattern of batch_add_components followed by batch_connect. Each component accepts an optional \"nets\" field mapping pin numbers/names to net names.
-
-Components without a \"nets\" field are placed but not connected (useful for passive components you plan to connect later, or power symbols).
-
-The response includes placed component positions, connected pin coordinates, and any warnings (e.g. PWR_FLAG suggestions).`,
-    {
-      schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      origin_x: z.number().optional().describe("X coordinate of the placement origin (mm). All per-component x values are offsets from this point."),
-      origin_y: z.number().optional().describe("Y coordinate of the placement origin (mm). All per-component y values are offsets from this point."),
-      components: z.array(z.object({
-        symbol: z.string().describe("Symbol in 'Library:SymbolName' format (e.g., Device:R, power:GND)"),
-        reference: z.string().describe("Reference designator (e.g., R1, C3, U2)"),
-        value: z.string().optional().describe("Component value (e.g., 10k, 100nF)"),
-        footprint: z.string().optional().describe("KiCAD footprint string (e.g., Resistor_SMD:R_0603_1608Metric)"),
-        position: z.object({ x: z.number(), y: z.number() }).optional().describe("Position in mm (offset from origin if origin_x/y set, otherwise absolute)"),
-        rotation: z.number().optional().describe("Rotation in degrees CCW, multiples of 90"),
-        nets: z.record(z.string()).optional().describe("Map of pinNumber/pinName → netName for this component. E.g. {\"1\": \"+5V\", \"2\": \"GND\"}. Omit if not connecting now."),
-      })).describe("Components to place and optionally connect"),
-    },
-    async (args: {
-      schematicPath: string;
-      origin_x?: number;
-      origin_y?: number;
-      components: Array<{
-        symbol: string;
-        reference: string;
-        value?: string;
-        footprint?: string;
-        position?: { x: number; y: number };
-        rotation?: number;
-        nets?: Record<string, string>;
-      }>;
-    }) => {
-      const result = await callKicadScript("batch_add_and_connect", args);
-      const lines: string[] = [result.message || ""];
-      for (const comp of (result.added || [])) {
-        const pos = comp.snapped_position;
-        lines.push(`  ${comp.reference} (${comp.symbol}) @ (${pos?.x}, ${pos?.y})`);
-        if (comp.footprint_warning) lines.push(`    [footprint_warning] ${comp.footprint_warning}`);
-      }
-      if ((result.connected || []).length > 0) {
-        lines.push(`Connected pins (${result.connected_count}):`);
-        for (const p of (result.connected || [])) {
-          const note = p.note ? ` [${p.note}]` : "";
-          lines.push(`  ${p.ref}/${p.pin} → ${p.net} @ (${p.position?.x}, ${p.position?.y})${note}`);
-        }
-      }
-      if ((result.errors || []).length > 0) {
-        lines.push(`Placement errors:`);
-        (result.errors as any[]).forEach((e: any) => lines.push(`  ${e.reference}: ${e.error}`));
-      }
-      if ((result.failed_connections || []).length > 0) {
-        lines.push(`Connection failures:`);
-        (result.failed_connections as any[]).forEach((f: any) => lines.push(`  ${f.ref}/${f.pin}: ${f.reason}`));
-      }
-      if ((result.warnings || []).length > 0) {
-        lines.push(`Warnings:`);
-        (result.warnings as string[]).forEach((w: string) => lines.push(`  ${w}`));
-      }
-      if (result.placement_bbox) {
-        const bb = result.placement_bbox;
-        lines.push(`Placement bbox: x=[${bb.x_min}, ${bb.x_max}] y=[${bb.y_min}, ${bb.y_max}]`);
-      }
-      return { content: [{ type: "text", text: lines.join("\n") }] };
     },
   );
 
@@ -301,16 +147,29 @@ To remove a footprint from a PCB, use delete_component instead.`,
     },
   );
 
-  // Edit component properties in schematic (footprint, value, reference)
+  // Edit component properties in schematic (footprint, value, reference, custom fields)
   server.tool(
     "edit_schematic_component",
     `Update properties of a placed symbol in a KiCAD schematic (.kicad_sch) in-place.
 
-Use this tool to assign or update a footprint, change the value, or rename the reference
-of an already-placed component. This is more efficient than delete + re-add because it
-preserves the component's position and UUID.
+Use this tool to:
+  • assign or update the footprint, value, or reference designator,
+  • reposition field labels (Reference / Value text),
+  • add, update, or remove ARBITRARY CUSTOM PROPERTIES used by BOM and sourcing
+    workflows: MPN, Manufacturer, Manufacturer_PN, Distributor, DigiKey, DigiKey_PN,
+    Mouser_PN, LCSC, JLCPCB_PN, Voltage, Tolerance, Power, Dielectric, etc.
 
-Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_component.`,
+Custom properties are first-class — they survive ERC, are exported by export_bom,
+and are picked up by the JLCPCB / Digi-Key BOM tooling. Newly-added properties
+default to hidden so they do not clutter the schematic canvas.
+
+Multiple updates can be batched in a single call: pass any combination of
+\`footprint\`, \`value\`, \`newReference\`, \`fieldPositions\`, \`properties\`,
+and \`removeProperties\` together.
+
+This is more efficient than delete + re-add because it preserves the component's
+position and UUID. Operates on .kicad_sch files only — to modify a PCB footprint
+use edit_component instead.`,
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       reference: z.string().describe("Current reference designator of the component (e.g. R1, U3)"),
@@ -335,6 +194,45 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
         .describe(
           'Reposition field labels: map of field name to {x, y, angle} (e.g. {"Reference": {"x": 12.5, "y": 17.0}})',
         ),
+      properties: z
+        .record(
+          z.union([
+            z.string(),
+            z.object({
+              value: z.string().describe("Property value to write"),
+              x: z.number().optional().describe("Label X position in mm (default: component X)"),
+              y: z.number().optional().describe("Label Y position in mm (default: component Y)"),
+              angle: z.number().optional().describe("Label rotation in degrees (default: 0)"),
+              hide: z
+                .boolean()
+                .optional()
+                .describe(
+                  "Whether to hide the property text on the schematic. Defaults to true for newly-created custom properties (BOM/sourcing data is normally hidden).",
+                ),
+              fontSize: z
+                .number()
+                .optional()
+                .describe("Font size in mm for the label (default: 1.27)"),
+            }),
+          ]),
+        )
+        .optional()
+        .describe(
+          "Add or update component properties. Map of property name to either a string value (sensible defaults) " +
+            "or a full spec object {value, x?, y?, angle?, hide?, fontSize?}. Use this to attach BOM and sourcing " +
+            "metadata such as MPN, Manufacturer, Distributor, DigiKey, LCSC, JLCPCB_PN, Voltage, Tolerance, " +
+            "Dielectric, Power, etc. Built-in fields (Reference, Value, Footprint, Datasheet) can also be set " +
+            "this way but the dedicated parameters above are clearer. Example: " +
+            '{"MPN": "RC0603FR-0710KL", "Manufacturer": "Yageo", "Tolerance": "1%"}',
+        ),
+      removeProperties: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "List of custom property names to delete from this component. The built-in fields " +
+            "Reference, Value, Footprint, and Datasheet cannot be removed (clear them by setting " +
+            'value to "" instead). Example: ["OldMPN", "Distributor_PN"]',
+        ),
     },
     async (args: {
       schematicPath: string;
@@ -343,17 +241,41 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
       value?: string;
       newReference?: string;
       fieldPositions?: Record<string, { x: number; y: number; angle?: number }>;
+      properties?: Record<
+        string,
+        | string
+        | {
+            value: string;
+            x?: number;
+            y?: number;
+            angle?: number;
+            hide?: boolean;
+            fontSize?: number;
+          }
+      >;
+      removeProperties?: string[];
     }) => {
       const result = await callKicadScript("edit_schematic_component", args);
       if (result.success) {
-        const changes = Object.entries(result.updated ?? {})
-          .map(([k, v]) => `${k}=${v}`)
-          .join(", ");
+        const updated = result.updated ?? {};
+        const summaryParts: string[] = [];
+        const simpleKeys = ["footprint", "value", "reference"] as const;
+        for (const k of simpleKeys) {
+          if (updated[k] !== undefined) summaryParts.push(`${k}=${updated[k]}`);
+        }
+        if (updated.fieldPositions)
+          summaryParts.push(`fieldPositions=${Object.keys(updated.fieldPositions).join(",")}`);
+        if (updated.propertiesAdded)
+          summaryParts.push(`added=${Object.keys(updated.propertiesAdded).join(",")}`);
+        if (updated.propertiesUpdated)
+          summaryParts.push(`updated=${Object.keys(updated.propertiesUpdated).join(",")}`);
+        if (updated.propertiesRemoved)
+          summaryParts.push(`removed=${updated.propertiesRemoved.join(",")}`);
         return {
           content: [
             {
               type: "text" as const,
-              text: `Successfully updated ${args.reference}: ${changes}`,
+              text: `Successfully updated ${args.reference}: ${summaryParts.join("; ") || "(no-op)"}`,
             },
           ],
         };
@@ -369,50 +291,133 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     },
   );
 
-  // Batch edit multiple component properties in one call
+  // ------------------------------------------------------------------
+  // Single-property convenience tools (delegate to edit_schematic_component)
+  // ------------------------------------------------------------------
+
+  // Set a single custom property on a placed symbol
   server.tool(
-    "batch_edit_schematic_components",
-    `Update properties of multiple placed symbols in a KiCAD schematic in a single call.
+    "set_schematic_component_property",
+    `Add or update a single custom property on a placed schematic symbol.
 
-Use this instead of calling edit_schematic_component repeatedly — all edits are applied
-in one round-trip. Each component entry can set footprint, value, and/or newReference.
+This is a focused convenience wrapper around edit_schematic_component for the very
+common case of attaching one BOM / sourcing field at a time. The property is
+created if it does not already exist on the component.
 
-Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3": {"footprint": "Capacitor_SMD:C_0402"}}`,
+Typical custom properties:
+  • MPN, Manufacturer, Manufacturer_PN — manufacturer part number metadata
+  • DigiKey, DigiKey_PN, Mouser_PN, LCSC, JLCPCB_PN — distributor part numbers
+  • Voltage, Tolerance, Power, Dielectric, Temperature_Coefficient — passive parameters
+  • Description, Notes — free-form documentation
+  • Any custom field your BOM exporter expects.
+
+These properties are written into the .kicad_sch file as standard KiCad property
+records, are exported by export_bom, and are picked up by the JLCPCB and Digi-Key
+sourcing tools. Newly-created properties default to hidden — set hide=false to
+display the value on the schematic canvas.
+
+For batch updates of multiple properties at once, use edit_schematic_component
+with the \`properties\` parameter instead.`,
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      components: z.record(z.object({
-        footprint: z.string().optional().describe("New KiCAD footprint string"),
-        value: z.string().optional().describe("New value string (e.g. 10k, 100nF)"),
-        newReference: z.string().optional().describe("Rename the reference designator"),
-      })).describe("Map of current reference → properties to update"),
+      reference: z.string().describe("Reference designator of the component (e.g. R1, U3)"),
+      name: z
+        .string()
+        .describe(
+          "Property name (e.g. 'MPN', 'Manufacturer', 'DigiKey_PN', 'Voltage', 'Dielectric')",
+        ),
+      value: z.string().describe("Property value to write (use empty string to clear)"),
+      x: z.number().optional().describe("Label X position in mm (default: component X)"),
+      y: z.number().optional().describe("Label Y position in mm (default: component Y)"),
+      angle: z.number().optional().describe("Label rotation in degrees (default: 0)"),
+      hide: z
+        .boolean()
+        .optional()
+        .describe(
+          "Hide the property text on the schematic canvas. Defaults to true for newly-created custom properties.",
+        ),
+      fontSize: z.number().optional().describe("Font size in mm for the label (default: 1.27)"),
     },
     async (args: {
       schematicPath: string;
-      components: Record<string, { footprint?: string; value?: string; newReference?: string }>;
+      reference: string;
+      name: string;
+      value: string;
+      x?: number;
+      y?: number;
+      angle?: number;
+      hide?: boolean;
+      fontSize?: number;
     }) => {
-      const result = await callKicadScript("batch_edit_schematic_components", args);
-      if (result.success || result.updated_count > 0) {
-        const lines: string[] = [
-          `Updated ${result.updated_count} component(s)${result.error_count > 0 ? `, ${result.error_count} failed` : ""}:`,
-        ];
-        for (const [ref, changes] of Object.entries(result.updated ?? {})) {
-          const changeStr = Object.entries(changes as Record<string, unknown>)
-            .map(([k, v]) => `${k}=${v}`)
-            .join(", ");
-          lines.push(`  ${ref}: ${changeStr}`);
-        }
-        if (result.errors?.length) {
-          lines.push("Errors:");
-          result.errors.forEach((e: any) => lines.push(`  ${e.reference}: ${e.error}`));
-        }
-        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      const result = await callKicadScript("set_schematic_component_property", args);
+      if (result.success) {
+        const updated = result.updated ?? {};
+        const action = updated.propertiesAdded?.[args.name] !== undefined ? "added" : "updated";
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Successfully ${action} property ${args.name}="${args.value}" on ${args.reference}`,
+            },
+          ],
+        };
       }
       return {
-        content: [{
-          type: "text" as const,
-          text: `batch_edit_schematic_components failed: ${result.message || "Unknown error"}\n` +
-            (result.errors || []).map((e: any) => `  ${e.reference}: ${e.error}`).join("\n"),
-        }],
+        content: [
+          {
+            type: "text" as const,
+            text: `Failed to set property '${args.name}' on ${args.reference}: ${result.message || "Unknown error"}`,
+          },
+        ],
+      };
+    },
+  );
+
+  // Remove a single custom property from a placed symbol
+  server.tool(
+    "remove_schematic_component_property",
+    `Remove a single custom property from a placed schematic symbol.
+
+Built-in fields (Reference, Value, Footprint, Datasheet) cannot be removed —
+KiCad requires them on every symbol. To clear a built-in field, use
+edit_schematic_component and set its value to an empty string.`,
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      reference: z.string().describe("Reference designator of the component (e.g. R1, U3)"),
+      name: z
+        .string()
+        .describe("Custom property name to remove (e.g. 'MPN', 'Distributor_PN', 'OldField')"),
+    },
+    async (args: { schematicPath: string; reference: string; name: string }) => {
+      const result = await callKicadScript("remove_schematic_component_property", args);
+      if (result.success) {
+        const removed = result.updated?.propertiesRemoved ?? [];
+        if (removed.includes(args.name)) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Successfully removed property '${args.name}' from ${args.reference}`,
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Property '${args.name}' was not present on ${args.reference} (no change made)`,
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Failed to remove property '${args.name}' from ${args.reference}: ${result.message || "Unknown error"}`,
+          },
+        ],
       };
     },
   );
@@ -420,7 +425,12 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
   // Get component properties and field positions from schematic
   server.tool(
     "get_schematic_component",
-    "Get full component info from a schematic: position, field values, and each field's label position (at x/y/angle). Use this to inspect or prepare repositioning of Reference/Value labels.",
+    "Get full component info from a schematic: position, every field's value, and each field's " +
+      "label position (at x/y/angle). Returns ALL properties — both built-in fields " +
+      "(Reference, Value, Footprint, Datasheet) and any custom BOM/sourcing properties present " +
+      "on the symbol (MPN, Manufacturer, DigiKey_PN, LCSC, Voltage, Tolerance, Dielectric, etc.). " +
+      "Use this before edit_schematic_component / set_schematic_component_property to inspect " +
+      "what is currently set, or to plan a label repositioning.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       reference: z.string().describe("Component reference designator (e.g. R1, U1)"),
@@ -535,66 +545,47 @@ Example: {"J1": {"footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4135"}, "C3
   // Add net label
   server.tool(
     "add_schematic_net_label",
-    `Add a net label to the schematic at a pin tip location.
-
-IMPORTANT — Power nets: For standard power nets (GND, +5V, +3V3, VBUS, +3.3V, etc.), strongly
-prefer using a power symbol via add_schematic_component (e.g., kicad_power:GND, kicad_power:+5V)
-rather than a net label. Power symbols always render upright and follow standard schematic
-conventions. Use net labels only for signal nets (USB_DM, BUCK_SW, SDA, etc.) that don't have
-a dedicated power symbol.
-
-Parameters:
-  net    — net name string (e.g. 'GND', '+3V3', 'BUCK_SW')
-  x, y   — exact pin tip coordinates in mm (same as the pin's connection point — no offset needed)
-  angle  — direction the label text extends FROM the pin tip (default: 0):
-             0   = rightward  → use for right-edge pins (pin stub exits →)
-             90  = upward     → use for top-edge pins (pin stub exits ↑)
-             180 = leftward   → use for left-edge pins (pin stub exits ←)
-             270 = downward   → use for bottom-edge pins (pin stub exits ↓)
-  justify — text anchor (default: auto-derived from angle):
-             'left'  — text starts at connection point, extends in label direction
-             'right' — text ends at connection point (correct for angle=180)
-
-Angle/justify quick reference:
-  Left-edge pin   (wire exits ←): angle=180, justify=right
-  Right-edge pin  (wire exits →): angle=0,   justify=left
-  Top-edge pin    (wire exits ↑): angle=90,  justify=left
-  Bottom-edge pin (wire exits ↓): angle=270, justify=left
-
-NOTE: Labels with angle=90/270 (top/bottom-edge pins) render with text rotated — this is
-standard KiCad behavior and cannot be changed via justify.
-
-PREFER connect_to_net or batch_connect: these tools auto-derive angle from the pin direction
-so you never need to look up the table above.
-
-The x,y coordinates are written exactly as provided (snapped only to KiCad's 50mil grid).
-Do NOT add any wire between the component pin and the label when the label is placed directly
-at the pin tip. A label exactly coinciding with a pin tip is a valid KiCad connection. Only
-add a wire if there is a gap between the pin tip and the desired label position.`,
+    "Add a net label to the schematic. " +
+      "PREFERRED: supply componentRef + pinNumber to snap the label to the exact pin endpoint — " +
+      "this guarantees an electrical connection. " +
+      "Alternatively supply position [x, y], but the coordinates must match the pin endpoint exactly " +
+      "(even a 0.01 mm offset breaks the connection). " +
+      "The response includes actual_position (coordinates actually used) and snapped_to_pin " +
+      "(present when a pin reference was resolved).",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
-      netName: z
-        .string()
-        .describe("Name of the net (e.g., VCC, GND, SIGNAL_1)"),
+      netName: z.string().describe("Name of the net (e.g., VCC, GND, SIGNAL_1)"),
       position: z
         .array(z.number())
         .length(2)
-        .describe("Position [x, y] for the label — exact pin tip coordinates in mm"),
-      angle: z
-        .number()
         .optional()
-        .describe("Direction label extends from pin: 0=right, 90=down, 180=left, 270=up (default: 0)"),
-      justify: z
-        .enum(["left", "right", "center"])
+        .describe(
+          "Position [x, y] for the label. Required when componentRef/pinNumber are not given.",
+        ),
+      componentRef: z
+        .string()
         .optional()
-        .describe("Text justification (default: auto-derived from angle; 180→right, others→left)"),
+        .describe("Component reference to snap label to (e.g. U1, R1). Use with pinNumber."),
+      pinNumber: z
+        .union([z.string(), z.number()])
+        .optional()
+        .describe(
+          "Pin number or name on componentRef to snap label to (e.g. '1', 'GND'). Use with componentRef.",
+        ),
+      labelType: z
+        .enum(["label", "global_label", "hierarchical_label"])
+        .optional()
+        .describe("Label type (default: label)"),
+      orientation: z.number().optional().describe("Rotation angle 0/90/180/270 (default: 0)"),
     },
     async (args: {
       schematicPath: string;
       netName: string;
-      position: number[];
-      angle?: number;
-      justify?: string;
+      position?: number[];
+      componentRef?: string;
+      pinNumber?: string | number;
+      labelType?: string;
+      orientation?: number;
     }) => {
       const result = await callKicadScript("add_schematic_net_label", args);
       if (result.success) {
@@ -602,7 +593,7 @@ add a wire if there is a gap between the pin tip and the desired label position.
           content: [
             {
               type: "text",
-              text: `Successfully added net label '${args.netName}' at position [${args.position}]`,
+              text: JSON.stringify(result, null, 2),
             },
           ],
         };
@@ -619,64 +610,17 @@ add a wire if there is a gap between the pin tip and the desired label position.
     },
   );
 
-  // Move a symbol's Reference or Value property field
-  server.tool(
-    "set_schematic_property_position",
-    `Move a symbol's Reference or Value property field to a specific schematic coordinate.
-Use this after component placement to avoid overlapping text.
-
-Parameters:
-  schematicPath — path to the .kicad_sch file
-  reference     — component reference designator (e.g. 'F1', 'U6', 'C3')
-  property      — which field to move: 'Reference' or 'Value'
-  x, y          — new absolute schematic coordinates in mm
-  angle         — text rotation in degrees (default: 0 = horizontal/readable). Text angle
-                  should almost always be 0 regardless of the symbol's rotation. Rotated
-                  text on Reference/Value fields is nearly always an error. Only pass a
-                  non-zero angle if you have a specific reason.
-  visible       — whether the field is visible (default: true)
-
-The tool writes the new position into the matching symbol's property in the .kicad_sch file.
-It does NOT move the symbol body, only the property text field.
-It does NOT auto-save; call save_schematic after all repositioning is done.`,
-    {
-      schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      reference: z.string().describe("Component reference designator (e.g. 'F1', 'U6', 'C3')"),
-      property: z.enum(["Reference", "Value"]).describe("Which field to move"),
-      x: z.number().describe("New X coordinate in mm"),
-      y: z.number().describe("New Y coordinate in mm"),
-      angle: z.number().optional().describe("Text rotation in degrees (default: 0 = horizontal). Almost always use 0 — rotated ref/val text is nearly always an error."),
-      visible: z.boolean().optional().describe("Whether the field is visible (default: true)"),
-    },
-    async (args: {
-      schematicPath: string;
-      reference: string;
-      property: "Reference" | "Value";
-      x: number;
-      y: number;
-      angle?: number;
-      visible?: boolean;
-    }) => {
-      const result = await callKicadScript("set_schematic_property_position", args);
-      if (result.success) {
-        return { content: [{ type: "text", text: result.message }] };
-      }
-      return {
-        content: [{ type: "text", text: `Failed to set property position: ${result.message || "Unknown error"}` }],
-        isError: true,
-      };
-    },
-  );
-
-  // Connect pin to net — places label directly at pin endpoint (no wire stub needed)
+  // Connect pin to net
   server.tool(
     "connect_to_net",
-    "Place a net label at a component pin endpoint to connect it to a named net. The label is placed exactly at the pin coordinate so KiCAD recognises the connection. No wire stub is needed. PREFERRED method for assigning nets to pins.",
+    "Connect a component pin to a named net by adding a wire stub and net label at the exact pin endpoint. " +
+      "The response includes pin_location (exact pin coords), label_location (where the label was placed), " +
+      "and wire_stub (the wire segment added) so you can confirm the placement.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       componentRef: z.string().describe("Component reference (e.g., U1, R1)"),
-      pinName: z.string().describe("Pin name or number to connect (e.g., '1', 'GND', 'SDA')"),
-      netName: z.string().describe("Name of the net to connect to (e.g., VCC, GND, SDA)"),
+      pinName: z.string().describe("Pin name/number to connect"),
+      netName: z.string().describe("Name of the net to connect to"),
     },
     async (args: {
       schematicPath: string;
@@ -684,19 +628,13 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
       pinName: string;
       netName: string;
     }) => {
-      // Use place_net_label_at_pin which places the label directly at the pin endpoint
-      const result = await callKicadScript("place_net_label_at_pin", {
-        schematicPath: args.schematicPath,
-        reference: args.componentRef,
-        pinNumber: args.pinName,
-        netName: args.netName,
-      });
+      const result = await callKicadScript("connect_to_net", args);
       if (result.success) {
         return {
           content: [
             {
               type: "text",
-              text: `Connected ${args.componentRef}/${args.pinName} to net '${args.netName}' at (${result.position?.x}, ${result.position?.y})`,
+              text: JSON.stringify(result, null, 2),
             },
           ],
         };
@@ -710,105 +648,6 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
           ],
         };
       }
-    },
-  );
-
-  // Place net label directly at a pin endpoint
-  server.tool(
-    "place_net_label_at_pin",
-    "Place a net label at the exact endpoint of a component pin. The label position and orientation are computed automatically from the pin's location and angle. This is the low-level version of connect_to_net — use connect_to_net for most cases.",
-    {
-      schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      reference: z.string().describe("Component reference designator (e.g. J1, U1)"),
-      pinNumber: z.string().describe("Pin number or name (e.g. '1', 'GND', 'SDA')"),
-      netName: z.string().describe("Net name to assign (e.g. VCC, GND, SIGNAL_1)"),
-    },
-    async (args: { schematicPath: string; reference: string; pinNumber: string; netName: string }) => {
-      const result = await callKicadScript("place_net_label_at_pin", args);
-      if (result.success) {
-        return {
-          content: [{
-            type: "text",
-            text: `Placed label '${args.netName}' on ${args.reference}/${args.pinNumber} at (${result.position?.x}, ${result.position?.y})`,
-          }],
-        };
-      }
-      return {
-        content: [{
-          type: "text",
-          text: `Failed to place label: ${result.message || "Unknown error"}`,
-        }],
-      };
-    },
-  );
-
-  // Add no-connect marker to a pin
-  server.tool(
-    "add_no_connect",
-    "Mark a pin as intentionally unconnected (adds an X marker). This suppresses ERC 'Pin not connected' errors for pins that are deliberately left unconnected (e.g., NC/DNP pins, unused GPIO, SBU pins on USB-C). Use get_schematic_pin_locations to get pin coordinates first, or provide componentRef+pinName for automatic lookup.",
-    {
-      schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      componentRef: z.string().optional().describe("Component reference (e.g. J1, U1) — provide with pinName for auto lookup"),
-      pinName: z.string().optional().describe("Pin name or number (e.g. '1', 'SBU1') — provide with componentRef for auto lookup"),
-      position: z.object({ x: z.number(), y: z.number() }).optional().describe("Explicit pin position — use if you already know the coordinates"),
-    },
-    async (args: {
-      schematicPath: string;
-      componentRef?: string;
-      pinName?: string;
-      position?: { x: number; y: number };
-    }) => {
-      const result = await callKicadScript("add_no_connect", {
-        schematicPath: args.schematicPath,
-        componentRef: args.componentRef,
-        pinName: args.pinName,
-        position: args.position ? [args.position.x, args.position.y] : undefined,
-      });
-      if (result.success) {
-        return {
-          content: [{
-            type: "text",
-            text: result.message || `Added no-connect marker`,
-          }],
-        };
-      }
-      return {
-        content: [{
-          type: "text",
-          text: `Failed to add no-connect: ${result.message || "Unknown error"}`,
-        }],
-      };
-    },
-  );
-
-  // List all unconnected pins
-  server.tool(
-    "list_unconnected_pins",
-    "List all pins that have no net connection and no no-connect marker. Use this after wiring to identify which pins still need to be connected or marked NC. Returns component ref, pin number, pin name, pin type, and position for each unconnected pin. NOTE: reads netlist from the saved file; results may differ from kicad-cli ERC if the skip library computes connectivity differently — use run_erc for the authoritative answer.",
-    {
-      schematicPath: z.string().describe("Path to the .kicad_sch file"),
-    },
-    async (args: { schematicPath: string }) => {
-      const result = await callKicadScript("list_unconnected_pins", args);
-      if (result.success) {
-        const pins: any[] = result.unconnected || [];
-        if (pins.length === 0) {
-          return { content: [{ type: "text", text: "All pins are connected or marked no-connect." }] };
-        }
-        const lines = pins.map(
-          (p: any) => `  ${p.reference}/${p.pinName || p.pinNumber} (pin ${p.pinNumber}, type=${p.pinType}) @ (${p.position.x}, ${p.position.y})`
-        );
-        return {
-          content: [{
-            type: "text",
-            text: `Unconnected pins (${pins.length}):\n${lines.join("\n")}`,
-          }],
-        };
-      }
-      return {
-        content: [{ type: "text", text: `Failed to list unconnected pins: ${result.message || "Unknown error"}` }],
-        isError: true,
-      };
     },
   );
 
@@ -850,24 +689,50 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
   // Get wire connections
   server.tool(
     "get_wire_connections",
-    "Find all component pins reachable from a schematic point via connected wires, net labels, and power symbols. The query point must be at a wire endpoint or junction — midpoints of wire segments are not matched. Use get_schematic_pin_locations or list_schematic_wires to obtain exact endpoint coordinates first.",
+    "Returns the net name and all wires and component pins connected at a given point. " +
+      "Accepts either a component reference + pin number (e.g. reference='U1', pin='3') " +
+      "or a schematic coordinate (x, y in mm). " +
+      "Returns net=null for unnamed (unlabelled) nets. " +
+      "The query point must be at a wire endpoint or junction — midpoints are not matched. " +
+      "Use get_schematic_pin_locations or list_schematic_wires to obtain exact endpoint coordinates.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
-      x: z.number().describe("X coordinate of a wire endpoint or junction"),
-      y: z.number().describe("Y coordinate of a wire endpoint or junction"),
+      reference: z
+        .string()
+        .optional()
+        .describe("Component reference (e.g. U1, R1). Pair with pin."),
+      pin: z
+        .string()
+        .optional()
+        .describe("Pin number or name (e.g. '3', 'SDA'). Pair with reference."),
+      x: z.number().optional().describe("X coordinate of a wire endpoint in mm. Pair with y."),
+      y: z.number().optional().describe("Y coordinate of a wire endpoint in mm. Pair with x."),
     },
-    async (args: { schematicPath: string; x: number; y: number }) => {
+    async (args: {
+      schematicPath: string;
+      reference?: string;
+      pin?: string;
+      x?: number;
+      y?: number;
+    }) => {
       const result = await callKicadScript("get_wire_connections", args);
-      if (result.success && result.pins) {
-        const pinList = result.pins.map((p: any) => `  - ${p.component}/${p.pin}`).join("\n");
+      if (result.success) {
+        const netLabel = result.net ?? "(unnamed)";
+        const pinList = (result.pins ?? [])
+          .map((p: any) => `  - ${p.component}/${p.pin}`)
+          .join("\n");
         const wireList = (result.wires ?? [])
           .map((w: any) => `  - (${w.start.x},${w.start.y}) → (${w.end.x},${w.end.y})`)
           .join("\n");
+        const qp = result.query_point;
         return {
           content: [
             {
               type: "text",
-              text: `Pins connected at (${args.x},${args.y}):\n${pinList || "  (none found)"}\n\nWire segments:\n${wireList || "  (none)"}`,
+              text:
+                `Net: ${netLabel}\n` +
+                `Query point: (${qp?.x ?? args.x}, ${qp?.y ?? args.y})\n` +
+                `Connected pins:\n${pinList || "  (none found)"}\n\nWire segments:\n${wireList || "  (none)"}`,
             },
           ],
         };
@@ -884,55 +749,28 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
     },
   );
 
-  // Get pin locations for one or more schematic components
+  // Get pin locations for a schematic component
   server.tool(
     "get_schematic_pin_locations",
-    "Returns the schematic coordinates of each pin's connection point — the tip of the pin stub where wires and net labels attach. These coordinates can be passed directly to add_wire, add_schematic_net_label, and add_schematic_connection without any offset.\n\nPass a single 'reference' or a list of 'references' to batch multiple components in one call — strongly prefer the batch form to avoid many round-trips.\n\nCoordinate convention: returned x/y are absolute schematic coordinates (Y-axis points DOWN). The Y-axis flip between symbol library space (Y-up) and schematic space (Y-down) is applied automatically by the underlying library — do NOT manually compute pin_schematic_y = component_y ± pin_symbol_y.\n\nEach pin includes near_boundary=true when within 20mm of the left or top sheet edge, plus suggested_component_x_offset indicating how far right to shift the component so leftward labels stay in bounds.\n\nNOTE: For components placed in the same session (not yet opened in KiCad), this tool may return empty results because the skip parser cannot always read MCP-generated files. In that case use batch_connect or connect_to_net which look up pin positions internally and do NOT require calling this tool first.",
+    "Returns the exact x/y coordinates of every pin on a schematic component. Use this before add_schematic_net_label to place labels correctly on pin endpoints.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
-      reference: z.string().optional().describe("Single component reference (e.g. U1). Use 'references' for batch."),
-      references: z.array(z.string()).optional().describe("List of component references to look up in one call (e.g. ['J1','U6','D1'])"),
+      reference: z.string().describe("Component reference designator (e.g. U1, R1, J2)"),
     },
-    async (args: { schematicPath: string; reference?: string; references?: string[] }) => {
-      const refs = args.references ?? (args.reference ? [args.reference] : []);
-      if (refs.length === 0) {
-        return { content: [{ type: "text", text: "Provide 'reference' or 'references'." }] };
-      }
-
-      const result = await callKicadScript("get_schematic_pin_locations", {
-        schematicPath: args.schematicPath,
-        references: refs,
-      });
-
-      if (result.success) {
-        // Batch result: result.components is a map of ref → pins
-        const components: Record<string, any> = result.components || {};
-        // Fallback for single-ref old format
-        if (Object.keys(components).length === 0 && result.pins && refs.length === 1) {
-          components[refs[0]] = result.pins;
-        }
-        const sections: string[] = [];
-        for (const [ref, pins] of Object.entries(components)) {
-          const lines = Object.entries(pins as Record<string, any>).map(
-            ([pinNum, data]: [string, any]) => {
-              let s = `    Pin ${pinNum} (${data.name || pinNum}): x=${data.x}, y=${data.y}`;
-              if (data.near_boundary) {
-                s += ` [NEAR_BOUNDARY`;
-                if (data.suggested_component_x_offset != null) {
-                  s += ` — move component right by ${data.suggested_component_x_offset}mm to keep labels in bounds`;
-                }
-                s += `]`;
-              }
-              return s;
-            }
-          );
-          sections.push(`${ref}:\n${lines.join("\n")}`);
-        }
+    async (args: { schematicPath: string; reference: string }) => {
+      const result = await callKicadScript("get_schematic_pin_locations", args);
+      if (result.success && result.pins) {
+        const lines = Object.entries(result.pins as Record<string, any>).map(
+          ([pinNum, data]: [string, any]) =>
+            `  Pin ${pinNum} (${data.name || pinNum}): x=${data.x}, y=${data.y}, angle=${data.angle ?? 0}°`,
+        );
         return {
-          content: [{
-            type: "text",
-            text: sections.join("\n\n"),
-          }],
+          content: [
+            {
+              type: "text",
+              text: `Pin locations for ${args.reference}:\n${lines.join("\n")}`,
+            },
+          ],
         };
       } else {
         return {
@@ -944,39 +782,6 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
           ],
         };
       }
-    },
-  );
-
-  // Batch connect: place net labels on multiple pins in one call
-  server.tool(
-    "batch_connect",
-    "Place net labels on multiple component pins in a single call. Accepts a map of {componentRef: {pinNumber: netName}} and places all labels in one round-trip. Use this instead of calling connect_to_net repeatedly — it is dramatically more token-efficient for wiring many pins at once. Set replace=true to atomically replace any existing label at each pin tip (useful when correcting wrong-net assignments without a separate delete step).",
-    {
-      schematicPath: z.string().describe("Path to the schematic file"),
-      connections: z
-        .record(
-          z.record(z.string()).describe("Map of pinNumber -> netName for this component")
-        )
-        .describe(
-          "Map of componentRef -> {pinNumber: netName}. " +
-          "Example: {\"J1\": {\"1\": \"VCC\", \"2\": \"GND\"}, \"U1\": {\"VDD\": \"VCC\"}}"
-        ),
-      replace: z.boolean().optional().describe("If true, delete any existing net label at each pin tip before placing the new one. Use when correcting wrong-net assignments — eliminates the separate delete_schematic_net_label step."),
-    },
-    async (args: { schematicPath: string; connections: Record<string, Record<string, string>>; replace?: boolean }) => {
-      const result = await callKicadScript("batch_connect", args);
-      const placed: any[] = result.placed || [];
-      const failed: any[] = result.failed || [];
-      const total = placed.length + failed.length;
-      if (failed.length === 0) {
-        // Full success — summary only, no per-pin noise
-        return { content: [{ type: "text", text: `${placed.length}/${total} labels placed.` }] };
-      }
-      // Partial or full failure — show only failures
-      const lines: string[] = [`${placed.length}/${total} labels placed.`];
-      lines.push(`Failed (${failed.length}):`);
-      failed.forEach((f: any) => lines.push(`  ${f.ref}/${f.pin}: ${f.reason}`));
-      return { content: [{ type: "text", text: lines.join("\n") }] };
     },
   );
 
@@ -1032,7 +837,7 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
   // List all components in schematic
   server.tool(
     "list_schematic_components",
-    "List all components in a schematic with their references, values, positions, pins, and property field positions. Essential for inspecting what's on the schematic before making edits. Each component includes ref_field and value_field with {x, y, angle, visible} for the Reference and Value text positions, and body_bbox with {x_min, y_min, x_max, y_max} for the symbol body bounding box (not including ref/val text). Set compact=true to omit field positions, properties, and bounds — returns only ref, libId, value, position, rotation, pin_count, body_bbox for faster review.",
+    "List all components in a schematic with their references, values, positions, and pins. Essential for inspecting what's on the schematic before making edits.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       filter: z
@@ -1045,12 +850,10 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
         })
         .optional()
         .describe("Optional filters"),
-      compact: z.boolean().optional().describe("If true, omit ref_field, value_field, properties, and bounds — returns only the essentials for design review"),
     },
     async (args: {
       schematicPath: string;
       filter?: { libId?: string; referencePrefix?: string };
-      compact?: boolean;
     }) => {
       const result = await callKicadScript("list_schematic_components", args);
       if (result.success) {
@@ -1060,15 +863,10 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
             content: [{ type: "text", text: "No components found in schematic." }],
           };
         }
-        const lines = comps.map((c: any) => {
-          let line = `  ${c.reference}: ${c.libId} = "${c.value}" at (${c.position.x}, ${c.position.y}) rot=${c.rotation}°${c.pins ? ` [${c.pins.length} pins]` : ""}`;
-          if (!args.compact) {
-            if (c.ref_field) line += ` ref@(${c.ref_field.x},${c.ref_field.y})`;
-            if (c.value_field) line += ` val@(${c.value_field.x},${c.value_field.y})`;
-          }
-          if (c.body_bbox) line += ` bbox=[${c.body_bbox.x_min},${c.body_bbox.y_min},${c.body_bbox.x_max},${c.body_bbox.y_max}]`;
-          return line;
-        });
+        const lines = comps.map(
+          (c: any) =>
+            `  ${c.reference}: ${c.libId} = "${c.value}" at (${c.position.x}, ${c.position.y}) rot=${c.rotation}°${c.pins ? ` [${c.pins.length} pins]` : ""}`,
+        );
         return {
           content: [
             {
@@ -1090,115 +888,10 @@ It does NOT auto-save; call save_schematic after all repositioning is done.`,
     },
   );
 
-  // Check schematic layout for violations
-  server.tool(
-    "check_schematic_layout",
-    `Analyze a .kicad_sch file and return a list of layout violations. Checks:
-  1. Out-of-bounds components: symbol body bbox extends outside the sheet's usable drawing area.
-  2. Out-of-bounds labels: net label text endpoint (estimated from text length × 1.5mm/char and angle) extends outside sheet border.
-  3. Overlapping component bodies: two symbols whose body bboxes overlap or are within 2mm of each other.
-  4. Ref/Val text inside parent body: Reference or Value text position falls within the parent symbol's body bbox.
-  5. Ref/Val text overlapping another component's body: Reference or Value text position falls within a different symbol's body bbox.
-  6. Field text overlap: the estimated bounding box of one component's Reference or Value text overlaps that of another component's field text (catches stacked power flags, etc.).
-  7. Label overlap: two net labels whose estimated text bounding boxes overlap or are within 0.5mm of each other — indicates components placed too close on a shared bus, or opposing labels on adjacent pin tips that need more separation.
-  8. Stray wire: a wire segment whose endpoint(s) have no connection (no pin, label, junction, or other wire) — typically left over after deleting a component.
-
-Returns structured violations with type, affected_refs, position, and description. Zero violations means the layout is clean.
-Call this after batch_add_components or set_schematic_property_position to get programmatic feedback instead of relying on visual inspection.
-
-Set autofix=true to automatically apply all fixable violations (text_inside_parent_body, field_text_overlap) in a single batch operation — eliminates the check→fix loop entirely.
-
-PREFERRED: call autoplace_schematic_fields after all net labels are placed — it handles all field positioning in one pass and accounts for net label extents, which autofix does not.`,
-    {
-      schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      autofix: z.boolean().optional().describe("If true, automatically apply all violations that have a suggested_fix (text_inside_parent_body, field_text_overlap) in one batch call. Returns autofix_applied_count and remaining violations."),
-    },
-    async (args: { schematicPath: string; autofix?: boolean }) => {
-      const result = await callKicadScript("check_schematic_layout", args);
-      if (result.success) {
-        const violations: any[] = result.violations || [];
-        const lines: string[] = [];
-        if (args.autofix && (result.autofix_applied_count ?? 0) > 0) {
-          lines.push(`Auto-fixed ${result.autofix_applied_count} violation(s).`);
-          if ((result.autofix_failed_count ?? 0) > 0) {
-            lines.push(`  (${result.autofix_failed_count} fix(es) failed)`);
-          }
-        }
-        if (violations.length === 0) {
-          lines.push("Layout check passed — no violations found.");
-          return { content: [{ type: "text", text: lines.join("\n") }] };
-        }
-        lines.push(`Layout violations (${violations.length}):`);
-        for (const v of violations) {
-          const refs = (v.affected_refs || []).join(", ");
-          const pos = v.position ? ` @ (${v.position.x}, ${v.position.y})` : "";
-          const fix = v.suggested_fix ? ` [fix: move ${v.suggested_fix.reference}.${v.suggested_fix.property} to (${v.suggested_fix.x},${v.suggested_fix.y})]` : "";
-          const del_ = v.suggested_delete_label
-            ? ` [fix: delete_schematic_net_label net='${v.suggested_delete_label.net}' @ (${v.suggested_delete_label.position.x},${v.suggested_delete_label.position.y})]`
-            : "";
-          lines.push(`  [${v.type}] ${refs}${pos}: ${v.description}${fix}${del_}`);
-        }
-        const area = result.sheet_usable_area;
-        if (area) {
-          lines.push(`Sheet usable area: x=[${area.left}, ${area.right}] y=[${area.top}, ${area.bottom}]`);
-        }
-        return {
-          content: [{ type: "text", text: lines.join("\n") }],
-        };
-      }
-      return {
-        content: [{ type: "text", text: `check_schematic_layout failed: ${result.message || "Unknown error"}` }],
-        isError: true,
-      };
-    },
-  );
-
-  // Auto-place Reference/Value fields outside body and labels
-  server.tool(
-    "autoplace_schematic_fields",
-    `Reposition Reference and Value fields for all (or selected) components so they sit outside:
-  1. The component's body bounding box.
-  2. Any net labels whose connection point is at one of the component's pin tips.
-
-Call this AFTER all net labels have been connected (i.e., after batch_connect, connect_to_net,
-or batch_add_and_connect). Do NOT call it before nets are assigned — it needs the labels to be
-present to avoid them.
-
-The tool uses KiCad's 50-mil grid for all positions and writes one file update for all
-components in a single pass. Prefer this over manually calling set_schematic_property_position
-or batch_set_schematic_property_positions after placement.
-
-Parameters:
-  schematicPath — path to the .kicad_sch file
-  references    — optional list of reference designators to limit scope (default: all components)
-  clearance     — minimum gap in mm between the component's occupied zone and the field text
-                  (default: 1.0 mm)`,
-    {
-      schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      references: z.array(z.string()).optional().describe("Limit to these component references (default: all components)"),
-      clearance: z.number().optional().describe("Gap in mm between occupied zone and field text centre (default: 1.0)"),
-    },
-    async (args: { schematicPath: string; references?: string[]; clearance?: number }) => {
-      const result = await callKicadScript("autoplace_schematic_fields", args);
-      if (result.success) {
-        const lines = [result.message || "Fields auto-placed."];
-        if ((result.failed || []).length > 0) {
-          lines.push("Failed updates:");
-          (result.failed as any[]).forEach((f: any) => lines.push(`  ${f.reference}.${f.property}: ${f.reason}`));
-        }
-        return { content: [{ type: "text", text: lines.join("\n") }] };
-      }
-      return {
-        content: [{ type: "text", text: `autoplace_schematic_fields failed: ${result.message || "Unknown error"}` }],
-        isError: true,
-      };
-    },
-  );
-
   // List all nets in schematic
   server.tool(
     "list_schematic_nets",
-    "List all NAMED nets in the schematic with their connections. WARNING: Only lists nets that have at least one local or global net label. Pins connected via unlabeled wire segments will NOT appear — use list_schematic_wires to verify physical connectivity, or get_net_topology for a full trace of a specific net.",
+    "List all nets in the schematic with their connections.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
     },
@@ -1212,14 +905,10 @@ Parameters:
           };
         }
         const lines = nets.map((n: any) => {
-          const conns = (n.connections || [])
-            .map((c: any) => {
-              const pinNum = String(c.pin);
-              const pinLabel = c.pinName && c.pinName !== pinNum ? `${pinNum}(${c.pinName})` : pinNum;
-              return `${c.component}/${pinLabel}`;
-            })
-            .join(", ");
-          return `  ${n.name}: ${conns || "(no connections)"}`;
+          const conns = (n.connections || []).map((c: any) => `${c.component}/${c.pin}`).join(", ");
+          const pinCount =
+            n.connected_pin_count !== undefined ? ` [${n.connected_pin_count} pin(s)]` : "";
+          return `  ${n.name}${pinCount}: ${conns || "(no connections)"}`;
         });
         return {
           content: [
@@ -1242,12 +931,11 @@ Parameters:
   // List all wires in schematic
   server.tool(
     "list_schematic_wires",
-    "List wires in the schematic with start/end coordinates. Use netName to filter to only wires reachable from a specific named net (BFS from that net's labels) — turns the flat wire dump into a targeted connectivity trace.",
+    "List all wires in the schematic with start/end coordinates.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      netName: z.string().optional().describe("If provided, return only wire segments reachable from this net's labels (local or global)"),
     },
-    async (args: { schematicPath: string; netName?: string }) => {
+    async (args: { schematicPath: string }) => {
       const result = await callKicadScript("list_schematic_wires", args);
       if (result.success) {
         const wires = result.wires || [];
@@ -1280,21 +968,24 @@ Parameters:
   // List all labels in schematic
   server.tool(
     "list_schematic_labels",
-    "List all net labels, global labels, power flags, and no-connect markers in the schematic. Types returned: [net] = local net label, [global] = global label, [power] = power symbol instance (e.g. PWR_FLAG, not a net label), [no_connect] = unconnected pin marker. Use filter.componentRef to see only labels near a specific component's pins (within 3mm of any pin tip) — avoids the full 50+ label dump when debugging one component. Set useBodyBox=true to instead return all labels within the component's body bounding box expanded by bodyBoxExpand mm.",
+    "List all net labels, global labels, and power flags in the schematic. " +
+      "Optionally filter by label name (netName) and/or label type (labelType).",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      filter: z.object({
-        netName: z.string().optional().describe("Return only labels whose name exactly matches this net name"),
-        componentRef: z.string().optional().describe("Return only labels near the pin tips of this component (within 3mm). Most efficient way to inspect one component's connections."),
-        useBodyBox: z.boolean().optional().describe("When true, use body bounding box (pin extents + bodyBoxExpand) instead of per-pin radius for componentRef filter"),
-        bodyBoxExpand: z.number().optional().describe("Expand the body bounding box by this many mm on each side when useBodyBox=true (default: 2.0)"),
-        boundingBox: z.object({
-          x_min: z.number(), y_min: z.number(),
-          x_max: z.number(), y_max: z.number(),
-        }).optional().describe("Return only labels whose position falls within this bounding box (mm)"),
-      }).optional().describe("Optional filters to narrow results"),
+      netName: z
+        .string()
+        .optional()
+        .describe(
+          "Filter to labels whose name exactly matches this string (case-sensitive). Omit to return all labels.",
+        ),
+      labelType: z
+        .enum(["net", "global", "power"])
+        .optional()
+        .describe(
+          "Filter by label type. 'net' = local label, 'global' = global label, 'power' = power symbol. Omit to return all types.",
+        ),
     },
-    async (args: { schematicPath: string; filter?: { netName?: string; componentRef?: string; useBodyBox?: boolean; bodyBoxExpand?: number; boundingBox?: { x_min: number; y_min: number; x_max: number; y_max: number } } }) => {
+    async (args: { schematicPath: string; netName?: string; labelType?: string }) => {
       const result = await callKicadScript("list_schematic_labels", args);
       if (result.success) {
         const labels = result.labels || [];
@@ -1304,8 +995,7 @@ Parameters:
           };
         }
         const lines = labels.map(
-          (l: any) =>
-            `  [${l.type}] ${l.name} at (${l.position.x}, ${l.position.y})${l.angle != null ? ` angle=${l.angle}` : ""}`,
+          (l: any) => `  [${l.type}] ${l.name} at (${l.position.x}, ${l.position.y})`,
         );
         return {
           content: [
@@ -1417,35 +1107,27 @@ Parameters:
   // Annotate schematic
   server.tool(
     "annotate_schematic",
-    "Assign reference designators to unannotated components (R? → R1, R2, ...). Must be called before tools that require known references. Automatically fixes hierarchical instance paths for sub-sheets so KiCAD ERC shows correct references when opening the parent schematic.",
+    "Assign reference designators to unannotated components (R? → R1, R2, ...). Must be called before tools that require known references.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      hierarchical: z
-        .boolean()
-        .optional()
-        .describe(
-          "Deprecated — hierarchical instance path fixing now happens automatically. Accepted for backward compatibility but has no additional effect.",
-        ),
     },
-    async (args: { schematicPath: string; hierarchical?: boolean }) => {
+    async (args: { schematicPath: string }) => {
       const result = await callKicadScript("annotate_schematic", args);
       if (result.success) {
         const annotated = result.annotated || [];
-        const subSheetsFixed: string[] = result.subSheetsFixed || [];
-        const parts: string[] = [];
         if (annotated.length === 0) {
-          parts.push("All components are already annotated.");
-        } else {
-          const lines = annotated.map(
-            (a: any) => `  ${a.oldReference} → ${a.newReference}`,
-          );
-          parts.push(`Annotated ${annotated.length} component(s):\n${lines.join("\n")}`);
+          return {
+            content: [{ type: "text", text: "All components are already annotated." }],
+          };
         }
-        if (subSheetsFixed.length > 0) {
-          parts.push(`Fixed sub-sheet instances in: ${subSheetsFixed.join(", ")}`);
-        }
+        const lines = annotated.map((a: any) => `  ${a.oldReference} → ${a.newReference}`);
         return {
-          content: [{ type: "text", text: parts.join("\n") }],
+          content: [
+            {
+              type: "text",
+              text: `Annotated ${annotated.length} component(s):\n${lines.join("\n")}`,
+            },
+          ],
         };
       }
       return {
@@ -1500,62 +1182,83 @@ Parameters:
   // Delete net label from schematic
   server.tool(
     "delete_schematic_net_label",
-    "Remove net label(s) from the schematic. Four modes: (1) componentRef+pinName to delete whatever label sits at that pin tip — no coordinate lookup needed, (2) single label by netName + optional position, (3) deleteAll=true to remove every label at once, (4) positions array for batch deletion in one call. tolerance_mm (default 0.5) controls the coordinate match radius for modes 1 and 2.",
+    "Remove a net label from the schematic.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      componentRef: z.string().optional().describe("Component reference (e.g. R1) — use with pinName to delete the label at that pin tip without knowing its coordinates"),
-      pinName: z.string().optional().describe("Pin number or name (e.g. '1', 'VDD') — use with componentRef"),
-      netName: z.string().optional().describe("Name of the net label to remove (single-delete mode)"),
+      netName: z.string().describe("Name of the net label to remove"),
       position: z
         .object({ x: z.number(), y: z.number() })
         .optional()
-        .describe("Position to disambiguate if multiple labels with same name (single-delete mode)"),
-      tolerance_mm: z.number().optional().describe("Search radius in mm for coordinate-based matching (default 0.5). Increase to 1.0+ when the label may be slightly offset from the pin tip."),
-      deleteAll: z
-        .boolean()
-        .optional()
-        .describe("Set true to delete ALL net labels in the schematic at once"),
-      positions: z
-        .array(
-          z.object({
-            netName: z.string().describe("Net label name to delete"),
-            position: z
-              .object({ x: z.number(), y: z.number() })
-              .optional()
-              .describe("Optional position to disambiguate"),
-          }),
-        )
-        .optional()
-        .describe("Batch delete: list of {netName, position?} items removed in one call"),
+        .describe("Position to disambiguate if multiple labels with same name"),
     },
     async (args: {
       schematicPath: string;
-      componentRef?: string;
-      pinName?: string;
-      netName?: string;
+      netName: string;
       position?: { x: number; y: number };
-      tolerance_mm?: number;
-      deleteAll?: boolean;
-      positions?: Array<{ netName: string; position?: { x: number; y: number } }>;
     }) => {
       const result = await callKicadScript("delete_schematic_net_label", args);
       if (result.success) {
-        let msg: string;
-        if (args.deleteAll) {
-          msg = `Deleted all net labels (${result.deleted ?? 0} removed)`;
-        } else if (args.positions) {
-          msg = `Deleted ${result.deleted ?? 0} label(s)`;
-          if (result.notFound?.length) msg += `, not found: ${result.notFound.join(", ")}`;
-        } else {
-          msg = `Deleted net label '${args.netName}'`;
-        }
-        return { content: [{ type: "text", text: msg }] };
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Deleted net label '${args.netName}'`,
+            },
+          ],
+        };
       }
       return {
         content: [
           {
             type: "text",
             text: `Failed to delete label: ${result.message || "Unknown error"}`,
+          },
+        ],
+        isError: true,
+      };
+    },
+  );
+
+  // Move net label to a new position in the schematic
+  server.tool(
+    "move_schematic_net_label",
+    "Move a net label (local, global, or hierarchical) to a new position in the schematic. Use currentPosition to disambiguate when multiple labels share the same name.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      netName: z.string().describe("Name of the net label to move"),
+      newPosition: z.object({ x: z.number(), y: z.number() }).describe("Target position in mm"),
+      currentPosition: z
+        .object({ x: z.number(), y: z.number() })
+        .optional()
+        .describe("Current position to disambiguate when multiple labels share the same name"),
+      labelType: z
+        .enum(["label", "global_label", "hierarchical_label"])
+        .optional()
+        .describe("Restrict search to a specific label type"),
+    },
+    async (args: {
+      schematicPath: string;
+      netName: string;
+      newPosition: { x: number; y: number };
+      currentPosition?: { x: number; y: number };
+      labelType?: "label" | "global_label" | "hierarchical_label";
+    }) => {
+      const result = await callKicadScript("move_schematic_net_label", args);
+      if (result.success) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Moved net label '${args.netName}' from (${result.oldPosition?.x}, ${result.oldPosition?.y}) to (${result.newPosition?.x}, ${result.newPosition?.y})`,
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to move label: ${result.message || "Unknown error"}`,
           },
         ],
         isError: true,
@@ -1638,16 +1341,12 @@ Parameters:
       format: z.enum(["png", "svg"]).optional().describe("Output format (default: png)"),
       width: z.number().optional().describe("Image width in pixels (default: 1200)"),
       height: z.number().optional().describe("Image height in pixels (default: 900)"),
-      crop: z.boolean().optional().describe("Auto-crop to the bounding box of placed components with a small margin (default: false). Makes the image readable when components occupy only a small portion of the sheet. Requires Pillow (pip install Pillow)."),
-      highlight_refs: z.array(z.string()).optional().describe("Optional list of reference designators to visually highlight in the rendered image (e.g. ['F1', 'C3']). Best-effort visual aid — accepted without error even if highlighting is not applied."),
     },
     async (args: {
       schematicPath: string;
       format?: "png" | "svg";
       width?: number;
       height?: number;
-      crop?: boolean;
-      highlight_refs?: string[];
     }) => {
       const result = await callKicadScript("get_schematic_view", args);
       if (result.success) {
@@ -1685,95 +1384,36 @@ Parameters:
     },
   );
 
-  // Validate schematic syntax (paren balance check, no KiCad process needed)
-  server.tool(
-    "validate_schematic",
-    "Check parenthesis balance and basic syntax of a .kicad_sch file without loading KiCad. Returns pass/fail and the line number of the first syntax error. Run this after placing components if batch_connect is reporting unexpected 'pin not found' errors — a paren underflow will cause those failures.",
-    {
-      schematicPath: z.string().describe("Path to the .kicad_sch file"),
-    },
-    async (args: { schematicPath: string }) => {
-      const result = await callKicadScript("validate_schematic", args);
-      if (result.valid) {
-        return { content: [{ type: "text" as const, text: `Syntax OK: ${result.message}` }] };
-      }
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Syntax error: ${result.error || result.message || "Unknown error"}`,
-        }],
-        isError: true,
-      };
-    },
-  );
-
   // Run Electrical Rules Check (ERC)
   server.tool(
     "run_erc",
-    "Runs the KiCAD Electrical Rules Check (ERC) on a schematic via kicad-cli (operates on the saved file on disk). Returns violations grouped by type with counts. Use errorsOnly=false to also see warnings. All coordinates are in mm. NOTE: all schematic tools auto-save after each change, so the on-disk file is always current.",
+    "Runs the KiCAD Electrical Rules Check (ERC) on a schematic and returns all violations. Use after wiring to verify the schematic before generating a netlist.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
-      errorsOnly: z.boolean().optional().describe("If true (default), only show error-severity violations. Set false to also show warnings and info."),
     },
-    async (args: { schematicPath: string; errorsOnly?: boolean }) => {
+    async (args: { schematicPath: string }) => {
       const result = await callKicadScript("run_erc", args);
       if (result.success) {
-        const errorsOnly = args.errorsOnly !== false; // default true
-        let violations: any[] = result.violations || [];
-        if (errorsOnly) {
-          violations = violations.filter((v: any) => v.severity === "error");
+        const violations: any[] = result.violations || [];
+        const lines: string[] = [`ERC result: ${violations.length} violation(s)`];
+        if (result.summary?.by_severity) {
+          const s = result.summary.by_severity;
+          lines.push(
+            `  Errors: ${s.error ?? 0}  Warnings: ${s.warning ?? 0}  Info: ${s.info ?? 0}`,
+          );
         }
-        // Filter benign violations
-        const actionable = violations.filter((v: any) => !v.benign);
-        const benignCount = violations.length - actionable.length;
-
-        const lines: string[] = [];
-        if (result.sheets_checked?.length) {
-          lines.push(`Checked: ${(result.sheets_checked as string[]).join(", ")}`);
-        }
-        const s = result.summary?.by_severity ?? {};
-        lines.push(`ERC: ${s.error ?? 0} error(s), ${s.warning ?? 0} warning(s)${errorsOnly ? " [showing errors only]" : ""}`);
-        if (benignCount > 0) lines.push(`  (${benignCount} benign library warnings hidden)`);
-
-        if (actionable.length === 0) {
-          lines.push(errorsOnly ? "No errors found." : "No violations found.");
-        } else {
-          // Group by type
-          const byType: Record<string, any[]> = {};
-          for (const v of actionable) {
-            const key = v.type || "unknown";
-            if (!byType[key]) byType[key] = [];
-            byType[key].push(v);
-          }
+        if (violations.length > 0) {
           lines.push("");
-          for (const [type, group] of Object.entries(byType)) {
-            lines.push(`[${type}] — ${group.length} violation(s):`);
-            group.slice(0, 20).forEach((v: any) => {
-              // Extract component reference from item descriptions
-              const itemDescs = (v.items || [])
-                .map((it: any) => it.description)
-                .filter(Boolean)
-                .join("; ");
-              const toMils = (mm: number) => Math.round(mm * 1000 / 25.4);
-              const loc = v.location?.x !== undefined
-                ? ` @ (${toMils(v.location.x)}, ${toMils(v.location.y)}) mils / (${v.location.x.toFixed(2)}, ${v.location.y.toFixed(2)}) mm`
+          violations.slice(0, 30).forEach((v: any, i: number) => {
+            const loc =
+              v.location && v.location.x !== undefined
+                ? ` @ (${v.location.x}, ${v.location.y})`
                 : "";
-              const detail = itemDescs ? `  ${itemDescs}${loc}` : `  ${v.message}${loc}`;
-              lines.push(detail);
-            });
-            if (group.length > 20) lines.push(`  ... and ${group.length - 20} more`);
-            lines.push("");
+            lines.push(`${i + 1}. [${v.severity}] ${v.message}${loc}`);
+          });
+          if (violations.length > 30) {
+            lines.push(`... and ${violations.length - 30} more`);
           }
-        }
-        // Surface PWR_FLAG suggestions so the agent can act immediately
-        const pwrSuggestions: any[] = result.pwr_flag_suggestions || [];
-        if (pwrSuggestions.length > 0) {
-          lines.push(`PWR_FLAG suggestions (${pwrSuggestions.length} net(s) need a PWR_FLAG):`);
-          for (const s of pwrSuggestions) {
-            const pos = s.suggested_position;
-            lines.push(`  net '${s.net}': place PWR_FLAG near (${pos.x.toFixed(2)}, ${pos.y.toFixed(2)}) mm`);
-          }
-          lines.push("  → Use batch_add_and_connect with symbol=power:PWR_FLAG to fix in one call.");
         }
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } else {
@@ -1792,9 +1432,9 @@ Parameters:
   // Generate netlist
   server.tool(
     "generate_netlist",
-    "Generate a netlist from the schematic",
+    "Return a structured JSON netlist from the schematic — component list (reference, value, footprint) and net list (net name with all connected component/pin pairs). Use this to inspect or verify connectivity within the conversation. Does not write any file. To export a netlist file in Spice, KiCad XML, Cadstar, or OrcadPCB2 format, use export_netlist instead.",
     {
-      schematicPath: z.string().describe("Path to the schematic file"),
+      schematicPath: z.string().describe("Absolute path to the .kicad_sch schematic file"),
     },
     async (args: { schematicPath: string }) => {
       const result = await callKicadScript("generate_netlist", args);
@@ -1837,33 +1477,6 @@ Parameters:
     },
   );
 
-  // Confirm schematic is saved (all schematic tools write immediately; this verifies the file exists)
-  server.tool(
-    "save_schematic",
-    "Confirm the schematic file is saved to disk. Schematic tools write changes immediately — this tool verifies the file exists and returns its size. Equivalent to save_project but for .kicad_sch files.",
-    {
-      schematicPath: z.string().describe("Path to the .kicad_sch file"),
-    },
-    async (args: { schematicPath: string }) => {
-      const result = await callKicadScript("save_schematic", args);
-      if (result.success) {
-        return {
-          content: [{
-            type: "text",
-            text: result.message || `Schematic saved: ${args.schematicPath}`,
-          }],
-        };
-      }
-      return {
-        content: [{
-          type: "text",
-          text: `Failed: ${result.message || "Unknown error"}`,
-        }],
-        isError: true,
-      };
-    },
-  );
-
   // Sync schematic to PCB board (equivalent to KiCAD F8 / "Update PCB from Schematic")
   server.tool(
     "sync_schematic_to_board",
@@ -1876,60 +1489,6 @@ Parameters:
       const result = await callKicadScript("sync_schematic_to_board", args);
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
-    },
-  );
-
-  // Add hierarchical sheet reference to a parent schematic
-  server.tool(
-    "add_hierarchical_sheet",
-    "Insert a hierarchical sheet reference block into a parent schematic. Creates the (sheet ...) block that links the parent to a sub-sheet file, and adds the corresponding entry to (sheet_instances). After populating the sub-sheet with components, call annotate_schematic on the sub-sheet — it will automatically fix hierarchical instance paths so the parent-context ERC shows correct references.",
-    {
-      schematicPath: z
-        .string()
-        .describe("Path to the parent .kicad_sch file"),
-      subsheetPath: z
-        .string()
-        .describe(
-          "Path to the referenced sub-sheet .kicad_sch file (resolved relative to the parent schematic's directory)",
-        ),
-      sheetName: z
-        .string()
-        .describe("Display name shown on the sheet block in the schematic"),
-      position: z
-        .object({ x: z.number(), y: z.number() })
-        .describe("Top-left corner of the sheet rectangle in mm"),
-      size: z
-        .object({ width: z.number(), height: z.number() })
-        .optional()
-        .describe("Sheet rectangle dimensions in mm (default 80×50)"),
-    },
-    async (args: {
-      schematicPath: string;
-      subsheetPath: string;
-      sheetName: string;
-      position: { x: number; y: number };
-      size?: { width: number; height: number };
-    }) => {
-      const result = await callKicadScript("add_hierarchical_sheet", args);
-      if (result.success) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Sheet '${result.sheet_name}' added (uuid: ${result.sheet_uuid}, file: ${result.subsheet_path}, page: ${result.page})`,
-            },
-          ],
-        };
-      }
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Failed to add hierarchical sheet: ${result.message || "Unknown error"}`,
-          },
-        ],
-        isError: true,
       };
     },
   );
@@ -1983,59 +1542,6 @@ Parameters:
     },
   );
 
-  // Trace a complete net topology
-  server.tool(
-    "get_net_topology",
-    `Trace a complete named net and return every element on it in one call:
-- wire_segments: all wire segments (start/end coordinates) that form this net
-- labels: all local and global net labels on this net (position, type, angle)
-- pins: all component pins connected to this net (ref, pin_number, pin_name, pin_type, world position)
-- dangling_endpoints: wire endpoints with no pin, no label, and no junction — true open circuits
-
-This replaces multiple separate tool calls (list_schematic_wires + list_schematic_labels + list_schematic_nets) when you need to inspect or debug a specific net. Use it to verify connectivity, find floating stubs, or map out signal paths.`,
-    {
-      schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      netName: z.string().describe("Net name to trace (must match a local or global label exactly)"),
-    },
-    async (args: { schematicPath: string; netName: string }) => {
-      const result = await callKicadScript("get_net_topology", args);
-      if (result.success) {
-        const lines: string[] = [`Net: ${result.net}`];
-        const segs = result.wire_segments || [];
-        lines.push(`Wire segments (${segs.length}):`);
-        for (const s of segs) {
-          lines.push(`  (${s.start.x}, ${s.start.y}) → (${s.end.x}, ${s.end.y})`);
-        }
-        const lbls = result.labels || [];
-        lines.push(`Labels (${lbls.length}):`);
-        for (const l of lbls) {
-          lines.push(`  [${l.type}] ${l.name} at (${l.position.x}, ${l.position.y}) angle=${l.angle}`);
-        }
-        const pins = result.pins || [];
-        lines.push(`Pins (${pins.length}):`);
-        for (const p of pins) {
-          lines.push(`  ${p.ref}/${p.pin_number}(${p.pin_name}) [${p.pin_type}] at (${p.position.x}, ${p.position.y})`);
-        }
-        const dang = result.dangling_endpoints || [];
-        if (dang.length > 0) {
-          lines.push(`DANGLING endpoints (${dang.length}) — open circuits:`);
-          for (const d of dang) {
-            lines.push(`  (${d.x}, ${d.y})`);
-          }
-        } else {
-          lines.push("No dangling endpoints.");
-        }
-        if (result.message) lines.push(result.message);
-        return { content: [{ type: "text", text: lines.join("\n") }] };
-      }
-      return {
-        content: [{ type: "text", text: `get_net_topology failed: ${result.message || "Unknown error"}` }],
-        isError: true,
-      };
-    },
-  );
-
-
   // Find overlapping elements
   server.tool(
     "find_overlapping_elements",
@@ -2082,36 +1588,6 @@ This replaces multiple separate tool calls (list_schematic_wires + list_schemati
       }
       return {
         content: [{ type: "text", text: `Failed: ${result.message || "Unknown error"}` }],
-      };
-    },
-  );
-
-  // Get component pin world positions
-  server.tool(
-    "get_component_pin_positions",
-    `Return the world (schematic) coordinates for every pin of a component reference — after applying the component's position, rotation, and KiCad's Y-flip. Returns pin_number, pin_name, pin_type, position {x, y}, and stub_direction_angle for each pin.
-
-Use this instead of manually combining list_symbol_pins (symbol-local coords) + rotation math. Internally uses the same PinLocator as add_no_connect and place_net_label_at_pin.`,
-    {
-      schematicPath: z.string().describe("Path to the .kicad_sch file"),
-      reference: z.string().describe("Component reference designator (e.g., 'U9', 'R3')"),
-    },
-    async (args: { schematicPath: string; reference: string }) => {
-      const result = await callKicadScript("get_component_pin_positions", args);
-      if (result.success) {
-        const pins = result.pins || [];
-        const lines = [
-          `${result.reference} — ${result.count} pin(s):`,
-          ...pins.map((p: any) => {
-            const angle = p.stub_direction_angle != null ? ` dir=${p.stub_direction_angle}°` : "";
-            return `  pin ${p.pin_number} (${p.pin_name}) [${p.pin_type}] at (${p.position.x}, ${p.position.y})${angle}`;
-          }),
-        ];
-        return { content: [{ type: "text", text: lines.join("\n") }] };
-      }
-      return {
-        content: [{ type: "text", text: `get_component_pin_positions failed: ${result.message || "Unknown error"}` }],
-        isError: true,
       };
     },
   );
@@ -2189,6 +1665,353 @@ Use this instead of manually combining list_symbol_pins (symbol-local coords) + 
       }
       return {
         content: [{ type: "text", text: `Failed: ${result.message || "Unknown error"}` }],
+      };
+    },
+  );
+
+  // List floating net labels
+  server.tool(
+    "list_floating_labels",
+    "Returns all net labels in the schematic that are not connected to any component pin. " +
+      "A label is 'floating' when no component pin falls on the wire-network reachable from the " +
+      "label's position. Floating labels indicate misplaced or off-grid labels that cause ERC errors. " +
+      "Does not require the KiCAD UI to be running.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
+    },
+    async (args: { schematicPath: string }) => {
+      const result = await callKicadScript("list_floating_labels", args);
+      if (result.success) {
+        const labels: any[] = result.floating_labels || [];
+        if (labels.length === 0) {
+          return { content: [{ type: "text", text: "No floating labels found." }] };
+        }
+        const lines: string[] = [`Found ${labels.length} floating label(s):\n`];
+        labels.slice(0, 50).forEach((lbl: any) => {
+          lines.push(`  "${lbl.name}" (${lbl.type}) at (${lbl.x}, ${lbl.y})`);
+        });
+        if (labels.length > 50) {
+          lines.push(`  ... and ${labels.length - 50} more`);
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+      return {
+        content: [{ type: "text", text: `Failed: ${result.message || "Unknown error"}` }],
+      };
+    },
+  );
+
+  // Find orphaned wires
+  server.tool(
+    "find_orphaned_wires",
+    "Find wire segments with at least one dangling endpoint — not connected to a component pin, " +
+      "net label, or another wire. Orphaned wires cause ERC 'wire end unconnected' errors. " +
+      "Does not require the KiCad UI to be running.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
+    },
+    async (args: { schematicPath: string }) => {
+      const result = await callKicadScript("find_orphaned_wires", args);
+      if (result.success) {
+        const wires: any[] = result.orphaned_wires || [];
+        if (wires.length === 0) {
+          return { content: [{ type: "text", text: "No orphaned wires found." }] };
+        }
+        const lines: string[] = [`Found ${wires.length} orphaned wire(s):\n`];
+        wires.slice(0, 50).forEach((w: any) => {
+          const dangling = w.dangling_ends.map((e: any) => `(${e.x}, ${e.y})`).join(", ");
+          lines.push(
+            `  wire (${w.start.x}, ${w.start.y})→(${w.end.x}, ${w.end.y})  dangling end(s): ${dangling}`,
+          );
+        });
+        if (wires.length > 50) lines.push(`  ... and ${wires.length - 50} more`);
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+      return {
+        content: [{ type: "text", text: `Failed: ${result.message || "Unknown error"}` }],
+      };
+    },
+  );
+
+  // Snap schematic elements to grid
+  server.tool(
+    "snap_to_grid",
+    "Snap schematic element coordinates to the nearest grid point. " +
+      "KiCAD uses exact integer matching for connectivity, so off-grid coordinates cause wires " +
+      "that look connected to fail ERC checks. " +
+      "Modifies the .kicad_sch file in place. Does not require the KiCAD UI to be running.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
+      gridSize: z
+        .number()
+        .optional()
+        .describe("Grid spacing in mm (default: 2.54 — standard KiCAD schematic grid)"),
+      elements: z
+        .array(z.enum(["wires", "junctions", "labels", "components"]))
+        .optional()
+        .describe(
+          'Element types to snap (default: ["wires", "junctions", "labels"]). ' +
+            '"components" is opt-in — moving a component without re-routing wires creates new mismatches.',
+        ),
+    },
+    async (args: { schematicPath: string; gridSize?: number; elements?: string[] }) => {
+      const result = await callKicadScript("snap_to_grid", args);
+      if (result.success) {
+        return { content: [{ type: "text", text: result.message }] };
+      }
+      return {
+        content: [{ type: "text", text: `Failed: ${result.message || "Unknown error"}` }],
+      };
+    },
+  );
+
+  server.tool(
+    "get_net_at_point",
+    "Returns the net name at a given (x, y) coordinate in a schematic, or null if no net label " +
+      "or wire endpoint is present at that position. Faster than get_pin_net when you only need " +
+      "the net name at a known coordinate and don't need pin traversal.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file (.kicad_sch)"),
+      x: z.number().describe("X coordinate in mm"),
+      y: z.number().describe("Y coordinate in mm"),
+    },
+    async (args: { schematicPath: string; x: number; y: number }) => {
+      const result = await callKicadScript("get_net_at_point", args);
+      if (result.success) {
+        const netName = result.net_name ?? null;
+        const source = result.source ?? null;
+        const pos = result.position;
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Net at (${pos?.x ?? args.x}, ${pos?.y ?? args.y}): ` +
+                (netName !== null ? netName : "(none)") +
+                (source ? ` [source: ${source}]` : ""),
+            },
+          ],
+        };
+      } else {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Failed to get net at point: ${result.message || "Unknown error"}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // Add hierarchical label to a sub-sheet
+  server.tool(
+    "add_schematic_hierarchical_label",
+    "Add a hierarchical label (sheet interface port) to a sub-sheet schematic. " +
+      "Hierarchical labels are the connection points that link a sub-sheet to its " +
+      "parent via sheet pins. The label text must exactly match the corresponding " +
+      "sheet pin name.",
+    {
+      schematicPath: z.string().describe("Path to the sub-sheet .kicad_sch file"),
+      text: z.string().describe("Label text (e.g. 'SD_CLK') — must match the sheet pin name"),
+      position: z.array(z.number()).length(2).describe("Position [x, y] in mm"),
+      shape: z
+        .enum(["input", "output", "bidirectional"])
+        .describe("Signal direction from the sub-sheet's perspective"),
+      orientation: z
+        .number()
+        .optional()
+        .describe("Rotation in degrees: 0=label points right, 180=label points left (default: 0)"),
+    },
+    async (args: {
+      schematicPath: string;
+      text: string;
+      position: number[];
+      shape: "input" | "output" | "bidirectional";
+      orientation?: number;
+    }) => {
+      const result = await callKicadScript("add_schematic_hierarchical_label", args);
+      if (result.success) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: result.message || `Added hierarchical label '${args.text}'`,
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Failed to add hierarchical label: ${result.message || "Unknown error"}`,
+          },
+        ],
+      };
+    },
+  );
+
+  // List free-form text annotations in schematic
+  server.tool(
+    "list_schematic_texts",
+    "List all free-form text annotations (notes, headings, documentation strings) in the schematic. " +
+      "Returns position, angle, font size, bold/italic flags, and justification for each text element. " +
+      "Optionally filter by a substring match on the text content.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      text: z
+        .string()
+        .optional()
+        .describe("Case-insensitive substring filter — only return texts containing this string"),
+    },
+    async (args: { schematicPath: string; text?: string }) => {
+      const result = await callKicadScript("list_schematic_texts", args);
+      if (result.success) {
+        const texts = result.texts || [];
+        if (texts.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "No text annotations found in schematic." }],
+          };
+        }
+        const lines = texts.map(
+          (t: any) =>
+            `  "${t.text}" at (${t.position.x}, ${t.position.y})` +
+            (t.angle ? ` angle=${t.angle}` : "") +
+            ` size=${t.font_size}` +
+            (t.bold ? " bold" : "") +
+            (t.italic ? " italic" : "") +
+            ` justify=${t.justify}`,
+        );
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Text annotations (${texts.length}):\n${lines.join("\n")}`,
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Failed to list text annotations: ${result.message || "Unknown error"}`,
+          },
+        ],
+        isError: true,
+      };
+    },
+  );
+
+  // Add free-form text annotation to schematic
+  server.tool(
+    "add_schematic_text",
+    "Add a free-form text annotation to the schematic. " +
+      "Use this to add notes, labels, section headings, or documentation strings " +
+      "directly on the schematic canvas. Unlike net labels, text annotations have " +
+      "no electrical significance.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      text: z.string().describe("Text content to display"),
+      position: z
+        .array(z.number())
+        .length(2)
+        .describe("Position [x, y] in schematic mm coordinates"),
+      angle: z.number().optional().describe("Rotation angle in degrees (default: 0)"),
+      fontSize: z.number().optional().describe("Font size in mm (default: 1.27)"),
+      bold: z.boolean().optional().describe("Bold text (default: false)"),
+      italic: z.boolean().optional().describe("Italic text (default: false)"),
+      justify: z
+        .enum(["left", "center", "right"])
+        .optional()
+        .describe("Horizontal text justification (default: left)"),
+    },
+    async (args: {
+      schematicPath: string;
+      text: string;
+      position: number[];
+      angle?: number;
+      fontSize?: number;
+      bold?: boolean;
+      italic?: boolean;
+      justify?: "left" | "center" | "right";
+    }) => {
+      const result = await callKicadScript("add_schematic_text", args);
+      if (result.success) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: result.message || "Text annotation added successfully",
+            },
+          ],
+        };
+      } else {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Failed to add text annotation: ${result.message || "Unknown error"}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // Add sheet pin to a sheet block on the parent schematic
+  server.tool(
+    "add_sheet_pin",
+    "Add a pin to a sheet symbol block on the parent schematic. Sheet pins are the " +
+      "parent-side connection points that correspond to hierarchical labels in the " +
+      "sub-sheet. The pinName must exactly match a hierarchical_label in the sub-sheet.",
+    {
+      schematicPath: z.string().describe("Path to the PARENT .kicad_sch file"),
+      sheetName: z
+        .string()
+        .describe("Sheet name as it appears in the Sheetname property (e.g. 'Storage')"),
+      pinName: z.string().describe("Pin name — must match a hierarchical_label in the sub-sheet"),
+      pinType: z
+        .enum(["input", "output", "bidirectional"])
+        .describe("Signal direction (should match the sub-sheet hierarchical label shape)"),
+      position: z
+        .array(z.number())
+        .length(2)
+        .describe("Pin position [x, y] in mm — must be on the sheet block boundary"),
+      orientation: z
+        .number()
+        .optional()
+        .describe("Pin orientation: 0=right edge of sheet box, 180=left edge (default: 0)"),
+    },
+    async (args: {
+      schematicPath: string;
+      sheetName: string;
+      pinName: string;
+      pinType: "input" | "output" | "bidirectional";
+      position: number[];
+      orientation?: number;
+    }) => {
+      const result = await callKicadScript("add_sheet_pin", args);
+      if (result.success) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                result.message || `Added sheet pin '${args.pinName}' to sheet '${args.sheetName}'`,
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Failed to add sheet pin: ${result.message || "Unknown error"}`,
+          },
+        ],
       };
     },
   );

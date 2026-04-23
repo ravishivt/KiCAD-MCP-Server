@@ -1338,7 +1338,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "add_schematic_component",
         "title": "Add Component to Schematic",
-        "description": "Places a symbol (resistor, capacitor, IC, etc.) on the schematic. Coordinates are in mm. Use 2.54mm grid multiples. Y increases downward. Space components 15-20mm apart. Use search_schematic_symbols to find the correct library:symbol_name before calling this tool. Use list_symbol_pins to discover pin names before placement.",
+        "description": "Places a symbol (resistor, capacitor, IC, etc.) on the schematic.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1354,138 +1354,11 @@ SCHEMATIC_TOOLS = [
                     "type": "string",
                     "description": "Component value (e.g., 10k, 0.1uF)",
                 },
-                "x": {
-                    "type": "number",
-                    "description": "X coordinate on schematic"
-                },
-                "y": {
-                    "type": "number",
-                    "description": "Y coordinate on schematic"
-                },
-                "rotation": {
-                    "type": "number",
-                    "description": "Rotation in degrees, CCW positive, multiples of 90 (e.g., 0, 90, 180, 270). Default 0."
-                },
-                "includePins": {
-                    "type": "boolean",
-                    "description": "Return pin coordinates in the response. Default false. Set true only when planning add_wire routing; batch_connect does not need coordinates."
-                }
+                "x": {"type": "number", "description": "X coordinate on schematic"},
+                "y": {"type": "number", "description": "Y coordinate on schematic"},
             },
             "required": ["reference", "symbol", "x", "y"],
         },
-    },
-    {
-        "name": "batch_add_components",
-        "title": "Batch Add Components to Schematic",
-        "description": "Places multiple symbols on the schematic in a single call. Prefer this over repeated add_schematic_component calls. All symbols must be specified as Library:SymbolName. Returns snapped positions. By default (auto_position_fields=true) automatically positions Reference and Value fields outside the component body based on rotation: rot=0/180 → labels above/below center; rot=90/270 → labels left/right of center. Set includePins: true only when planning add_wire routing; batch_connect does not need coordinates.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                },
-                "components": {
-                    "type": "array",
-                    "description": "List of components to place",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "symbol": {
-                                "type": "string",
-                                "description": "Symbol in Library:SymbolName format (e.g., Device:R)"
-                            },
-                            "reference": {
-                                "type": "string",
-                                "description": "Reference designator (e.g., R1, C2, U3)"
-                            },
-                            "value": {
-                                "type": "string",
-                                "description": "Component value (e.g., 10k, 100nF)"
-                            },
-                            "footprint": {
-                                "type": "string",
-                                "description": "Optional footprint (e.g., Resistor_SMD:R_0402)"
-                            },
-                            "position": {
-                                "type": "object",
-                                "description": "Placement position in mm",
-                                "properties": {
-                                    "x": {"type": "number"},
-                                    "y": {"type": "number"}
-                                },
-                                "required": ["x", "y"]
-                            },
-                            "rotation": {
-                                "type": "number",
-                                "description": "Rotation in degrees, CCW positive, multiples of 90. Default 0."
-                            },
-                            "includePins": {
-                                "type": "boolean",
-                                "description": "Return pin coordinates for this component. Default false. Set true only when planning add_wire routing; batch_connect does not need coordinates."
-                            }
-                        },
-                        "required": ["symbol", "reference", "position"]
-                    }
-                },
-                "auto_position_fields": {
-                    "type": "boolean",
-                    "description": "Automatically position Reference and Value fields outside the component body based on rotation. Default true. Set false only when you want to position fields manually with batch_set_schematic_property_positions."
-                }
-            },
-            "required": ["schematicPath", "components"]
-        }
-    },
-    {
-        "name": "batch_set_schematic_property_positions",
-        "title": "Batch Set Property Positions",
-        "description": "Move Reference and/or Value property fields for multiple components in a single call (one file read/write). Use this after batch_add_components when auto-positioning is insufficient (e.g., for ICs, connectors, or PWR_FLAGs with non-standard layouts). Replaces 22+ individual set_schematic_property_position calls with 1.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                },
-                "updates": {
-                    "type": "array",
-                    "description": "List of property position updates to apply",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "reference": {
-                                "type": "string",
-                                "description": "Component reference designator (e.g., R1, U3)"
-                            },
-                            "property": {
-                                "type": "string",
-                                "enum": ["Reference", "Value"],
-                                "description": "Which property field to move"
-                            },
-                            "x": {
-                                "type": "number",
-                                "description": "New X coordinate in mm"
-                            },
-                            "y": {
-                                "type": "number",
-                                "description": "New Y coordinate in mm"
-                            },
-                            "angle": {
-                                "type": "number",
-                                "description": "Text rotation angle in degrees (0=horizontal, 90=vertical). Default 0."
-                            },
-                            "visible": {
-                                "type": "boolean",
-                                "description": "Whether the field should be visible. Default true."
-                            }
-                        },
-                        "required": ["reference", "property", "x", "y"]
-                    },
-                    "minItems": 1
-                }
-            },
-            "required": ["schematicPath", "updates"]
-        }
     },
     {
         "name": "add_schematic_wire",
@@ -1526,7 +1399,15 @@ SCHEMATIC_TOOLS = [
     {
         "name": "add_schematic_net_label",
         "title": "Add Net Label",
-        "description": "Adds a net label at exact coordinates on a schematic wire or pin endpoint. WARNING: x/y must match an existing wire endpoint or pin endpoint exactly — placing the label even 0.01mm away from a pin will result in an unconnected pin ERC error. To connect a component pin to a net by reference and pin number (recommended), use connect_to_net instead. To place at a pin by reference+pinNumber with automatic position lookup, use place_net_label_at_pin instead.",
+        "description": (
+            "Add a net label to a schematic. "
+            "PREFERRED: supply componentRef + pinNumber to snap the label to the exact pin endpoint — "
+            "this guarantees an electrical connection. "
+            "Alternatively supply position [x, y], but the coordinates must match the pin endpoint exactly "
+            "(even a 0.01 mm offset breaks the connection). "
+            "The response includes actual_position (coordinates actually used) and snapped_to_pin "
+            "(present when a pin reference was resolved)."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1538,21 +1419,45 @@ SCHEMATIC_TOOLS = [
                     "type": "string",
                     "description": "Name of the net (e.g., VCC, GND, SDA)",
                 },
-                "x": {"type": "number", "description": "X coordinate on schematic"},
-                "y": {"type": "number", "description": "Y coordinate on schematic"},
-                "rotation": {
+                "position": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "description": "Position [x, y] for the label. Required when componentRef/pinNumber are not given.",
+                },
+                "componentRef": {
+                    "type": "string",
+                    "description": "Component reference to snap label to (e.g. U1, R1). Use with pinNumber.",
+                },
+                "pinNumber": {
+                    "type": "string",
+                    "description": "Pin number or name on componentRef (e.g. '1', 'GND'). Use with componentRef.",
+                },
+                "labelType": {
+                    "type": "string",
+                    "enum": ["label", "global_label", "hierarchical_label"],
+                    "description": "Label type (default: label)",
+                    "default": "label",
+                },
+                "orientation": {
                     "type": "number",
                     "description": "Rotation angle in degrees (0, 90, 180, 270)",
                     "default": 0,
                 },
             },
-            "required": ["schematicPath", "netName", "x", "y"],
+            "required": ["schematicPath", "netName"],
         },
     },
     {
         "name": "connect_to_net",
         "title": "Connect Pin to Net",
-        "description": "Intelligently connects a component pin to a named net, automatically routing wires as needed. PREFERRED connection method. Do NOT call get_schematic_pin_locations first — pin lookup is automatic. For no-wire-stub placement, use place_net_label_at_pin instead. NOTE: If a global label with the same net name already exists on the sheet, this tool will return a warning and refuse to place a conflicting local label (to avoid ERC errors). Use force=true to override, or use add_wire to connect to the existing global label instead.",
+        "description": (
+            "Connect a component pin to a named net by adding a wire stub and net label at the exact "
+            "pin endpoint. The response includes pin_location (exact pin coords), label_location "
+            "(where the label was placed), and wire_stub (the wire segment added) so you can confirm "
+            "the placement without a separate verification call."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1560,11 +1465,11 @@ SCHEMATIC_TOOLS = [
                     "type": "string",
                     "description": "Path to schematic file",
                 },
-                "reference": {
+                "componentRef": {
                     "type": "string",
                     "description": "Component reference designator (e.g., R1, U3)",
                 },
-                "pinNumber": {
+                "pinName": {
                     "type": "string",
                     "description": "Pin number or name on the component",
                 },
@@ -1572,13 +1477,8 @@ SCHEMATIC_TOOLS = [
                     "type": "string",
                     "description": "Name of the net to connect to",
                 },
-                "force": {
-                    "type": "boolean",
-                    "description": "If true, place the local label even if a global label with the same name exists (may produce ERC warnings). Default false.",
-                    "default": False,
-                },
             },
-            "required": ["schematicPath", "reference", "pinNumber", "netName"],
+            "required": ["schematicPath", "componentRef", "pinName", "netName"],
         },
     },
     {
@@ -1603,21 +1503,67 @@ SCHEMATIC_TOOLS = [
     {
         "name": "get_wire_connections",
         "title": "Get Wire Connections",
-        "description": "Returns all wires and component pins connected to the wire at a given point, by flood-filling through touching wires.",
+        "description": (
+            "Returns the net name and all wires and component pins connected at a given point. "
+            "Accepts either a component reference + pin number (e.g. reference='U1', pin='3') "
+            "or a schematic coordinate (x, y in mm). "
+            "The response includes: 'net' (label name or null for unnamed nets), "
+            "'pins' (all component pins on the net), 'wires' (all wire segments on the net), "
+            "and 'query_point' (the resolved coordinate used). "
+            "The query point must be at a wire endpoint or junction — wire midpoints are not matched. "
+            "Use get_schematic_pin_locations or list_schematic_wires to obtain exact endpoint coordinates."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "schematicPath": {
                     "type": "string",
-                    "description": "Path to schematic file",
+                    "description": "Path to the schematic file (.kicad_sch)",
+                },
+                "reference": {
+                    "type": "string",
+                    "description": "Component reference (e.g. U1, R1). Pair with pin.",
+                },
+                "pin": {
+                    "type": "string",
+                    "description": "Pin number or name (e.g. '3', 'SDA'). Pair with reference.",
                 },
                 "x": {
                     "type": "number",
-                    "description": "X coordinate of the point on the wire",
+                    "description": "X coordinate of a wire endpoint in mm. Pair with y.",
                 },
                 "y": {
                     "type": "number",
-                    "description": "Y coordinate of the point on the wire",
+                    "description": "Y coordinate of a wire endpoint in mm. Pair with x.",
+                },
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
+        "name": "get_net_at_point",
+        "title": "Get Net At Point",
+        "description": (
+            "Returns the net name at a given (x, y) coordinate in a schematic, "
+            "or null if no net label or wire endpoint is present at that position. "
+            "Checks net label positions first, then wire endpoints. "
+            "Useful for quickly identifying what net occupies a specific coordinate "
+            "without traversing the full wire graph."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the schematic file (.kicad_sch)",
+                },
+                "x": {
+                    "type": "number",
+                    "description": "X coordinate in mm",
+                },
+                "y": {
+                    "type": "number",
+                    "description": "Y coordinate in mm",
                 },
             },
             "required": ["schematicPath", "x", "y"],
@@ -1626,7 +1572,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "get_schematic_pin_locations",
         "title": "Get Schematic Pin Locations",
-        "description": "Returns the exact absolute coordinates of all pins on a schematic component. Use this BEFORE placing net labels with add_schematic_net_label to get the correct x/y position for each pin endpoint. If the reference is not found, the error message lists all available references in the schematic. Note: unannotated components have '?' references (e.g. R?) — run annotate_schematic first or use the exact reference including '?'.",
+        "description": "Returns the exact absolute coordinates of all pins on a schematic component. Use this BEFORE placing net labels with add_schematic_net_label to get the correct x/y position for each pin endpoint.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1674,36 +1620,9 @@ SCHEMATIC_TOOLS = [
         },
     },
     {
-        "name": "place_net_label_at_pin",
-        "title": "Place Net Label at Pin",
-        "description": "Places a net label at the exact pin endpoint of a component, with automatic position and orientation lookup. No wire stub is generated — avoids floating-endpoint ERC errors. PREFERRED over connect_to_net for clean schematics.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                },
-                "reference": {
-                    "type": "string",
-                    "description": "Component reference designator (e.g., R1, U3)"
-                },
-                "pinNumber": {
-                    "type": "string",
-                    "description": "Pin number on the component"
-                },
-                "netName": {
-                    "type": "string",
-                    "description": "Net label text (e.g., VCC, GND, SDA)"
-                }
-            },
-            "required": ["schematicPath", "reference", "pinNumber", "netName"]
-        }
-    },
-    {
-        "name": "list_unconnected_pins",
-        "title": "List Unconnected Pins",
-        "description": "Returns pins with no net connection and no no-connect flag. Use instead of ERC for connectivity checks — faster and returns structured data.",
+        "name": "run_erc",
+        "title": "Run Electrical Rules Check (ERC)",
+        "description": "Runs the KiCAD Electrical Rules Check (ERC) on a schematic via kicad-cli and returns all violations with type, severity, and location. Use this to verify the schematic is electrically correct before generating a netlist or exporting.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1714,70 +1633,6 @@ SCHEMATIC_TOOLS = [
             },
             "required": ["schematicPath"],
         },
-    },
-    {
-        "name": "search_schematic_symbols",
-        "title": "Search Schematic Symbols",
-        "description": "Search symbol libraries by name to find the correct Library:SymbolName before calling add_schematic_component. Searches symbol names and library names. E.g. query='STM32F103' returns 'MCU_ST_STM32F1:STM32F103C8Tx'. When schematicPath is provided, project-local libraries are searched first and global libraries with the same nickname are skipped (they are shadowed).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query (matched against symbol names and library names)"
-                },
-                "maxResults": {
-                    "type": "integer",
-                    "description": "Maximum number of results to return (default: 20, max: 100)",
-                    "default": 20,
-                    "maximum": 100
-                },
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Optional path to .kicad_sch file. When provided, searches project-local libraries first and excludes shadowed global libraries. Always provide this when working in a project."
-                }
-            },
-            "required": ["query"]
-        }
-    },
-    {
-        "name": "list_symbol_pins",
-        "title": "List Symbol Pins",
-        "description": "Returns pin names, numbers, and types for a symbol directly from the library — no schematic required. Use before add_schematic_component to discover pin names for connect_to_net / batch_connect calls. Returns close-match suggestions if the symbol name is slightly wrong.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "symbol": {
-                    "type": "string",
-                    "description": "Symbol in Library:SymbolName format (e.g., Device:R, Connector:Conn_01x04)"
-                },
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Optional path to .kicad_sch file; enables project-local sym-lib-table lookup"
-                }
-            },
-            "required": ["symbol"]
-        }
-    },
-    {
-        "name": "batch_list_symbol_pins",
-        "title": "Batch List Symbol Pins",
-        "description": "Returns pin names, numbers, types, and symbol-local coordinates for multiple symbols in a single call. Prefer this over calling list_symbol_pins repeatedly. Returns a map of symbol -> {pins, pin_count, body_bbox}. body_bbox gives the symbol body extent in local coordinates (pin envelope ±1.27mm) with width/height fields — use these to plan component spacing before placement.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "symbols": {
-                    "type": "array",
-                    "description": "List of symbols in Library:SymbolName format (e.g., [\"Device:R\", \"Device:C\", \"Connector:Conn_01x04\"])",
-                    "items": {"type": "string"}
-                },
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Optional path to .kicad_sch file; enables project-local sym-lib-table lookup"
-                }
-            },
-            "required": ["symbols"]
-        }
     },
     {
         "name": "sync_schematic_to_board",
@@ -1799,24 +1654,20 @@ SCHEMATIC_TOOLS = [
     },
     {
         "name": "generate_netlist",
-        "title": "Generate Netlist",
-        "description": "Generates a full netlist from the schematic: nets + components. Use for complete connectivity analysis or PCB sync. For nets only, use list_schematic_nets.",
+        "title": "Generate Netlist (JSON)",
+        "description": (
+            "Returns a structured JSON netlist from the schematic: component list "
+            "(reference, value, footprint) and net list (net name + all connected "
+            "component/pin pairs). Uses kicad-cli internally — requires a saved "
+            ".kicad_sch file. For writing to a file or exporting SPICE/Cadstar/OrcadPCB2 "
+            "format, use export_netlist instead."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "schematicPath": {
                     "type": "string",
-                    "description": "Path to schematic file",
-                },
-                "outputPath": {
-                    "type": "string",
-                    "description": "Optional path to save netlist file",
-                },
-                "format": {
-                    "type": "string",
-                    "enum": ["kicad", "json", "spice"],
-                    "description": "Netlist output format",
-                    "default": "json",
+                    "description": "Absolute path to the .kicad_sch schematic file",
                 },
             },
             "required": ["schematicPath"],
@@ -1836,90 +1687,6 @@ SCHEMATIC_TOOLS = [
                 }
             },
         },
-    },
-    {
-        "name": "annotate_schematic",
-        "title": "Annotate Schematic Components",
-        "description": "Assigns reference designators to all unannotated components (e.g. R? → R1, U? → U1). Run this before get_schematic_pin_locations or run_erc to ensure all components have proper references. Returns a list of old→new reference mappings.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                }
-            },
-            "required": ["schematicPath"]
-        }
-    },
-    {
-        "name": "list_schematic_components",
-        "title": "List Schematic Components",
-        "description": "Returns structured data for all components in the schematic including reference, value, footprint, position, pins with coordinates, and a 'properties' dict containing all KiCad symbol properties (MPN, Description, Manufacturer, Datasheet, and any custom user-defined fields). Preferred over get_schematic_view for data access.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                },
-                "filter": {
-                    "type": "object",
-                    "description": "Optional filters",
-                    "properties": {
-                        "libId": {"type": "string", "description": "Filter by library ID substring"},
-                        "referencePrefix": {"type": "string", "description": "Filter by reference prefix (e.g. 'R', 'U')"}
-                    }
-                }
-            },
-            "required": ["schematicPath"]
-        }
-    },
-    {
-        "name": "list_schematic_nets",
-        "title": "List Schematic Nets",
-        "description": "Returns all net names and their pin connections. Each net entry includes a 'labelType' field: 'local' (local label only), 'global' (global label, takes ERC priority), or 'power' (#PWR symbol). Each connection includes 'pinName' (semantic name, e.g. 'FB', 'EN') and 'pinType' (e.g. 'input', 'output', 'passive') in addition to the pin number. For full connectivity + component data, use generate_netlist. For a single compact view of the whole schematic, use get_schematic_summary.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                }
-            },
-            "required": ["schematicPath"]
-        }
-    },
-    {
-        "name": "get_schematic_view",
-        "title": "Get Schematic View",
-        "description": "Returns a rasterized image (PNG or SVG) of the schematic for spatial overview. For structured data, prefer list_schematic_components.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                },
-                "format": {
-                    "type": "string",
-                    "enum": ["png", "svg"],
-                    "description": "Output image format (default: png)",
-                    "default": "png"
-                },
-                "width": {
-                    "type": "integer",
-                    "description": "Output image width in pixels (default: 1200)",
-                    "default": 1200
-                },
-                "height": {
-                    "type": "integer",
-                    "description": "Output image height in pixels (default: 900)",
-                    "default": 900
-                }
-            },
-            "required": ["schematicPath"]
-        }
     },
     {
         "name": "export_schematic_pdf",
@@ -2070,262 +1837,92 @@ SCHEMATIC_TOOLS = [
         },
     },
     {
-        "name": "add_no_connect",
-        "title": "Add No-Connect Flag",
-        "description": "Marks an intentionally unconnected pin with a no-connect flag (X marker) to suppress ERC 'Pin not connected' errors. Use get_schematic_pin_locations to get the exact pin coordinates first, then place the no-connect flag at the pin endpoint. This is the correct way to handle pins that are intentionally left unconnected (e.g., NC/DNP pins, unused GPIO, SBU pins on USB-C).",
+        "name": "find_orphaned_wires",
+        "title": "Find Orphaned Wires",
+        "description": (
+            "Find wire segments with at least one dangling endpoint — an endpoint not connected "
+            "to a component pin, net label, or another wire. "
+            "Orphaned wires cause ERC 'wire end unconnected' errors and indicate routing mistakes. "
+            "Does not require the KiCad UI to be running."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "schematicPath": {
                     "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                },
-                "componentRef": {
-                    "type": "string",
-                    "description": "Component reference designator (e.g., U1). Use with pinName to auto-resolve the pin position."
-                },
-                "pinName": {
-                    "type": "string",
-                    "description": "Pin number or name on the component (e.g., '3', 'NC'). Used with componentRef to auto-resolve position."
-                },
-                "position": {
-                    "type": "array",
-                    "description": "Pin endpoint coordinates [x, y] in mm. Alternative to componentRef+pinName; must match the pin endpoint exactly.",
-                    "items": {"type": "number"},
-                    "minItems": 2,
-                    "maxItems": 2
+                    "description": "Path to the .kicad_sch schematic file",
                 }
             },
-            "required": ["schematicPath"]
-        }
+            "required": ["schematicPath"],
+        },
     },
     {
-        "name": "batch_add_no_connects",
-        "title": "Batch Add No-Connect Flags",
-        "description": "Adds no-connect (X) markers to multiple pins in a single call. Each entry auto-resolves the pin position from the schematic. Use this to suppress ERC 'Pin not connected' errors for intentionally unconnected pins (NC/DNP pins, unused GPIO, SBU pins on USB-C). Replaces multiple individual add_no_connect calls.",
+        "name": "list_floating_labels",
+        "title": "List Floating Net Labels",
+        "description": (
+            "Returns all net labels in the schematic that are not connected to any component pin. "
+            "A label is 'floating' when no component pin's coordinate falls on the wire-network "
+            "reachable from the label's anchor position. "
+            "Floating labels indicate misplaced or off-grid labels that will cause ERC errors. "
+            "Does not require the KiCad UI to be running."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "schematicPath": {
                     "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                },
-                "pins": {
-                    "type": "array",
-                    "description": "List of pins to mark as no-connect",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "componentRef": {
-                                "type": "string",
-                                "description": "Component reference designator (e.g., U1, J2)"
-                            },
-                            "pinName": {
-                                "type": "string",
-                                "description": "Pin number or name (e.g., '3', 'NC', 'SBU1')"
-                            }
-                        },
-                        "required": ["componentRef", "pinName"]
-                    },
-                    "minItems": 1
+                    "description": "Path to the .kicad_sch schematic file",
                 }
             },
-            "required": ["schematicPath", "pins"]
-        }
+            "required": ["schematicPath"],
+        },
     },
     {
-        "name": "save_schematic",
-        "title": "Save Schematic",
-        "description": "Confirms the schematic file is saved to disk. Note: all schematic editing tools (add_schematic_wire, connect_to_net, add_schematic_net_label, etc.) write changes directly to the .kicad_sch file immediately — there is no separate save step required. Use this tool to verify the file exists and check its current size.",
+        "name": "snap_to_grid",
+        "title": "Snap Schematic Elements to Grid",
+        "description": (
+            "Snap schematic element coordinates to the nearest grid point. "
+            "KiCAD eeschema uses exact integer matching (10 000 IU/mm) for connectivity, "
+            "so even a sub-pixel coordinate offset will make wires appear connected visually "
+            "but fail ERC checks. Running this tool before ERC eliminates that class of error. "
+            "Modifies the .kicad_sch file in place. "
+            "Does not require the KiCAD UI to be running."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "schematicPath": {
                     "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                }
-            },
-            "required": ["schematicPath"]
-        }
-    },
-    {
-        "name": "get_schematic_summary",
-        "title": "Get Schematic Summary",
-        "description": "Returns a compact, human-readable text summary of the entire schematic: a components table (ref, value, MPN, description, footprint) and a net adjacency list (net name → REF/pin_name connections). Nets are classified as ground, power_rail, clock, differential_pair, or signal. Optimised for LLM consumption — much more token-efficient than calling list_schematic_components + list_schematic_nets separately.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                }
-            },
-            "required": ["schematicPath"]
-        }
-    },
-    {
-        "name": "get_net_graph",
-        "title": "Get Component Net Graph",
-        "description": "Returns a compact text adjacency graph showing which components connect to which through signal nets. Each line shows: SOURCE(pin) --[NET]--> DEST1(pin), DEST2(pin). Power/ground nets with fewer than 3 real components are filtered by default (use skipPower=false to include all). Useful for tracing signal paths and identifying topology (e.g. voltage-divider feedback networks) without reconstructing from two separate flat lists.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
+                    "description": "Path to the .kicad_sch schematic file",
                 },
-                "skipPower": {
-                    "type": "boolean",
-                    "description": "Skip GND/power-rail nets that connect fewer than 3 real components (default: true)",
-                    "default": True
-                }
-            },
-            "required": ["schematicPath"]
-        }
-    },
-    {
-        "name": "find_single_pin_nets",
-        "title": "Find Single-Pin (Dangling) Nets",
-        "description": "Returns all nets that have exactly one connected pin — dangling/floating connections that are likely unintentional wiring errors or in-progress stubs. Each entry includes the net name, component reference, pin number, and semantic pin name. Especially useful during design review to catch open connections that ERC may miss depending on pin type.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                }
-            },
-            "required": ["schematicPath"]
-        }
-    },
-    {
-        "name": "classify_nets",
-        "title": "Classify Schematic Nets",
-        "description": "Classifies every net by type (ground, power_rail, clock, differential_pair, signal) and returns driver/load pin counts and fan-out. Classification heuristics: GND/AGND/DGND/PGND → ground; voltage-pattern names or PWR_FLAG present → power_rail; CLK/SCK/OSC in name → clock; _P/_N or +/- suffix pairs → differential_pair. Useful for quickly identifying structurally interesting nets (high fan-out, no driver, etc.) without manually counting.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                }
-            },
-            "required": ["schematicPath"]
-        }
-    },
-    {
-        "name": "run_erc",
-        "title": "Run Electrical Rules Check (ERC)",
-        "description": "Runs the KiCAD Electrical Rules Check (ERC) on a schematic via kicad-cli and returns all violations. Each violation includes type, severity, message, location (x/y coordinates), and an 'items' array where each item has a 'description' field identifying the specific component/pin (e.g. 'Pin 1 [Passive] of R1') and its position. Annotate the schematic first (annotate_schematic) for best results. Set hierarchical=true to run ERC on every .kicad_sch in the project directory and get per-sheet violations.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to the .kicad_sch schematic file"
-                },
-                "hierarchical": {
-                    "type": "boolean",
-                    "description": "Run ERC on all .kicad_sch files in the project directory (root + sub-sheets) and return violations grouped by sheet. Default false (single sheet only)."
-                }
-            },
-            "required": ["schematicPath"]
-        }
-    },
-    {
-        "name": "create_hierarchical_subsheet",
-        "title": "Create Hierarchical Sub-Sheet",
-        "description": "Creates a new blank sub-sheet schematic file and links it into a parent schematic in one call. Replaces the 3-step workflow of: (1) create_schematic for sub-sheet, (2) create_schematic for root if needed, (3) add_hierarchical_sheet to link them. Returns the sub-sheet file path, its UUID, the sheet block UUID in the parent, and the page number assigned.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "parentSchematicPath": {
-                    "type": "string",
-                    "description": "Path to the existing parent .kicad_sch file that will contain the sheet reference block"
-                },
-                "subsheetPath": {
-                    "type": "string",
-                    "description": "Path for the new sub-sheet .kicad_sch file to create (must not already exist)"
-                },
-                "sheetName": {
-                    "type": "string",
-                    "description": "Display name for the sheet block in the parent schematic (e.g., 'Power', 'USB Interface'). Default 'Sheet'."
-                },
-                "position": {
-                    "type": "object",
-                    "description": "Position of the sheet block in the parent schematic (mm). Default {x:50, y:50}.",
-                    "properties": {
-                        "x": {"type": "number"},
-                        "y": {"type": "number"}
-                    }
-                },
-                "size": {
-                    "type": "object",
-                    "description": "Size of the sheet block rectangle (mm). Default {width:80, height:50}.",
-                    "properties": {
-                        "width": {"type": "number"},
-                        "height": {"type": "number"}
-                    }
-                },
-                "metadata": {
-                    "type": "object",
-                    "description": "Optional metadata for the new sub-sheet schematic (title block, revision, etc.)"
-                }
-            },
-            "required": ["parentSchematicPath", "subsheetPath"]
-        }
-    },
-    {
-        "name": "list_schematic_wires",
-        "title": "List Schematic Wires",
-        "description": "List wire segments in a schematic. Optionally filter by net name (returns only wires reachable from that net's labels via BFS). Set annotate_nets=true to include net membership for each wire segment.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to .kicad_sch file"
-                },
-                "netName": {
-                    "type": "string",
-                    "description": "If provided, return only wires on this net"
-                },
-                "annotate_nets": {
-                    "type": "boolean",
-                    "description": "If true, annotate each wire with its net name",
-                    "default": False
-                }
-            },
-            "required": ["schematicPath"]
-        }
-    },
-    {
-        "name": "replace_schematic_component",
-        "title": "Replace Schematic Component",
-        "description": "Replace a placed symbol with a different symbol from the library while preserving its position, rotation, and field values (Reference, Value, Footprint). Returns the new pin coordinates.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to .kicad_sch file"
-                },
-                "reference": {
-                    "type": "string",
-                    "description": "Reference designator of the component to replace (e.g. D1, U3)"
-                },
-                "newSymbol": {
-                    "type": "string",
-                    "description": "New symbol in 'Library:Symbol' format (e.g. 'Device:D_Zener')"
-                },
-                "newRotation": {
+                "gridSize": {
                     "type": "number",
-                    "description": "Optional rotation angle in degrees for the new symbol. If omitted, the original rotation is preserved."
-                }
+                    "description": (
+                        "Grid spacing in mm (default: 1.27 — standard KiCAD schematic grid). "
+                        "Do NOT use 2.54: half of all valid KiCAD pin positions are at odd "
+                        "multiples of 1.27 mm and would be displaced 1.27 mm, breaking "
+                        "connectivity."
+                    ),
+                    "default": 1.27,
+                },
+                "elements": {
+                    "type": "array",
+                    "description": (
+                        "Element types to snap. "
+                        'Valid values: "wires", "junctions", "labels", "components". '
+                        'Defaults to ["wires", "junctions", "labels"] when omitted. '
+                        '"components" is opt-in because moving a component without re-routing '
+                        "its wires will create new mismatches."
+                    ),
+                    "items": {
+                        "type": "string",
+                        "enum": ["wires", "junctions", "labels", "components"],
+                    },
+                },
             },
-            "required": ["schematicPath", "reference", "newSymbol"]
-        }
-    }
+            "required": ["schematicPath"],
+        },
+    },
 ]
 
 # =============================================================================
@@ -2380,4 +1977,4 @@ for tool in (
 ):
     TOOL_SCHEMAS[tool["name"]] = tool
 
-# Total: 50 tools with comprehensive schemas
+# Total: 46 tools with comprehensive schemas

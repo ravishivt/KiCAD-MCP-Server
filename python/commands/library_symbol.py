@@ -33,6 +33,7 @@ class SymbolInfo:
     stock: str = ""  # Stock (from JLCPCB libs)
     price: str = ""  # Price (from JLCPCB libs)
     lib_class: str = ""  # Basic/Preferred/Extended
+    sim_pins: str = ""  # Sim.Pins pin mapping (e.g. "1=in+ 2=in- 3=vcc 4=vee 5=out")
 
 
 class SymbolLibraryManager:
@@ -268,19 +269,28 @@ class SymbolLibraryManager:
                 # Find the start position of this symbol
                 start_pos = match.start()
 
-                # Extract properties from this symbol block
-                # Use parenthesis counting to find the actual end of this symbol block
+                # Walk forward tracking parenthesis depth to find the true end of the block
                 depth = 0
-                block_end = start_pos
-                for j in range(start_pos, min(start_pos + 50000, len(content))):
-                    if content[j] == '(':
+                i = start_pos
+                end_pos = start_pos
+                while i < len(content):
+                    ch = content[i]
+                    if ch == "(":
                         depth += 1
-                    elif content[j] == ')':
+                    elif ch == ")":
                         depth -= 1
                         if depth == 0:
-                            block_end = j + 1
+                            end_pos = i + 1
                             break
-                symbol_block = content[start_pos:block_end]
+                    i += 1
+
+                if end_pos == start_pos:
+                    logger.warning(
+                        f"Malformed symbol block for '{symbol_name}' in {library_path}; skipping"
+                    )
+                    continue
+
+                symbol_block = content[start_pos:end_pos]
 
                 # Extract properties
                 properties = self._extract_properties(symbol_block)
@@ -300,6 +310,7 @@ class SymbolLibraryManager:
                     stock=properties.get("Stock", ""),
                     price=properties.get("Price", ""),
                     lib_class=properties.get("Class", ""),
+                    sim_pins=properties.get("Sim.Pins", ""),
                 )
 
                 symbols.append(symbol_info)
@@ -505,41 +516,8 @@ class SymbolLibraryCommands:
         self.library_manager = library_manager or SymbolLibraryManager()
 
     def list_symbol_libraries(self, params: Dict) -> Dict:
-        """List available symbol libraries.
-
-        If projectOnly=True and schematicPath or projectPath is provided,
-        only libraries from the project's sym-lib-table are returned.
-        """
+        """List all available symbol libraries"""
         try:
-            project_only = params.get("projectOnly", False)
-            schematic_path = params.get("schematicPath") or params.get("projectPath")
-
-            if project_only and schematic_path:
-                # Derive project directory from schematic or project path
-                project_dir = Path(schematic_path)
-                if project_dir.is_file():
-                    project_dir = project_dir.parent
-                project_table = project_dir / "sym-lib-table"
-                if not project_table.exists():
-                    return {
-                        "success": True,
-                        "libraries": [],
-                        "count": 0,
-                        "note": f"No sym-lib-table found in {project_dir}"
-                    }
-                # Parse only the project sym-lib-table
-                mgr = SymbolLibraryManager(project_path=project_dir)
-                # Reset and reload only project table
-                mgr.libraries = {}
-                mgr._parse_sym_lib_table(project_table)
-                libraries = list(mgr.libraries.keys())
-                return {
-                    "success": True,
-                    "libraries": libraries,
-                    "count": len(libraries),
-                    "source": str(project_table)
-                }
-
             libraries = self.library_manager.list_libraries()
             return {"success": True, "libraries": libraries, "count": len(libraries)}
         except Exception as e:
@@ -614,20 +592,6 @@ class SymbolLibraryCommands:
             symbol_spec = params.get("symbol")
             if not symbol_spec:
                 return {"success": False, "message": "Missing symbol parameter"}
-
-            # If a schematic/project path is provided, search project-local sym-lib-table
-            # first so project-specific symbols (e.g. connectors:TYPE-C) are found.
-            schematic_path = params.get("schematicPath") or params.get("projectPath")
-            if schematic_path:
-                project_dir = Path(schematic_path)
-                if project_dir.is_file():
-                    project_dir = project_dir.parent
-                project_table = project_dir / "sym-lib-table"
-                if project_table.exists():
-                    mgr = SymbolLibraryManager(project_path=project_dir)
-                    result = mgr.find_symbol(symbol_spec)
-                    if result:
-                        return {"success": True, "symbol_info": asdict(result)}
 
             result = self.library_manager.find_symbol(symbol_spec)
 

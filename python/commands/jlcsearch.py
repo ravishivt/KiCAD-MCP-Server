@@ -117,66 +117,24 @@ class JLCSearchClient:
 
         return self.search_components("capacitors", limit=limit, **filters)
 
-    def search_text(
-        self,
-        query: str,
-        package: Optional[str] = None,
-        is_basic: Optional[bool] = None,
-        limit: int = 20
-    ) -> List[Dict]:
+    def get_part_by_lcsc(self, lcsc_number: int) -> Optional[Dict]:
         """
-        Full-text search via /api/search endpoint (live, no local DB required)
+        Get part details by LCSC number
 
         Args:
-            query: Free-text search string (e.g. "10k resistor 0603", "ESP32", "C25804")
-            package: Optional package filter (e.g. "0603", "SOT-23")
-            is_basic: If True, only return Basic library parts
-            limit: Maximum number of results
-
-        Returns:
-            List of component dicts with fields: lcsc, mfr, package, is_basic, stock, price, description
-        """
-        url = f"{self.BASE_URL}/api/search"
-        params: Dict = {"q": query, "limit": limit}
-        if package:
-            params["package"] = package
-        if is_basic is not None:
-            params["is_basic"] = "true" if is_basic else "false"
-
-        try:
-            response = requests.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            for key, value in data.items():
-                if isinstance(value, list):
-                    return value
-            return []
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to search JLCSearch (text): {e}")
-            raise Exception(f"JLCSearch API request failed: {e}")
-
-    def get_part_by_lcsc(self, lcsc_number) -> Optional[Dict]:
-        """
-        Get part details by LCSC number via live API (no local DB required)
-
-        Args:
-            lcsc_number: LCSC number as int (25804) or string ("C25804" or "25804")
+            lcsc_number: LCSC number (integer, without 'C' prefix)
 
         Returns:
             Part dict or None if not found
         """
-        # Normalise to integer string for query
-        lcsc_str = str(lcsc_number).lstrip("Cc")
-        query = f"C{lcsc_str}"
+        # Search across all components filtering by LCSC
+        # Note: jlcsearch doesn't have a dedicated single-part endpoint
+        # so we search and filter
         try:
-            results = self.search_text(query, limit=5)
-            # Find exact match by LCSC number
-            for r in results:
-                if str(r.get("lcsc", "")) == lcsc_str:
-                    return r
+            results = self.search_components("components", limit=1, lcsc=lcsc_number)
             return results[0] if results else None
         except Exception as e:
-            logger.error(f"Failed to get part {query}: {e}")
+            logger.error(f"Failed to get part C{lcsc_number}: {e}")
             return None
 
     def download_all_components(

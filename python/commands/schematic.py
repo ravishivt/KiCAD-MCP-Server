@@ -2,21 +2,20 @@ import logging
 import os
 import shutil
 import uuid
-import re as _re
 from typing import Any, Optional
+
 from skip import Schematic
 
 logger = logging.getLogger("kicad_interface")
-
-# Module-level list tracking template components removed during last create_schematic call
-_last_removed_templates = []
 
 
 class SchematicManager:
     """Core schematic operations using kicad-skip"""
 
     @staticmethod
-    def create_schematic(name: str, metadata: Optional[Any] = None) -> Any:
+    def create_schematic(
+        name: str, metadata: Optional[Any] = None, *, path: Optional[str] = None
+    ) -> Any:
         """Create a new empty schematic from template"""
         try:
             # Determine template path (use template_with_symbols for component cloning support)
@@ -28,7 +27,8 @@ class SchematicManager:
             )
 
             # Determine output path
-            output_path = name if name.endswith(".kicad_sch") else f"{name}.kicad_sch"
+            base_name = name if name.endswith(".kicad_sch") else f"{name}.kicad_sch"
+            output_path = os.path.join(path, base_name) if path else base_name
 
             if os.path.exists(template_path):
                 # Copy template to target location
@@ -48,45 +48,6 @@ class SchematicManager:
                 )
                 with open(output_path, "w", encoding="utf-8", newline="\n") as f:
                     f.write(content)
-
-                # Remove template placeholder symbol instances (_TEMPLATE_R, _TEMPLATE_C, etc.)
-                # These are off-page symbols that cause ERC errors in new schematics
-                global _last_removed_templates
-                _last_removed_templates = []
-                lines = content.split('\n')
-                new_lines = []
-                i = 0
-                while i < len(lines):
-                    line = lines[i]
-                    stripped = line.strip()
-                    if stripped.startswith('(symbol (lib_id'):
-                        # Collect this whole symbol block using depth counting
-                        block_lines = [line]
-                        depth = line.count('(') - line.count(')')
-                        j = i + 1
-                        while j < len(lines) and depth > 0:
-                            block_lines.append(lines[j])
-                            depth += lines[j].count('(') - lines[j].count(')')
-                            j += 1
-                        block_text = '\n'.join(block_lines)
-                        if '_TEMPLATE_' in block_text:
-                            ref_match = _re.search(r'"(_TEMPLATE_[^"]*)"', block_text)
-                            ref = ref_match.group(1) if ref_match else '_TEMPLATE_?'
-                            _last_removed_templates.append(ref)
-                            i = j
-                            continue
-                        else:
-                            new_lines.extend(block_lines)
-                            i = j
-                            continue
-                    new_lines.append(line)
-                    i += 1
-
-                if _last_removed_templates:
-                    cleaned_content = '\n'.join(new_lines)
-                    with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
-                        f.write(cleaned_content)
-                    logger.info(f"Removed template components: {_last_removed_templates}")
 
                 logger.info(f"Created schematic from template: {output_path}")
             else:

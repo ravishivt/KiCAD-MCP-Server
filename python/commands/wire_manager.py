@@ -8,6 +8,7 @@ manipulate the .kicad_sch file directly.
 
 import logging
 import math
+import re
 import tempfile
 import uuid
 from pathlib import Path
@@ -18,25 +19,103 @@ from sexpdata import Symbol
 
 logger = logging.getLogger("kicad_interface")
 
-_SCHEMATIC_GRID_MM = 1.27  # 50mil — KiCAD standard schematic grid
-
-
-def _snap(val: float) -> float:
-    """Round a coordinate to the nearest KiCAD schematic grid point (50mil = 1.27mm)."""
-    return round(round(val / _SCHEMATIC_GRID_MM) * _SCHEMATIC_GRID_MM, 4)
-
-
 # Module-level Symbol constants — avoids repeated allocation on every call
 _SYM_WIRE = Symbol("wire")
 _SYM_PTS = Symbol("pts")
 _SYM_XY = Symbol("xy")
 _SYM_AT = Symbol("at")
 _SYM_LABEL = Symbol("label")
+_SYM_GLOBAL_LABEL = Symbol("global_label")
+_SYM_HIERARCHICAL_LABEL = Symbol("hierarchical_label")
 _SYM_STROKE = Symbol("stroke")
 _SYM_WIDTH = Symbol("width")
 _SYM_TYPE = Symbol("type")
 _SYM_UUID = Symbol("uuid")
 _SYM_SHEET_INSTANCES = Symbol("sheet_instances")
+
+
+def _find_insertion_point(content: str) -> int:
+    """Find the right place to insert new elements in a .kicad_sch file.
+
+    Looks for (sheet_instances (KiCad 8) first, falls back to inserting
+    before the final closing paren (KiCad 9+).
+    """
+    marker = "(sheet_instances"
+    pos = content.rfind(marker)
+    if pos != -1:
+        return pos
+    pos = content.rfind(")")
+    if pos == -1:
+        raise ValueError("Could not find insertion point in schematic")
+    return pos
+
+
+def _text_insert(file_path: Path, sexp_text: str) -> bool:
+    """Insert S-expression text into a .kicad_sch file preserving formatting."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    insert_at = _find_insertion_point(content)
+    content = content[:insert_at] + sexp_text + content[insert_at:]
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return True
+
+
+def _make_hierarchical_label_text(
+    text: str,
+    position: List[float],
+    shape: str = "bidirectional",
+    orientation: int = 0,
+) -> str:
+    """Generate a hierarchical_label S-expression as formatted text.
+
+    orientation: 0=right (label points right, justify left),
+                 180=left (label points left, justify right),
+                 90/270=vertical.
+    """
+    uid = str(uuid.uuid4())
+    justify = "right" if orientation == 180 else "left"
+    return (
+        f'\t(hierarchical_label "{text}"\n'
+        f"\t\t(shape {shape})\n"
+        f"\t\t(at {position[0]} {position[1]} {orientation})\n"
+        f"\t\t(effects\n"
+        f"\t\t\t(font\n"
+        f"\t\t\t\t(size 1.27 1.27)\n"
+        f"\t\t\t)\n"
+        f"\t\t\t(justify {justify})\n"
+        f"\t\t)\n"
+        f'\t\t(uuid "{uid}")\n'
+        f"\t)\n"
+    )
+
+
+def _make_sheet_pin_text(
+    pin_name: str,
+    pin_type: str,
+    position: List[float],
+    orientation: int = 0,
+) -> str:
+    """Generate a sheet pin S-expression as formatted text (indented for inside sheet block).
+
+    orientation: 0=right side of sheet box, 180=left side.
+    """
+    uid = str(uuid.uuid4())
+    justify = "left" if orientation == 0 else "right"
+    return (
+        f'\t\t(pin "{pin_name}" {pin_type}\n'
+        f"\t\t\t(at {position[0]} {position[1]} {orientation})\n"
+        f'\t\t\t(uuid "{uid}")\n'
+        f"\t\t\t(effects\n"
+        f"\t\t\t\t(font\n"
+        f"\t\t\t\t\t(size 1.27 1.27)\n"
+        f"\t\t\t\t)\n"
+        f"\t\t\t\t(justify {justify})\n"
+        f"\t\t\t)\n"
+        f"\t\t)\n"
+    )
 
 
 class WireManager:
@@ -64,10 +143,6 @@ class WireManager:
             True if successful, False otherwise
         """
         try:
-            # Snap to 50mil grid before writing
-            start_point = [_snap(start_point[0]), _snap(start_point[1])]
-            end_point = [_snap(end_point[0]), _snap(end_point[1])]
-
             # Read schematic
             with open(schematic_path, "r", encoding="utf-8") as f:
                 sch_content = f.read()
@@ -140,9 +215,6 @@ class WireManager:
                 logger.error("Polyline requires at least 2 points")
                 return False
 
-            # Snap all points to 50mil grid before writing
-            points = [[_snap(p[0]), _snap(p[1])] for p in points]
-
             # Read schematic
             with open(schematic_path, "r", encoding="utf-8") as f:
                 sch_content = f.read()
@@ -202,7 +274,6 @@ class WireManager:
         position: List[float],
         label_type: str = "label",
         orientation: int = 0,
-        justify: Optional[str] = None,
     ) -> bool:
         """
         Add a net label to the schematic
@@ -210,27 +281,14 @@ class WireManager:
         Args:
             schematic_path: Path to .kicad_sch file
             text: Label text (net name)
-            position: [x, y] coordinates for label — written exactly as provided (no extra rounding)
+            position: [x, y] coordinates for label
             label_type: Type of label ('label', 'global_label', 'hierarchical_label')
             orientation: Rotation angle (0, 90, 180, 270)
-            justify: Text justification ('left', 'right', 'center'). If None, derived from
-                     orientation: 180 → 'right', all others → 'left'.
 
         Returns:
             True if successful, False otherwise
         """
         try:
-            # Snap to 50mil grid before writing
-            position = [_snap(position[0]), _snap(position[1])]
-
-            # Derive justify from orientation when not explicitly provided.
-            # orientation=180 (label extends left): connection at right edge → "right"
-            # orientation=270 (label extends down): connection at top edge → "right"
-            # orientation=0 (label extends right): connection at left edge → "left"
-            # orientation=90 (label extends up): connection at bottom edge → "left"
-            if justify is None:
-                justify = "right" if orientation in (180, 270) else "left"
-
             # Read schematic
             with open(schematic_path, "r", encoding="utf-8") as f:
                 sch_content = f.read()
@@ -238,7 +296,7 @@ class WireManager:
             sch_data = sexpdata.loads(sch_content)
 
             # Create label S-expression
-            # Format: (label "TEXT" (at x y angle) (effects (font (size 1.27 1.27)) (justify ...)))
+            # Format: (label "TEXT" (at x y angle) (effects (font (size 1.27 1.27))))
             label_sexp = [
                 Symbol(label_type),
                 text,
@@ -247,7 +305,7 @@ class WireManager:
                 [
                     Symbol("effects"),
                     [Symbol("font"), [Symbol("size"), 1.27, 1.27]],
-                    [Symbol("justify"), Symbol(justify)],
+                    [Symbol("justify"), Symbol("left"), Symbol("bottom")],
                 ],
                 [Symbol("uuid"), str(uuid.uuid4())],
             ]
@@ -625,8 +683,9 @@ class WireManager:
 
             sch_data = sexpdata.loads(sch_content)
 
+            _LABEL_TYPES = {_SYM_LABEL, _SYM_GLOBAL_LABEL, _SYM_HIERARCHICAL_LABEL}
             for i, item in enumerate(sch_data):
-                if not (isinstance(item, list) and len(item) > 0 and item[0] == _SYM_LABEL):
+                if not (isinstance(item, list) and len(item) > 0 and item[0] in _LABEL_TYPES):
                     continue
 
                 # Second element is the label text
@@ -668,115 +727,6 @@ class WireManager:
             return False
 
     @staticmethod
-    def delete_all_labels(schematic_path: Path) -> int:
-        """Remove all net labels from the schematic in a single file read/write.
-
-        Returns the number of labels deleted.
-        """
-        try:
-            with open(schematic_path, "r", encoding="utf-8") as f:
-                sch_content = f.read()
-
-            sch_data = sexpdata.loads(sch_content)
-            before = len(sch_data)
-            sch_data = [
-                item for item in sch_data
-                if not (isinstance(item, list) and len(item) > 0 and item[0] == Symbol("label"))
-            ]
-            deleted = before - len(sch_data)
-
-            with open(schematic_path, "w", encoding="utf-8") as f:
-                f.write(sexpdata.dumps(sch_data))
-
-            logger.info(f"Deleted {deleted} labels from {schematic_path}")
-            return deleted
-
-        except Exception as e:
-            logger.error(f"Error deleting all labels: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return 0
-
-    @staticmethod
-    def delete_labels_batch(
-        schematic_path: Path,
-        items: List[dict],
-        tolerance: float = 0.5,
-    ) -> dict:
-        """Delete multiple net labels in a single file read/write.
-
-        Args:
-            schematic_path: Path to .kicad_sch file
-            items: List of dicts with keys 'netName' (str) and optional 'position' {x, y}
-            tolerance: Maximum coordinate difference to consider a match (mm)
-
-        Returns:
-            {"deleted": int, "notFound": [str]}
-        """
-        try:
-            with open(schematic_path, "r", encoding="utf-8") as f:
-                sch_content = f.read()
-
-            sch_data = sexpdata.loads(sch_content)
-
-            # Build a lookup: netName -> list of positions requested (None = any)
-            targets: List[dict] = []
-            for item in items:
-                targets.append({
-                    "netName": item.get("netName", ""),
-                    "position": item.get("position"),
-                    "matched": False,
-                })
-
-            new_sch_data = []
-            for elem in sch_data:
-                if not (isinstance(elem, list) and len(elem) > 0 and elem[0] == Symbol("label")):
-                    new_sch_data.append(elem)
-                    continue
-
-                label_name = elem[1] if len(elem) > 1 else None
-                at_entry = next(
-                    (p for p in elem[1:] if isinstance(p, list) and len(p) >= 3 and p[0] == Symbol("at")),
-                    None,
-                )
-                lx = float(at_entry[1]) if at_entry else None
-                ly = float(at_entry[2]) if at_entry else None
-
-                consumed = False
-                for target in targets:
-                    if target["matched"]:
-                        continue
-                    if label_name != target["netName"]:
-                        continue
-                    pos = target["position"]
-                    if pos is not None:
-                        if lx is None or ly is None:
-                            continue
-                        if not (abs(lx - pos["x"]) < tolerance and abs(ly - pos["y"]) < tolerance):
-                            continue
-                    target["matched"] = True
-                    consumed = True
-                    break
-
-                if not consumed:
-                    new_sch_data.append(elem)
-
-            deleted = sum(1 for t in targets if t["matched"])
-            not_found = [t["netName"] for t in targets if not t["matched"]]
-
-            with open(schematic_path, "w", encoding="utf-8") as f:
-                f.write(sexpdata.dumps(new_sch_data))
-
-            logger.info(f"Batch deleted {deleted} labels, {len(not_found)} not found")
-            return {"deleted": deleted, "notFound": not_found}
-
-        except Exception as e:
-            logger.error(f"Error batch deleting labels: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {"deleted": 0, "notFound": [item.get("netName", "") for item in items]}
-
-    @staticmethod
     def create_orthogonal_path(
         start: List[float], end: List[float], prefer_horizontal_first: bool = True
     ) -> List[List[float]]:
@@ -806,6 +756,200 @@ class WireManager:
             return [start, end]
 
         return [start, corner, end]
+
+    @staticmethod
+    def list_texts(schematic_path: Path) -> Optional[List[Any]]:
+        """Return all free-form text annotations (SCH_TEXT) in a schematic.
+
+        Each entry is a dict with keys: text, position (x/y), angle,
+        font_size, bold, italic, justify, uuid.
+        Returns None on parse error.
+        """
+        try:
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                sch_data = sexpdata.loads(f.read())
+
+            _SYM_TEXT = Symbol("text")
+            _SYM_EFFECTS = Symbol("effects")
+            _SYM_FONT = Symbol("font")
+            _SYM_SIZE = Symbol("size")
+            _SYM_JUSTIFY = Symbol("justify")
+            _SYM_BOLD = Symbol("bold")
+            _SYM_ITALIC = Symbol("italic")
+
+            results = []
+            for item in sch_data:
+                if not (isinstance(item, list) and len(item) >= 2 and item[0] == _SYM_TEXT):
+                    continue
+                # item[1] is the text string
+                text_val = item[1] if len(item) > 1 else ""
+
+                pos_x = pos_y = angle = 0.0
+                font_size = 1.27
+                bold = italic = False
+                justify = "left"
+                uid = ""
+
+                for part in item[2:]:
+                    if not isinstance(part, list) or not part:
+                        continue
+                    tag = part[0]
+                    if tag == _SYM_AT and len(part) >= 3:
+                        pos_x = float(part[1])
+                        pos_y = float(part[2])
+                        angle = float(part[3]) if len(part) >= 4 else 0.0
+                    elif tag == _SYM_UUID and len(part) >= 2:
+                        uid = str(part[1])
+                    elif tag == _SYM_EFFECTS:
+                        for eff in part[1:]:
+                            if not isinstance(eff, list) or not eff:
+                                continue
+                            if eff[0] == _SYM_FONT:
+                                for fp in eff[1:]:
+                                    if not isinstance(fp, list) or not fp:
+                                        continue
+                                    if fp[0] == _SYM_SIZE and len(fp) >= 2:
+                                        font_size = float(fp[1])
+                                    elif fp[0] == _SYM_BOLD and len(fp) >= 2:
+                                        bold = str(fp[1]).lower() == "yes"
+                                    elif fp[0] == _SYM_ITALIC and len(fp) >= 2:
+                                        italic = str(fp[1]).lower() == "yes"
+                            elif eff[0] == _SYM_JUSTIFY and len(eff) >= 2:
+                                justify = str(eff[1])
+
+                results.append(
+                    {
+                        "text": text_val,
+                        "position": {"x": pos_x, "y": pos_y},
+                        "angle": angle,
+                        "font_size": font_size,
+                        "bold": bold,
+                        "italic": italic,
+                        "justify": justify,
+                        "uuid": uid,
+                    }
+                )
+            return results
+        except Exception as e:
+            logger.error(f"Error listing texts: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return None
+
+    @staticmethod
+    def add_text(
+        schematic_path: Path,
+        text: str,
+        position: List[float],
+        angle: float = 0,
+        font_size: float = 1.27,
+        bold: bool = False,
+        italic: bool = False,
+        justify: str = "left",
+    ) -> bool:
+        """Add a free-form text annotation (SCH_TEXT) to a KiCad schematic."""
+        try:
+            text_escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+            uid = str(uuid.uuid4())
+            font_attrs = f"\n\t\t\t\t(size {font_size} {font_size})"
+            if bold:
+                font_attrs += "\n\t\t\t\t(bold yes)"
+            if italic:
+                font_attrs += "\n\t\t\t\t(italic yes)"
+            text_sexp = (
+                f'\t(text "{text_escaped}"\n'
+                f"\t\t(exclude_from_sim no)\n"
+                f"\t\t(at {position[0]} {position[1]} {angle})\n"
+                f"\t\t(effects\n"
+                f"\t\t\t(font{font_attrs}\n"
+                f"\t\t\t)\n"
+                f"\t\t\t(justify {justify} bottom)\n"
+                f"\t\t)\n"
+                f'\t\t(uuid "{uid}")\n'
+                f"\t)\n"
+            )
+            _text_insert(schematic_path, text_sexp)
+            logger.info(f"Added text '{text}' at {position}")
+            return True
+        except Exception as e:
+            logger.error(f"Error adding text: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return False
+
+    @staticmethod
+    def add_hierarchical_label(
+        schematic_path: Path,
+        text: str,
+        position: List[float],
+        shape: str = "bidirectional",
+        orientation: int = 0,
+    ) -> bool:
+        """Add a hierarchical label to a sub-sheet schematic."""
+        try:
+            label_text = _make_hierarchical_label_text(text, position, shape, orientation)
+            _text_insert(schematic_path, label_text)
+            logger.info(f"Added hierarchical_label '{text}' at {position} shape={shape}")
+            return True
+        except Exception as e:
+            logger.error(f"Error adding hierarchical label: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return False
+
+    @staticmethod
+    def add_sheet_pin(
+        content: str,
+        sheet_name: str,
+        pin_name: str,
+        pin_type: str,
+        position: List[float],
+        orientation: int = 0,
+    ) -> Tuple[str, bool]:
+        """Insert a sheet pin into the named sheet block in the parent schematic.
+
+        Returns (modified_content, success).
+        """
+        lines = content.split("\n")
+        sheetname_pattern = re.compile(
+            r'\(property\s+"Sheetname"\s+"' + re.escape(sheet_name) + r'"'
+        )
+        sheet_block_pattern = re.compile(r"^\t\(sheet\b")
+
+        # Find the sheet block that contains the target Sheetname property
+        i = 0
+        while i < len(lines):
+            if sheet_block_pattern.match(lines[i]):
+                # Walk forward to find closing paren of this block
+                depth = sum(1 for c in lines[i] if c == "(") - sum(1 for c in lines[i] if c == ")")
+                j = i + 1
+                found_name = False
+                while j < len(lines) and depth > 0:
+                    if sheetname_pattern.search(lines[j]):
+                        found_name = True
+                    depth += sum(1 for c in lines[j] if c == "(") - sum(
+                        1 for c in lines[j] if c == ")"
+                    )
+                    j += 1
+                b_end = j - 1  # index of closing ")" line of the sheet block
+
+                if found_name:
+                    # Insert pin text before the closing paren of the sheet block
+                    pin_text = _make_sheet_pin_text(pin_name, pin_type, position, orientation)
+                    pin_lines = pin_text.rstrip("\n").split("\n")
+                    for offset, line in enumerate(pin_lines):
+                        lines.insert(b_end + offset, line)
+                    logger.info(f"Added sheet pin '{pin_name}' to sheet '{sheet_name}'")
+                    return "\n".join(lines), True
+
+                i = b_end + 1
+                continue
+            i += 1
+
+        return content, False
 
 
 if __name__ == "__main__":
