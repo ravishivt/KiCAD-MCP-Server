@@ -96,8 +96,6 @@ export const toolCategories: ToolCategory[] = [
       "add_hierarchical_sheet",
       "add_wire",
       "delete_schematic_wire",
-      "add_schematic_connection",
-      "add_schematic_junction",
       "add_schematic_net_label",
       "delete_schematic_net_label",
       "connect_to_net",

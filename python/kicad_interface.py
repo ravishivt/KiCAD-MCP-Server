@@ -15,24 +15,34 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import sexpdata
+from annotations import AnnotationLoader
+from commands.wire_manager import WireManager
 from resources.resource_definitions import RESOURCE_DEFINITIONS, handle_resource_read
 
 # Import tool schemas, resource definitions, and IPC API annotations
 from schemas.tool_schemas import TOOL_SCHEMAS
-from annotations import AnnotationLoader
 
 _annotation_loader = AnnotationLoader()
 
 # Configure logging
-log_dir = os.path.join(os.path.expanduser("~"), ".kicad-mcp", "logs")
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, "kicad_interface.log")
-
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(log_file)],
-)
+# Try to set up a file handler in ~/.kicad-mcp/logs. If that directory isn't
+# writable (e.g. sandboxed test environments, restricted CI runners), fall
+# back to console-only logging so importing this module never crashes.
+try:
+    log_dir = os.path.join(os.path.expanduser("~"), ".kicad-mcp", "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "kicad_interface.log")
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(log_file)],
+    )
+except (OSError, PermissionError):
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
 logger = logging.getLogger("kicad_interface")
 
 # Log Python environment details
@@ -381,7 +391,6 @@ class KiCADInterface:
             "get_schematic_component": self._handle_get_schematic_component,
             "add_schematic_wire": self._handle_add_schematic_wire,
             "add_schematic_net_label": self._handle_add_schematic_net_label,
-            "add_schematic_junction": self._handle_add_schematic_junction,
             "connect_to_net": self._handle_connect_to_net,
             "connect_passthrough": self._handle_connect_passthrough,
             "get_schematic_pin_locations": self._handle_get_schematic_pin_locations,
@@ -574,6 +583,7 @@ class KiCADInterface:
         "import_svg_logo",
         "sync_schematic_to_board",
         "connect_passthrough",
+        "connect_to_net",
     }
 
     def _auto_save_board(self) -> None:
@@ -727,9 +737,17 @@ class KiCADInterface:
             y = component.get("y", 0)
             unit = component.get("unit", 1)
 
-            # Derive project path from schematic path for project-local library resolution
+            # Derive project path from schematic path for project-local library resolution.
+            # Walk up from the schematic file to find the directory that owns the project
+            # (contains sym-lib-table or a .kicad_pro file).  Schematics stored in a
+            # sub-folder (e.g. sheets/) would otherwise resolve to the wrong directory and
+            # miss any project-local sym-lib-table entries.
             schematic_file = Path(schematic_path)
             derived_project_path = schematic_file.parent
+            for ancestor in schematic_file.parents:
+                if (ancestor / "sym-lib-table").exists() or list(ancestor.glob("*.kicad_pro")):
+                    derived_project_path = ancestor
+                    break
 
             loader = DynamicSymbolLoader(project_path=derived_project_path)
             loader.add_component(
@@ -806,7 +824,15 @@ class KiCADInterface:
             # line-by-line regex would never match.
             blocks_to_delete = []  # list of (char_start, char_end) into content
             search_start = 0
-            pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
+            # Match the opening of any placed-symbol block. KiCAD may emit the
+            # children of (symbol ...) in any order — most commonly
+            # `(symbol (lib_id "..."))`, but symbols whose library entry has been
+            # rescued / customised carry an additional `(lib_name "...")` first:
+            # `(symbol (lib_name "...") (lib_id "...") ...)`. Matching just
+            # `(symbol\s+(` covers both, and the lib_symbols range check below
+            # still excludes library-definition symbols (which use the
+            # `(symbol "name" ...)` form with a quoted string, not a paren).
+            pattern = re.compile(r"\(symbol\s+\(")
             while True:
                 m = pattern.search(content, search_start)
                 if not m:
@@ -1140,11 +1166,17 @@ class KiCADInterface:
                 self._find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
             )
 
-            # Find placed symbol blocks that match the reference
-            # Search for (symbol (lib_id "...") ... (property "Reference" "<ref>" ...) ...)
+            # Find placed symbol blocks that match the reference. KiCAD may
+            # serialise the children of (symbol ...) in different orders —
+            # `(symbol (lib_id "..."))` is the common case but rescued or
+            # locally-customised symbols carry an extra `(lib_name "...")`
+            # before the lib_id: `(symbol (lib_name "...") (lib_id "..."))`.
+            # Match any opening paren after `(symbol`; the lib_symbols range
+            # check below excludes library-definition symbols, which use the
+            # `(symbol "name" ...)` form (quoted string, not paren).
             block_start = block_end = None
             search_start = 0
-            pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
+            pattern = re.compile(r"\(symbol\s+\(")
             while True:
                 m = pattern.search(content, search_start)
                 if not m:
@@ -1178,8 +1210,12 @@ class KiCADInterface:
 
             # Determine the parent symbol position so that newly-added properties
             # default to a sensible location (anchored near the component).
+            # KiCAD always emits the symbol's own (at x y angle) before any
+            # (property ...) child blocks, so the FIRST (at ...) inside the
+            # symbol block is the symbol origin regardless of whether
+            # (lib_name ...) precedes (lib_id ...).
             comp_at = re.search(
-                r'\(symbol\s+\(lib_id\s+"[^"]*"\s*\)\s+\(at\s+([\d\.\-]+)\s+([\d\.\-]+)',
+                r"\(at\s+([\d\.\-]+)\s+([\d\.\-]+)",
                 block_text,
             )
             comp_origin: Tuple[float, float] = (
@@ -1379,10 +1415,17 @@ class KiCADInterface:
             lib_sym_pos = content.find("(lib_symbols")
             lib_sym_end = find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
 
-            # Find the placed symbol block for this reference
+            # Find the placed symbol block for this reference. KiCAD may emit
+            # the children of (symbol ...) in different orders — most commonly
+            # `(symbol (lib_id "..."))`, but symbols whose library entry has
+            # been rescued / customised carry an extra `(lib_name "...")` first
+            # (`(symbol (lib_name "...") (lib_id "..."))`). Match `(symbol\s+(`
+            # — any opening paren — to handle both. The lib_symbols range check
+            # below excludes library-definition symbols, which use the
+            # `(symbol "name" ...)` form (quoted string, not paren).
             block_start = block_end = None
             search_start = 0
-            pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
+            pattern = re.compile(r"\(symbol\s+\(")
             while True:
                 m = pattern.search(content, search_start)
                 if not m:
@@ -1412,9 +1455,12 @@ class KiCADInterface:
 
             block_text = content[block_start : block_end + 1]
 
-            # Extract component position: first (at x y angle) in the symbol header line
+            # Extract component position: the first (at x y angle) inside the
+            # symbol block. KiCAD always writes the symbol's own (at) before
+            # any (property ...) child blocks, so the first match is the
+            # symbol origin regardless of the (lib_name)/(lib_id) ordering.
             comp_at = re.search(
-                r'\(symbol\s+\(lib_id\s+"[^"]*"\s*\)\s+\(at\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)\s*\)',
+                r"\(at\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)\s*\)",
                 block_text,
             )
             if comp_at:
@@ -1575,39 +1621,6 @@ class KiCADInterface:
                 return {"success": False, "message": "Failed to add wire"}
         except Exception as e:
             logger.error(f"Error adding wire to schematic: {str(e)}")
-            import traceback
-
-            logger.error(traceback.format_exc())
-            return {
-                "success": False,
-                "message": str(e),
-                "errorDetails": traceback.format_exc(),
-            }
-
-    def _handle_add_schematic_junction(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Add a junction (connection dot) to a schematic using WireManager"""
-        logger.info("Adding junction to schematic")
-        try:
-            from pathlib import Path
-
-            from commands.wire_manager import WireManager
-
-            schematic_path = params.get("schematicPath")
-            position = params.get("position")
-
-            if not schematic_path:
-                return {"success": False, "message": "Schematic path is required"}
-            if not position:
-                return {"success": False, "message": "Position is required"}
-
-            success = WireManager.add_junction(Path(schematic_path), position)
-
-            if success:
-                return {"success": True, "message": "Junction added successfully"}
-            else:
-                return {"success": False, "message": "Failed to add junction"}
-        except Exception as e:
-            logger.error(f"Error adding junction to schematic: {str(e)}")
             import traceback
 
             logger.error(traceback.format_exc())
@@ -1984,7 +1997,11 @@ class KiCADInterface:
             }
 
     def _handle_connect_to_net(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Connect a component pin to a named net using wire stub and label"""
+        """Connect a component pin to a named net using wire stub and label,
+        and also assign the net to the corresponding pad on the PCB board so
+        that save_project persists the net (pcbnew.SaveBoard only writes nets
+        that are referenced by at least one board element).
+        """
         logger.info("Connecting component pin to net")
         try:
             from pathlib import Path
@@ -2001,6 +2018,16 @@ class KiCADInterface:
             result = ConnectionManager.connect_to_net(
                 Path(schematic_path), component_ref, pin_name, net_name
             )
+
+            # Also assign the net to the pad on the PCB board
+            if self.board and isinstance(result, dict) and result.get("success"):
+                try:
+                    if self._assign_net_to_pad(component_ref, pin_name, net_name):
+                        msg = result.get("message", "")
+                        result["message"] = (msg + " (PCB pad also updated)").strip()
+                except Exception as pcb_err:
+                    logger.warning(f"Could not assign net to PCB pad: {pcb_err}")
+
             return result
         except Exception as e:
             logger.error(f"Error connecting to net: {str(e)}")
@@ -2035,11 +2062,48 @@ class KiCADInterface:
                 Path(schematic_path), source_ref, target_ref, net_prefix, pin_offset
             )
 
+            # Also assign nets to PCB pads for each successfully connected pin
+            pcb_assigned = 0
+            if self.board:
+                import re as _re
+
+                for conn_info in result.get("connected", []):
+                    # Expected format: "{src_ref}/{pin} <-> {tgt_ref}/{pin} [{net}]"
+                    try:
+                        parts = conn_info.split(" <-> ")
+                        if len(parts) != 2:
+                            continue
+                        src_part = parts[0]
+                        rest = parts[1]
+                        bracket_match = _re.search(r"\[(.+)\]", rest)
+                        tgt_part = rest.split(" [")[0] if " [" in rest else rest
+                        net_name = bracket_match.group(1) if bracket_match else None
+                        if not net_name:
+                            continue
+
+                        src_ref_pin = src_part.split("/")
+                        tgt_ref_pin = tgt_part.split("/")
+                        if len(src_ref_pin) == 2 and self._assign_net_to_pad(
+                            src_ref_pin[0], src_ref_pin[1], net_name
+                        ):
+                            pcb_assigned += 1
+                        if len(tgt_ref_pin) == 2 and self._assign_net_to_pad(
+                            tgt_ref_pin[0], tgt_ref_pin[1], net_name
+                        ):
+                            pcb_assigned += 1
+                    except Exception as parse_err:
+                        logger.debug(
+                            f"Could not parse passthrough result for PCB assignment: {parse_err}"
+                        )
+
             n_ok = len(result["connected"])
             n_fail = len(result["failed"])
+            msg = f"Passthrough complete: {n_ok} connected, {n_fail} failed"
+            if pcb_assigned:
+                msg += f" ({pcb_assigned} PCB pads updated)"
             return {
                 "success": n_fail == 0,
-                "message": f"Passthrough complete: {n_ok} connected, {n_fail} failed",
+                "message": msg,
                 "connected": result["connected"],
                 "failed": result["failed"],
             }
@@ -2049,6 +2113,49 @@ class KiCADInterface:
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
+
+    def _assign_net_to_pad(self, component_ref: str, pin_name: str, net_name: str) -> bool:
+        """Assign a net to a specific pad on the PCB board.
+
+        Ensures the net exists on the board and sets it on the matching pad.
+        Needed because pcbnew.SaveBoard() drops nets that are not referenced
+        by any board element (pad/track/via/zone).
+        Returns True if the pad was found and updated.
+        """
+        board = self.board
+        if not board:
+            return False
+
+        netinfo = board.GetNetInfo()
+        nets_map = netinfo.NetsByName()
+        if not nets_map.has_key(net_name):
+            net_item = pcbnew.NETINFO_ITEM(board, net_name)
+            board.Add(net_item)
+            netinfo = board.GetNetInfo()
+            nets_map = netinfo.NetsByName()
+
+        if not nets_map.has_key(net_name):
+            logger.warning(f"Net '{net_name}' could not be created on board")
+            return False
+
+        net_obj = nets_map[net_name]
+
+        for fp in board.GetFootprints():
+            if fp.GetReference() == component_ref:
+                for pad in fp.Pads():
+                    if str(pad.GetNumber()) == str(pin_name):
+                        pad.SetNet(net_obj)
+                        logger.info(
+                            f"Assigned net '{net_name}' to pad {component_ref}/{pin_name} on PCB"
+                        )
+                        return True
+                logger.warning(
+                    f"Pad '{pin_name}' not found on footprint '{component_ref}'"
+                )
+                return False
+
+        logger.warning(f"Footprint '{component_ref}' not found on board")
+        return False
 
     def _handle_get_schematic_pin_locations(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Return exact pin endpoint coordinates for a schematic component"""
@@ -2521,7 +2628,6 @@ class KiCADInterface:
         """Move a schematic component to a new position, dragging connected wires."""
         logger.info("Moving schematic component")
         try:
-            import sexpdata as _sexpdata
             from commands.wire_dragger import WireDragger
 
             schematic_path = params.get("schematicPath")
@@ -2543,7 +2649,7 @@ class KiCADInterface:
                 }
 
             with open(schematic_path, "r", encoding="utf-8") as f:
-                sch_data = _sexpdata.loads(f.read())
+                sch_data = sexpdata.loads(f.read())
 
             # Find symbol and record old position
             found = WireDragger.find_symbol(sch_data, reference)
@@ -2582,8 +2688,10 @@ class KiCADInterface:
             # Update symbol position
             WireDragger.update_symbol_position(sch_data, reference, float(new_x), float(new_y))
 
+            WireManager.sync_junctions(sch_data)
+
             with open(schematic_path, "w", encoding="utf-8") as f:
-                f.write(_sexpdata.dumps(sch_data))
+                f.write(sexpdata.dumps(sch_data))
 
             return {
                 "success": True,
@@ -2616,33 +2724,77 @@ class KiCADInterface:
                     "message": "schematicPath and reference are required",
                 }
 
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
+            sym_k = sexpdata.Symbol("symbol")
+            prop_k = sexpdata.Symbol("property")
+            at_k = sexpdata.Symbol("at")
+            mirror_k = sexpdata.Symbol("mirror")
 
-            for symbol in schematic.symbol:
-                if not hasattr(symbol.property, "Reference"):
+            with open(schematic_path, "r", encoding="utf-8") as _f:
+                sch_data = sexpdata.load(_f)
+
+            target = None
+            for item in sch_data:
+                if not (isinstance(item, list) and item and item[0] == sym_k):
                     continue
-                if symbol.property.Reference.value == reference:
-                    pos = list(symbol.at.value)
-                    while len(pos) < 3:
-                        pos.append(0)
-                    pos[2] = angle
-                    symbol.at.value = pos
+                ref_val = None
+                for sub in item[1:]:
+                    if (
+                        isinstance(sub, list)
+                        and len(sub) >= 3
+                        and sub[0] == prop_k
+                        and str(sub[1]).strip('"') == "Reference"
+                    ):
+                        ref_val = str(sub[2]).strip('"')
+                        break
+                if ref_val == reference:
+                    target = item
+                    break
 
-                    if mirror:
-                        if hasattr(symbol, "mirror"):
-                            symbol.mirror.value = mirror
-                        else:
-                            logger.warning(
-                                f"Mirror '{mirror}' requested for {reference}, "
-                                f"but symbol has no mirror attribute; skipped"
-                            )
+            if target is None:
+                return {"success": False, "message": f"Component {reference} not found"}
 
-                    SchematicManager.save_schematic(schematic, schematic_path)
-                    return {"success": True, "reference": reference, "angle": angle}
+            # Update (at x y rot)
+            at_node = None
+            mirror_idx = None
+            for idx, sub in enumerate(target[1:], start=1):
+                if not isinstance(sub, list) or not sub:
+                    continue
+                if sub[0] == at_k:
+                    at_node = sub
+                elif sub[0] == mirror_k:
+                    mirror_idx = idx
 
-            return {"success": False, "message": f"Component {reference} not found"}
+            if at_node is None:
+                return {
+                    "success": False,
+                    "message": f"Component {reference} has no (at ...) node",
+                }
+            while len(at_node) < 3:
+                at_node.append(0)
+            if len(at_node) < 4:
+                at_node.append(angle)
+            else:
+                at_node[3] = angle
+
+            if mirror:
+                mirror_node = [mirror_k, sexpdata.Symbol(str(mirror))]
+                if mirror_idx is not None:
+                    target[mirror_idx] = mirror_node
+                else:
+                    # Insert after (at ...) for stability
+                    insert_at = len(target)
+                    for idx, sub in enumerate(target[1:], start=1):
+                        if isinstance(sub, list) and sub and sub[0] == at_k:
+                            insert_at = idx + 1
+                            break
+                    target.insert(insert_at, mirror_node)
+
+            WireManager.sync_junctions(sch_data)
+
+            with open(schematic_path, "w", encoding="utf-8") as _f:
+                _f.write(sexpdata.dumps(sch_data))
+
+            return {"success": True, "reference": reference, "angle": angle}
 
         except Exception as e:
             logger.error(f"Error rotating schematic component: {e}")
