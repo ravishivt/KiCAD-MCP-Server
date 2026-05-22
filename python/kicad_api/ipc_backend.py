@@ -412,13 +412,79 @@ class IPCBoardAPI(BoardAPI):
             for fp in footprints:
                 try:
                     pos = fp.position
+
+                    # Try to get bounding box
+                    bbox_data = None
+                    try:
+                        bbox = board.get_item_bounding_box(fp)
+                        if bbox:
+                            bbox_data = {
+                                "min_x": to_mm(bbox.min.x),
+                                "min_y": to_mm(bbox.min.y),
+                                "max_x": to_mm(bbox.max.x),
+                                "max_y": to_mm(bbox.max.y),
+                                "width": to_mm(bbox.max.x - bbox.min.x),
+                                "height": to_mm(bbox.max.y - bbox.min.y),
+                                "unit": "mm",
+                            }
+                    except Exception:
+                        pass  # Bounding box may not be available via IPC
+
+                    # Fallback: compute bounding box from pad positions + sizes
+                    if not bbox_data:
+                        try:
+                            pads = fp.pads if hasattr(fp, "pads") else []
+                            pad_list = list(pads)
+                            if pad_list:
+                                min_x = float("inf")
+                                min_y = float("inf")
+                                max_x = float("-inf")
+                                max_y = float("-inf")
+                                for pad in pad_list:
+                                    px = to_mm(pad.position.x) if pad.position else 0
+                                    py = to_mm(pad.position.y) if pad.position else 0
+                                    pw = (
+                                        to_mm(pad.size.x) / 2
+                                        if hasattr(pad, "size") and pad.size
+                                        else 0.5
+                                    )
+                                    ph = (
+                                        to_mm(pad.size.y) / 2
+                                        if hasattr(pad, "size") and pad.size
+                                        else 0.5
+                                    )
+                                    min_x = min(min_x, px - pw)
+                                    min_y = min(min_y, py - ph)
+                                    max_x = max(max_x, px + pw)
+                                    max_y = max(max_y, py + ph)
+                                margin = 0.25  # mm — small margin for component body beyond pads
+                                bbox_data = {
+                                    "min_x": min_x - margin,
+                                    "min_y": min_y - margin,
+                                    "max_x": max_x + margin,
+                                    "max_y": max_y + margin,
+                                    "width": (max_x - min_x) + 2 * margin,
+                                    "height": (max_y - min_y) + 2 * margin,
+                                    "unit": "mm",
+                                }
+                        except Exception as e:
+                            logger.debug(f"Could not compute bbox from pads: {e}")
+
                     components.append(
                         {
                             "reference": (
                                 fp.reference_field.text.value if fp.reference_field else ""
                             ),
                             "value": fp.value_field.text.value if fp.value_field else "",
-                            "footprint": str(fp.definition.library_link) if fp.definition else "",
+                            "footprint": (
+                                str(fp.definition.library_link)
+                                if fp.definition and hasattr(fp.definition, "library_link")
+                                else (
+                                    str(fp.definition.id)
+                                    if fp.definition and hasattr(fp.definition, "id")
+                                    else ""
+                                )
+                            ),
                             "position": {
                                 "x": to_mm(pos.x) if pos else 0,
                                 "y": to_mm(pos.y) if pos else 0,
@@ -427,6 +493,7 @@ class IPCBoardAPI(BoardAPI):
                             "rotation": fp.orientation.degrees if fp.orientation else 0,
                             "layer": str(fp.layer) if hasattr(fp, "layer") else "F.Cu",
                             "id": str(fp.id) if hasattr(fp, "id") else "",
+                            "boundingBox": bbox_data,
                         }
                     )
                 except Exception as e:
@@ -851,6 +918,71 @@ class IPCBoardAPI(BoardAPI):
 
         except Exception as e:
             logger.error(f"Failed to add track: {e}")
+            return False
+
+    def add_arc_track(
+        self,
+        start_x: float,
+        start_y: float,
+        mid_x: float,
+        mid_y: float,
+        end_x: float,
+        end_y: float,
+        width: float = 0.25,
+        layer: str = "F.Cu",
+        net_name: Optional[str] = None,
+    ) -> bool:
+        """Add a copper arc track to the board."""
+        try:
+            from kipy.board_types import ArcTrack
+            from kipy.geometry import Vector2
+            from kipy.proto.board.board_types_pb2 import BoardLayer
+            from kipy.util.units import from_mm
+
+            board = self._get_board()
+
+            arc = ArcTrack()
+            arc.start = Vector2.from_xy(from_mm(start_x), from_mm(start_y))
+            arc.mid = Vector2.from_xy(from_mm(mid_x), from_mm(mid_y))
+            arc.end = Vector2.from_xy(from_mm(end_x), from_mm(end_y))
+            arc.width = from_mm(width)
+
+            layer_map = {
+                "F.Cu": BoardLayer.BL_F_Cu,
+                "B.Cu": BoardLayer.BL_B_Cu,
+                "In1.Cu": BoardLayer.BL_In1_Cu,
+                "In2.Cu": BoardLayer.BL_In2_Cu,
+            }
+            arc.layer = layer_map.get(layer, BoardLayer.BL_F_Cu)
+
+            if net_name:
+                nets = board.get_nets()
+                for net in nets:
+                    if net.name == net_name:
+                        arc.net = net
+                        break
+
+            commit = board.begin_commit()
+            board.create_items(arc)
+            board.push_commit(commit, "Added arc track")
+
+            self._notify(
+                "arc_track_added",
+                {
+                    "start": {"x": start_x, "y": start_y},
+                    "mid": {"x": mid_x, "y": mid_y},
+                    "end": {"x": end_x, "y": end_y},
+                    "width": width,
+                    "layer": layer,
+                    "net": net_name,
+                },
+            )
+            logger.info(
+                f"Added arc track start=({start_x}, {start_y}) mid=({mid_x}, {mid_y}) end=({end_x}, {end_y}) mm"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to add arc track: {e}")
             return False
 
     def add_via(

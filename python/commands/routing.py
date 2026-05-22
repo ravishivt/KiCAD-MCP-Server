@@ -48,11 +48,20 @@ class RoutingCommands:
                 net = pcbnew.NETINFO_ITEM(self.board, name)
                 self.board.Add(net)
 
-            # Set net class if provided
+            # Set net class if provided — defensive against KiCad 6/7 vs KiCad 9/10 API.
             if net_class:
                 net_classes = self.board.GetNetClasses()
-                if net_classes.Find(net_class):
-                    net.SetClass(net_classes.Find(net_class))
+                resolved = None
+                if hasattr(net_classes, "Find"):
+                    resolved = net_classes.Find(net_class)
+                else:
+                    try:
+                        if net_class in net_classes:
+                            resolved = net_classes[net_class]
+                    except Exception:
+                        resolved = None
+                if resolved is not None:
+                    net.SetClass(resolved)
 
             return {
                 "success": True,
@@ -339,6 +348,81 @@ class RoutingCommands:
             return {
                 "success": False,
                 "message": "Failed to route trace",
+                "errorDetails": str(e),
+            }
+
+    def route_arc_trace(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Route a copper arc trace from start/mid/end points."""
+        try:
+            if not self.board:
+                return {
+                    "success": False,
+                    "message": "No board is loaded",
+                    "errorDetails": "Load or create a board first",
+                }
+
+            start = params.get("start")
+            mid = params.get("mid")
+            end = params.get("end")
+            layer = params.get("layer", "F.Cu")
+            width = params.get("width")
+            net = params.get("net")
+
+            if not start or not mid or not end:
+                return {
+                    "success": False,
+                    "message": "Missing parameters",
+                    "errorDetails": "start, mid and end points are required",
+                }
+
+            layer_id = self.board.GetLayerID(layer)
+            if layer_id < 0:
+                return {
+                    "success": False,
+                    "message": "Invalid layer",
+                    "errorDetails": f"Layer '{layer}' does not exist",
+                }
+
+            start_point = self._get_point(start)
+            mid_point = self._get_point(mid)
+            end_point = self._get_point(end)
+
+            arc = pcbnew.PCB_ARC(self.board)
+            arc.SetStart(start_point)
+            arc.SetMid(mid_point)
+            arc.SetEnd(end_point)
+            arc.SetLayer(layer_id)
+
+            if width:
+                arc.SetWidth(int(width * 1000000))
+            else:
+                arc.SetWidth(self.board.GetDesignSettings().GetCurrentTrackWidth())
+
+            if net:
+                netinfo = self.board.GetNetInfo()
+                nets_map = netinfo.NetsByName()
+                if nets_map.has_key(net):
+                    arc.SetNet(nets_map[net])
+
+            self.board.Add(arc)
+
+            return {
+                "success": True,
+                "message": "Added arc trace",
+                "arc": {
+                    "start": {"x": start_point.x / 1000000, "y": start_point.y / 1000000, "unit": "mm"},
+                    "mid": {"x": mid_point.x / 1000000, "y": mid_point.y / 1000000, "unit": "mm"},
+                    "end": {"x": end_point.x / 1000000, "y": end_point.y / 1000000, "unit": "mm"},
+                    "layer": layer,
+                    "width": arc.GetWidth() / 1000000,
+                    "net": net,
+                },
+            }
+        except Exception as e:
+            logger.error(f"Error routing arc trace: {str(e)}")
+            return {
+                "success": False,
+                "message": "Failed to route arc trace",
                 "errorDetails": str(e),
             }
 
@@ -707,6 +791,113 @@ class RoutingCommands:
                 "errorDetails": str(e),
             }
 
+    def query_zones(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Query copper zones (filled pours) by net, layer, or bounding box.
+
+        Returns one entry per zone with its net, layers, priority, fill state,
+        and bounding box. Useful for auditing power planes / GND pours that
+        ``query_traces`` does not report (zones are PCB_ZONE_T, not tracks).
+        """
+        try:
+            if not self.board:
+                return {
+                    "success": False,
+                    "message": "No board is loaded",
+                    "errorDetails": "Load or create a board first",
+                }
+
+            net_name = params.get("net")
+            layer = params.get("layer")
+            bbox = params.get("boundingBox")
+
+            scale = 1000000  # nm -> mm
+            target_layer_id = None
+            if layer:
+                target_layer_id = self.board.GetLayerID(layer)
+
+            bbox_box = None
+            if bbox:
+                bbox_unit = bbox.get("unit", "mm")
+                bbox_scale = scale if bbox_unit == "mm" else 25400000
+                bbox_box = (
+                    int(bbox.get("x1", 0) * bbox_scale),
+                    int(bbox.get("y1", 0) * bbox_scale),
+                    int(bbox.get("x2", 0) * bbox_scale),
+                    int(bbox.get("y2", 0) * bbox_scale),
+                )
+
+            zones_out = []
+            for zone in list(self.board.Zones()):
+                try:
+                    z_net = zone.GetNetname()
+                    if net_name and z_net != net_name:
+                        continue
+
+                    # A zone can span multiple copper layers; collect them.
+                    layer_names = []
+                    try:
+                        layer_set = zone.GetLayerSet()
+                        seq = layer_set.CuStack() if hasattr(layer_set, "CuStack") else layer_set.Seq()
+                        for lid in seq:
+                            layer_names.append(self.board.GetLayerName(lid))
+                    except Exception:
+                        layer_names = [self.board.GetLayerName(zone.GetLayer())]
+
+                    if target_layer_id is not None:
+                        if target_layer_id not in [self.board.GetLayerID(n) for n in layer_names]:
+                            continue
+
+                    bb = zone.GetBoundingBox()
+                    bb_x1, bb_y1 = bb.GetLeft(), bb.GetTop()
+                    bb_x2, bb_y2 = bb.GetRight(), bb.GetBottom()
+
+                    if bbox_box is not None:
+                        x1, y1, x2, y2 = bbox_box
+                        # Reject if no overlap with filter bbox.
+                        if bb_x2 < x1 or bb_x1 > x2 or bb_y2 < y1 or bb_y1 > y2:
+                            continue
+
+                    entry = {
+                        "uuid": zone.m_Uuid.AsString(),
+                        "net": z_net,
+                        "netCode": zone.GetNetCode(),
+                        "layers": layer_names,
+                        "priority": zone.GetAssignedPriority() if hasattr(zone, "GetAssignedPriority") else 0,
+                        "isFilled": bool(zone.IsFilled()),
+                        "minThickness": zone.GetMinThickness() / scale,
+                        "boundingBox": {
+                            "x1": bb_x1 / scale,
+                            "y1": bb_y1 / scale,
+                            "x2": bb_x2 / scale,
+                            "y2": bb_y2 / scale,
+                            "unit": "mm",
+                        },
+                    }
+                    # Area is only available when zone is filled.
+                    try:
+                        entry["filledArea"] = zone.GetFilledArea() / (scale * scale)
+                    except Exception:
+                        pass
+
+                    zones_out.append(entry)
+                except Exception as zone_err:
+                    logger.warning(f"Skipping invalid zone object: {zone_err}")
+                    continue
+
+            return {
+                "success": True,
+                "zoneCount": len(zones_out),
+                "zones": zones_out,
+            }
+
+        except Exception as e:
+            logger.error(f"Error querying zones: {str(e)}")
+            return {
+                "success": False,
+                "message": "Failed to query zones",
+                "errorDetails": str(e),
+            }
+
     def modify_trace(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Modify properties of an existing trace
 
@@ -1028,7 +1219,8 @@ class RoutingCommands:
 
             name = params.get("name")
             clearance = params.get("clearance")
-            track_width = params.get("trackWidth")
+            # Schema exposes "traceWidth"; older callers may send "trackWidth". Accept both.
+            track_width = params.get("traceWidth", params.get("trackWidth"))
             via_diameter = params.get("viaDiameter")
             via_drill = params.get("viaDrill")
             uvia_diameter = params.get("uviaDiameter")
@@ -1044,34 +1236,52 @@ class RoutingCommands:
                     "errorDetails": "name parameter is required",
                 }
 
-            # Get net classes
+            # Get net classes — KiCad 6/7 returns NETCLASSES with .Find/.Add;
+            # KiCad 9/10 returns a netclasses_map (SWIG-wrapped std::map) that is dict-like.
             net_classes = self.board.GetNetClasses()
 
-            # Create new net class if it doesn't exist
-            if not net_classes.Find(name):
-                netclass = pcbnew.NETCLASS(name)
-                net_classes.Add(netclass)
+            existing = None
+            if hasattr(net_classes, "Find"):
+                existing = net_classes.Find(name)
             else:
-                netclass = net_classes.Find(name)
+                try:
+                    if name in net_classes:
+                        existing = net_classes[name]
+                except Exception:
+                    existing = None
+
+            if existing is None:
+                netclass = pcbnew.NETCLASS(name)
+                if hasattr(net_classes, "Add"):
+                    net_classes.Add(netclass)
+                else:
+                    net_classes[name] = netclass
+            else:
+                netclass = existing
 
             # Set properties
             scale = 1000000  # mm to nm
-            if clearance is not None:
-                netclass.SetClearance(int(clearance * scale))
-            if track_width is not None:
-                netclass.SetTrackWidth(int(track_width * scale))
-            if via_diameter is not None:
-                netclass.SetViaDiameter(int(via_diameter * scale))
-            if via_drill is not None:
-                netclass.SetViaDrill(int(via_drill * scale))
-            if uvia_diameter is not None:
-                netclass.SetMicroViaDiameter(int(uvia_diameter * scale))
-            if uvia_drill is not None:
-                netclass.SetMicroViaDrill(int(uvia_drill * scale))
-            if diff_pair_width is not None:
-                netclass.SetDiffPairWidth(int(diff_pair_width * scale))
-            if diff_pair_gap is not None:
-                netclass.SetDiffPairGap(int(diff_pair_gap * scale))
+
+            # Defensive setters — KiCad 10's NETCLASS dropped some legacy mutators.
+            def _safe_set(method_name, value):
+                if value is None:
+                    return
+                method = getattr(netclass, method_name, None)
+                if method is None:
+                    return
+                try:
+                    method(int(value * scale))
+                except Exception:
+                    pass
+
+            _safe_set("SetClearance", clearance)
+            _safe_set("SetTrackWidth", track_width)
+            _safe_set("SetViaDiameter", via_diameter)
+            _safe_set("SetViaDrill", via_drill)
+            _safe_set("SetMicroViaDiameter", uvia_diameter)
+            _safe_set("SetMicroViaDrill", uvia_drill)
+            _safe_set("SetDiffPairWidth", diff_pair_width)
+            _safe_set("SetDiffPairGap", diff_pair_gap)
 
             # Add nets to net class
             netinfo = self.board.GetNetInfo()
@@ -1081,19 +1291,29 @@ class RoutingCommands:
                     net = nets_map[net_name]
                     net.SetClass(netclass)
 
+            # Defensive accessors — KiCad 10's NETCLASS dropped some legacy getters.
+            def _safe_get(method_name):
+                method = getattr(netclass, method_name, None)
+                if method is None:
+                    return None
+                try:
+                    return method() / scale
+                except Exception:
+                    return None
+
             return {
                 "success": True,
                 "message": f"Created net class: {name}",
                 "netClass": {
                     "name": name,
-                    "clearance": netclass.GetClearance() / scale,
-                    "trackWidth": netclass.GetTrackWidth() / scale,
-                    "viaDiameter": netclass.GetViaDiameter() / scale,
-                    "viaDrill": netclass.GetViaDrill() / scale,
-                    "uviaDiameter": netclass.GetMicroViaDiameter() / scale,
-                    "uviaDrill": netclass.GetMicroViaDrill() / scale,
-                    "diffPairWidth": netclass.GetDiffPairWidth() / scale,
-                    "diffPairGap": netclass.GetDiffPairGap() / scale,
+                    "clearance": _safe_get("GetClearance"),
+                    "trackWidth": _safe_get("GetTrackWidth"),
+                    "viaDiameter": _safe_get("GetViaDiameter"),
+                    "viaDrill": _safe_get("GetViaDrill"),
+                    "uviaDiameter": _safe_get("GetMicroViaDiameter"),
+                    "uviaDrill": _safe_get("GetMicroViaDrill"),
+                    "diffPairWidth": _safe_get("GetDiffPairWidth"),
+                    "diffPairGap": _safe_get("GetDiffPairGap"),
                     "nets": nets,
                 },
             }
@@ -1429,3 +1649,391 @@ class RoutingCommands:
         dx = p1.x - p2.x
         dy = p1.y - p2.y
         return (dx * dx + dy * dy) ** 0.5
+
+    # -----------------------------------------------------------------------
+    # add_gnd_stitching_vias
+    #
+    # Originally prototyped in morningfire-pcb-automation:
+    #   https://github.com/NiNjA-CodE/morningfire-pcb-automation
+    #   (scripts/ground/add_gnd_vias.py — regex-on-PCB-text version)
+    #
+    # The version here uses the pcbnew API so it handles arbitrary
+    # rotations, gets net IDs / clearances from the loaded board, and
+    # works against the live in-memory board state (so two calls in
+    # sequence — e.g. "around U1" then "across the board" — both see
+    # the first call's placements). All copper layers are checked
+    # because a through-hole via penetrates the full stackup; missing a
+    # B.Cu collision check is the classic way GND-stitching tools
+    # create silent shorts.
+    # -----------------------------------------------------------------------
+    def add_gnd_stitching_vias(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Drop GND stitching vias across the board, collision-checked on every copper layer.
+
+        Strategies (combine freely):
+          - ``grid``        Place candidates on a regular grid across the board
+                            interior. Each candidate is accepted only if its
+                            full keep-out radius is clear of every non-GND
+                            segment / via / pad on every copper layer.
+          - ``around_refs`` For each named footprint, try a small radius of
+                            grid points around its anchor. Good for densifying
+                            ground around noisy ICs (MCUs, switching
+                            regulators, RF parts).
+          - ``in_zones``    Restrict candidates to points actually inside the
+                            filled polygons of GND copper zones, so each new
+                            via lands on copper that's already a GND
+                            equipotential. Highly recommended on boards where
+                            the GND zone is fragmented — these vias
+                            actually stitch the zones, not just float on
+                            silkscreen.
+
+        Args:
+            gndNet: name of the ground net. Default: auto-detect from
+                ``GND`` / ``GROUND`` / ``VSS`` in that order, else error.
+            strategies: list of strategy names. Default ``["grid"]``.
+                Pass ``["grid", "around_refs", "in_zones"]`` for the kitchen
+                sink — collision check + intra-call dedupe means the
+                strategies compose safely.
+            viaSize: pad diameter mm. Default 0.6.
+            viaDrill: drill diameter mm. Default 0.3.
+            clearance: extra clearance beyond required mm. Default 0.2.
+            spacing: grid spacing mm for ``grid`` and ``around_refs``.
+                Default 5.0.
+            densifyRefs: list of refs for ``around_refs``. Default [].
+            densifyRadius: how many grid cells around each ref to try.
+                Default 2 (5x5 candidate field per ref).
+            edgeMargin: distance from board edge mm. Default 0.5.
+            maxVias: maximum total placements (across all strategies).
+                Default unlimited.
+            dryRun: don't write, just return placements.
+
+        Returns:
+            ``{"success": True, "placed": [{"x", "y", "unit"}, ...],
+                "summary": {...}}``
+        """
+        if not self.board:
+            return {
+                "success": False,
+                "message": "No board is loaded",
+                "errorDetails": "Load or create a board first",
+            }
+
+        try:
+            return self._do_add_gnd_stitching(params)
+        except Exception as e:
+            import traceback
+            logger.error(
+                f"add_gnd_stitching_vias failed: {e}\n{traceback.format_exc()}"
+            )
+            return {
+                "success": False,
+                "message": "add_gnd_stitching_vias failed",
+                "errorDetails": str(e),
+            }
+
+    def _do_add_gnd_stitching(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        # --- Parse params ---
+        gnd_net_name = params.get("gndNet")
+        strategies = list(params.get("strategies") or ["grid"])
+        for s in strategies:
+            if s not in ("grid", "around_refs", "in_zones"):
+                return {
+                    "success": False,
+                    "message": f"Unknown strategy '{s}'",
+                    "errorDetails": "Valid strategies: grid, around_refs, in_zones",
+                }
+
+        via_size_mm = float(params.get("viaSize", 0.6))
+        via_drill_mm = float(params.get("viaDrill", 0.3))
+        if via_drill_mm >= via_size_mm:
+            return {
+                "success": False,
+                "message": "Invalid via geometry",
+                "errorDetails": "viaDrill must be smaller than viaSize",
+            }
+        clearance_mm = float(params.get("clearance", 0.2))
+        spacing_mm = float(params.get("spacing", 5.0))
+        densify_refs = list(params.get("densifyRefs") or [])
+        densify_radius = int(params.get("densifyRadius", 2))
+        edge_margin_mm = float(params.get("edgeMargin", 0.5))
+        max_vias_raw = params.get("maxVias")
+        max_vias = int(max_vias_raw) if max_vias_raw is not None else None
+        dry_run = bool(params.get("dryRun", False))
+
+        scale = 1_000_000  # mm -> nm
+        via_size_nm = int(via_size_mm * scale)
+        via_drill_nm = int(via_drill_mm * scale)
+        via_radius_nm = via_size_nm // 2
+        clearance_nm = int(clearance_mm * scale)
+        spacing_nm = int(spacing_mm * scale)
+        edge_margin_nm = int(edge_margin_mm * scale)
+
+        # --- Resolve GND net ---
+        netinfo = self.board.GetNetInfo()
+        nets_by_name = netinfo.NetsByName()
+        gnd_net = None
+        if gnd_net_name:
+            if nets_by_name.has_key(gnd_net_name):
+                gnd_net = nets_by_name[gnd_net_name]
+            else:
+                return {
+                    "success": False,
+                    "message": f"Net '{gnd_net_name}' not found",
+                    "errorDetails": "Pass a net that exists on this board",
+                }
+        else:
+            for candidate in ("GND", "GROUND", "VSS", "/GND"):
+                if nets_by_name.has_key(candidate):
+                    gnd_net = nets_by_name[candidate]
+                    gnd_net_name = candidate
+                    break
+            if gnd_net is None:
+                return {
+                    "success": False,
+                    "message": "No GND net detected",
+                    "errorDetails": (
+                        "Pass gndNet explicitly. Auto-detect tries "
+                        "GND / GROUND / VSS / /GND."
+                    ),
+                }
+        gnd_net_code = gnd_net.GetNetCode()
+
+        # --- Board outline bbox (for the grid + edge guard) ---
+        edge_bb = self.board.GetBoardEdgesBoundingBox()
+        if edge_bb.GetWidth() <= 0 or edge_bb.GetHeight() <= 0:
+            return {
+                "success": False,
+                "message": "Board outline is missing or empty",
+                "errorDetails": "Define Edge.Cuts before stitching vias",
+            }
+        x_min = edge_bb.GetLeft() + edge_margin_nm
+        y_min = edge_bb.GetTop() + edge_margin_nm
+        x_max = edge_bb.GetRight() - edge_margin_nm
+        y_max = edge_bb.GetBottom() - edge_margin_nm
+        if x_max <= x_min or y_max <= y_min:
+            return {
+                "success": False,
+                "message": "Edge margin too large for this board",
+                "errorDetails": "Reduce edgeMargin or increase the outline",
+            }
+
+        # --- Gather obstacles (everything on a non-GND net we must dodge) ---
+        # Tracks: list of (x1, y1, x2, y2, half_width)
+        # Vias:   list of (cx, cy, radius)
+        # Pads:   list of (cx, cy, half_extent) — bbox-circle approximation
+        obstacle_tracks: List[tuple] = []
+        obstacle_vias: List[tuple] = []
+        obstacle_pads: List[tuple] = []
+
+        for track in self.board.GetTracks():
+            if track.GetNetCode() == gnd_net_code:
+                continue
+            # The rest of this module uses the string-class check rather
+            # than `isinstance(track, pcbnew.PCB_VIA)` — match that for
+            # consistency and because isinstance against the SWIG type
+            # works unreliably under test stubs.
+            is_via = False
+            try:
+                is_via = track.GetClass() == "PCB_VIA"
+            except Exception:
+                is_via = False
+            if is_via:
+                pos = track.GetPosition()
+                width = track.GetWidth()
+                drill = 0
+                try:
+                    drill = track.GetDrill()
+                except Exception:
+                    pass
+                obstacle_vias.append((pos.x, pos.y, max(width, drill) // 2))
+            else:
+                s, e = track.GetStart(), track.GetEnd()
+                obstacle_tracks.append((s.x, s.y, e.x, e.y, track.GetWidth() // 2))
+
+        for fp in self.board.GetFootprints():
+            for pad in fp.Pads():
+                pad_net = pad.GetNetCode()
+                if pad_net == gnd_net_code:
+                    continue
+                p = pad.GetPosition()
+                sz = pad.GetSize()
+                half_extent = max(sz.x, sz.y) // 2
+                # Inflate for pad-shape variation (round vs rect)
+                obstacle_pads.append((p.x, p.y, half_extent))
+
+        logger.info(
+            f"add_gnd_stitching_vias: {len(obstacle_tracks)} tracks, "
+            f"{len(obstacle_vias)} vias, {len(obstacle_pads)} pads to avoid"
+        )
+
+        # --- In-zone test (cached per call) ---
+        gnd_zones = [
+            z for z in self.board.Zones()
+            if z.GetNetCode() == gnd_net_code
+        ]
+
+        def in_any_gnd_zone(x_nm: int, y_nm: int) -> bool:
+            pt = pcbnew.VECTOR2I(x_nm, y_nm)
+            for z in gnd_zones:
+                try:
+                    if z.HitTestFilledArea(z.GetLayer(), pt, 0):
+                        return True
+                except Exception:
+                    # API variant: take any zone in whose bbox we sit
+                    bb = z.GetBoundingBox()
+                    if (bb.GetLeft() <= x_nm <= bb.GetRight()
+                            and bb.GetTop() <= y_nm <= bb.GetBottom()):
+                        return True
+            return False
+
+        # --- Collision check closure (all-layer) ---
+        placed_via_centres: List[tuple] = []  # nm coords of vias placed this call
+
+        def can_place(x_nm: int, y_nm: int) -> bool:
+            # Boundary
+            if not (x_min <= x_nm <= x_max and y_min <= y_nm <= y_max):
+                return False
+
+            # Distance against placed-this-call vias (avoid clumping)
+            min_self = via_size_nm + clearance_nm
+            for ox, oy in placed_via_centres:
+                dx = x_nm - ox
+                dy = y_nm - oy
+                if dx * dx + dy * dy < min_self * min_self:
+                    return False
+
+            # Tracks
+            for x1, y1, x2, y2, hw in obstacle_tracks:
+                min_dist = via_radius_nm + hw + clearance_nm
+                if _point_to_segment_distance_nm(x_nm, y_nm, x1, y1, x2, y2) < min_dist:
+                    return False
+
+            # Vias
+            for vx, vy, vr in obstacle_vias:
+                min_dist = via_radius_nm + vr + clearance_nm
+                dx = x_nm - vx
+                dy = y_nm - vy
+                if dx * dx + dy * dy < min_dist * min_dist:
+                    return False
+
+            # Pads (bbox-circle approximation, intentionally conservative)
+            for px, py, ph in obstacle_pads:
+                min_dist = via_radius_nm + ph + clearance_nm
+                dx = x_nm - px
+                dy = y_nm - py
+                if dx * dx + dy * dy < min_dist * min_dist:
+                    return False
+
+            return True
+
+        # --- Build candidate list per strategy ---
+        candidates: List[tuple] = []
+        if "around_refs" in strategies:
+            if not densify_refs:
+                logger.warning(
+                    "around_refs strategy requested but densifyRefs is empty"
+                )
+            fps_by_ref = {fp.GetReference(): fp for fp in self.board.GetFootprints()}
+            for ref in densify_refs:
+                fp = fps_by_ref.get(ref)
+                if not fp:
+                    logger.warning(f"densifyRefs: {ref!r} not found")
+                    continue
+                cx = fp.GetPosition().x
+                cy = fp.GetPosition().y
+                for dx in range(-densify_radius, densify_radius + 1):
+                    for dy in range(-densify_radius, densify_radius + 1):
+                        candidates.append((cx + dx * spacing_nm, cy + dy * spacing_nm))
+
+        if "grid" in strategies or "in_zones" in strategies:
+            x = x_min
+            while x <= x_max:
+                y = y_min
+                while y <= y_max:
+                    candidates.append((x, y))
+                    y += spacing_nm
+                x += spacing_nm
+
+        # --- Filter + place ---
+        in_zones_only = "in_zones" in strategies
+        skipped_by_zone = 0
+        skipped_by_collision = 0
+        placed_meta: List[Dict[str, Any]] = []
+
+        for cx, cy in candidates:
+            if max_vias is not None and len(placed_meta) >= max_vias:
+                break
+            if in_zones_only and not in_any_gnd_zone(cx, cy):
+                skipped_by_zone += 1
+                continue
+            if not can_place(cx, cy):
+                skipped_by_collision += 1
+                continue
+            placed_via_centres.append((cx, cy))
+            placed_meta.append({
+                "x": round(cx / scale, 3),
+                "y": round(cy / scale, 3),
+                "unit": "mm",
+            })
+
+        # --- Write to board ---
+        if not dry_run:
+            f_cu = self.board.GetLayerID("F.Cu")
+            b_cu = self.board.GetLayerID("B.Cu")
+            for cx, cy in placed_via_centres:
+                via = pcbnew.PCB_VIA(self.board)
+                via.SetPosition(pcbnew.VECTOR2I(cx, cy))
+                via.SetWidth(via_size_nm)
+                via.SetDrill(via_drill_nm)
+                via.SetLayerPair(f_cu, b_cu)
+                via.SetNet(gnd_net)
+                self.board.Add(via)
+
+        return {
+            "success": True,
+            "placed": placed_meta,
+            "summary": {
+                "gnd_net": gnd_net_name,
+                "placed_count": len(placed_meta),
+                "candidates_evaluated": len(candidates),
+                "skipped_by_zone_membership": skipped_by_zone,
+                "skipped_by_collision": skipped_by_collision,
+                "strategies": strategies,
+                "dry_run": dry_run,
+                "via_size_mm": via_size_mm,
+                "via_drill_mm": via_drill_mm,
+                "clearance_mm": clearance_mm,
+                "spacing_mm": spacing_mm,
+            },
+        }
+
+
+# ---------------------------------------------------------------------------
+# Module-level geometry helper (used by add_gnd_stitching_vias collision check)
+# ---------------------------------------------------------------------------
+
+def _point_to_segment_distance_nm(
+    px: int, py: int, x1: int, y1: int, x2: int, y2: int
+) -> float:
+    """Shortest distance (nm) from point (px,py) to segment (x1,y1)-(x2,y2).
+
+    Pure integer-friendly variant of the standard projection formula;
+    used in the hot loop of GND-stitching collision detection so we
+    avoid building VECTOR2I objects per call.
+    """
+    dx = x2 - x1
+    dy = y2 - y1
+    if dx == 0 and dy == 0:
+        ex = px - x1
+        ey = py - y1
+        return (ex * ex + ey * ey) ** 0.5
+    denom = dx * dx + dy * dy
+    t = ((px - x1) * dx + (py - y1) * dy) / denom
+    if t < 0:
+        t = 0
+    elif t > 1:
+        t = 1
+    proj_x = x1 + t * dx
+    proj_y = y1 + t * dy
+    ex = px - proj_x
+    ey = py - proj_y
+    return (ex * ex + ey * ey) ** 0.5
