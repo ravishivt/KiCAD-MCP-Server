@@ -320,4 +320,32 @@ Returns symbol references that can be used directly in schematics.`,
       };
     }
   );
+
+  // World coordinates of all pins on a placed component (post-rotation/mirroring)
+  server.tool(
+    "get_component_pin_positions",
+    "Return world (schematic) coordinates for every pin of a placed component, accounting for its rotation and mirroring. Use after placing a component (when you know its reference, e.g. U1, R3) to get exact pin endpoints for routing wires or placing net labels. Each pin includes pin_number, pin_name, pin_type, position {x,y}, and (when available) stub_direction_angle. For pre-placement, symbol-local pin coords, use list_symbol_pins / batch_list_symbol_pins instead.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      reference: z.string().describe("Reference designator of the placed component (e.g., U1, R3, C12)"),
+    },
+    async (args: { schematicPath: string; reference: string }) => {
+      const result = await callKicadScript("get_component_pin_positions", args);
+      if (result.success) {
+        const lines = result.pins.map((p: any) => {
+          const ang = p.stub_direction_angle !== undefined ? ` angle=${p.stub_direction_angle}` : "";
+          return `  Pin ${p.pin_number} (${p.pin_name}) — type: ${p.pin_type} at (${p.position.x}, ${p.position.y})${ang}`;
+        });
+        return {
+          content: [{
+            type: "text",
+            text: `${result.reference} — ${result.count} pin(s):\n${lines.join('\n')}`
+          }]
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Failed to get pin positions: ${result.message || 'Unknown error'}` }]
+      };
+    }
+  );
 }
