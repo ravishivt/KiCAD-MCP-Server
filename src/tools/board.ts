@@ -29,7 +29,7 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
     {
       width: z.number().describe("Board width"),
       height: z.number().describe("Board height"),
-      unit: z.enum(["mm", "inch"]).describe("Unit of measurement"),
+      unit: z.enum(["mm", "mil", "inch"]).describe("Unit of measurement"),
     },
     async ({ width, height, unit }) => {
       logger.debug(`Setting board size to ${width}x${height} ${unit}`);
@@ -181,7 +181,7 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
           // Position: top-left corner for rectangles/rounded_rectangle, center for circle
           x: z.number().describe("X coordinate of top-left corner for rectangles (default: 0)"),
           y: z.number().describe("Y coordinate of top-left corner for rectangles (default: 0)"),
-          unit: z.enum(["mm", "inch"]).describe("Unit of measurement"),
+          unit: z.enum(["mm", "mil", "inch"]).describe("Unit of measurement"),
         })
         .describe("Parameters for the outline shape"),
     },
@@ -216,7 +216,7 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
         .object({
           x: z.number().describe("X coordinate"),
           y: z.number().describe("Y coordinate"),
-          unit: z.enum(["mm", "inch"]).describe("Unit of measurement"),
+          unit: z.enum(["mm", "mil", "inch"]).describe("Unit of measurement"),
         })
         .describe("Position of the mounting hole"),
       diameter: z.number().describe("Diameter of the hole"),
@@ -253,7 +253,7 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
         .object({
           x: z.number().describe("X coordinate"),
           y: z.number().describe("Y coordinate"),
-          unit: z.enum(["mm", "inch"]).describe("Unit of measurement"),
+          unit: z.enum(["mm", "mil", "inch"]).describe("Unit of measurement"),
         })
         .describe("Position of the text"),
       layer: z.string().describe("Layer to place the text on"),
@@ -302,7 +302,7 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
           }),
         )
         .describe("Points defining the zone outline"),
-      unit: z.enum(["mm", "inch"]).describe("Unit of measurement"),
+      unit: z.enum(["mm", "mil", "inch"]).describe("Unit of measurement"),
       clearance: z.number().optional().describe("Clearance value"),
       minWidth: z.number().optional().describe("Minimum width"),
       padConnection: z
@@ -340,7 +340,7 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
     "get_board_extents",
     "Return the bounding box (min/max X and Y) of all objects on the current PCB board.",
     {
-      unit: z.enum(["mm", "inch"]).optional().describe("Unit of measurement for the result"),
+      unit: z.enum(["mm", "mil", "inch"]).optional().describe("Unit of measurement for the result"),
     },
     async ({ unit }) => {
       logger.debug("Getting board extents");
@@ -363,27 +363,30 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
   server.tool(
     "get_board_2d_view",
     [
-      "Render a 2D image of the current PCB board and return it as PNG, JPG or SVG.",
-      "Use responseMode to choose how the image is delivered:",
-      '  "inline" (default) — base64-encoded bytes returned in imageData; works well for small boards.',
+      "Render a 2D image of the PCB using kicad-cli. Returns PNG, JPG, or SVG.",
+      "Use layers to filter — e.g. [\"F.Cu\",\"B.Cu\",\"Edge.Cuts\"] for copper + outline only.",
+      "Use responseMode to choose delivery:",
+      '  "inline" (default) — PNG/JPG rendered as an image visible to Claude; SVG returned as text.',
       '  "file" — image written next to the .kicad_pcb as <board>_2d_view.<ext>; filePath is returned.',
-      "Use file mode for large boards to avoid hitting MCP message-size limits.",
+      "Use file mode for large boards to avoid MCP message-size limits.",
     ].join(" "),
     {
-      layers: z.array(z.string()).optional().describe("Optional array of layer names to include"),
-      width: z.number().optional().describe("Optional width of the image in pixels"),
-      height: z.number().optional().describe("Optional height of the image in pixels"),
-      format: z.enum(["png", "jpg", "svg"]).optional().describe("Image format"),
+      pcbPath: z.string().optional().describe("Absolute path to the .kicad_pcb file. Falls back to the currently loaded board if omitted."),
+      layers: z.array(z.string()).optional().describe("Layer names to include, e.g. [\"F.Cu\",\"B.Cu\",\"Edge.Cuts\"]. Omit for all layers."),
+      width: z.number().optional().describe("Output image width in pixels (default: 1600)"),
+      height: z.number().optional().describe("Output image height in pixels (default: 1200)"),
+      format: z.enum(["png", "jpg", "svg"]).optional().describe("Output format (default: png)"),
       responseMode: z
         .enum(["inline", "file"])
         .optional()
         .describe(
-          'How to return the image: "inline" (default) returns base64 imageData; "file" writes to disk and returns filePath',
+          '"inline" (default): image returned directly; "file": written to disk, filePath returned',
         ),
     },
-    async ({ layers, width, height, format, responseMode }) => {
+    async ({ pcbPath, layers, width, height, format, responseMode }) => {
       logger.debug("Getting 2D board view");
       const result = await callKicadScript("get_board_2d_view", {
+        pcbPath,
         layers,
         width,
         height,
@@ -391,13 +394,39 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
         responseMode,
       });
 
+      if (result.success) {
+        // file mode — just return the path as text
+        if (responseMode === "file" || result.filePath) {
+          return {
+            content: [{ type: "text" as const, text: result.message || result.filePath }],
+          };
+        }
+        // inline svg (or fallback svg) — return as text, prepend any notice
+        if (result.format === "svg") {
+          const parts: { type: "text"; text: string }[] = [];
+          if (result.message) parts.push({ type: "text" as const, text: result.message });
+          parts.push({ type: "text" as const, text: Buffer.from(result.imageData, "base64").toString("utf-8") });
+          return { content: parts };
+        }
+        // inline png/jpg — return as renderable image
+        return {
+          content: [
+            {
+              type: "image" as const,
+              data: result.imageData,
+              mimeType: result.format === "jpg" ? "image/jpeg" : "image/png",
+            },
+          ],
+        };
+      }
       return {
         content: [
           {
-            type: "text",
-            text: JSON.stringify(result),
+            type: "text" as const,
+            text: `Failed to get board view: ${result.message || result.errorDetails || "Unknown error"}`,
           },
         ],
+        isError: true,
       };
     },
   );

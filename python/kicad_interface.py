@@ -15,6 +15,7 @@ import shutil
 import sys
 import traceback
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,25 +44,92 @@ from schemas.tool_schemas import TOOL_SCHEMAS
 
 _annotation_loader = AnnotationLoader()
 
-# Configure logging
-# Try to set up a file handler in ~/.kicad-mcp/logs. If that directory isn't
-# writable (e.g. sandboxed test environments, restricted CI runners), fall
-# back to console-only logging so importing this module never crashes.
+
+def _parse_log_level() -> int:
+    """Return the configured Python log level from the MCP environment.
+
+    Honors KICAD_MCP_LOG_LEVEL (preferred) or LOG_LEVEL; defaults to INFO.
+    Accepts common aliases (WARN, FATAL) and an OFF/NONE/0 kill switch.
+    """
+    raw_level = os.environ.get("KICAD_MCP_LOG_LEVEL") or os.environ.get("LOG_LEVEL") or "INFO"
+    normalized = raw_level.strip().upper()
+    aliases = {
+        "WARN": "WARNING",
+        "FATAL": "CRITICAL",
+        "OFF": "OFF",
+        "NONE": "OFF",
+        "FALSE": "OFF",
+        "0": "OFF",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized == "OFF":
+        return logging.CRITICAL + 1
+    return {
+        "CRITICAL": logging.CRITICAL,
+        "ERROR": logging.ERROR,
+        "WARNING": logging.WARNING,
+        "INFO": logging.INFO,
+        "DEBUG": logging.DEBUG,
+    }.get(normalized, logging.INFO)
+
+
+def _parse_positive_int_env(name: str, default: int) -> int:
+    """Return a non-negative int from env var ``name``, or ``default``."""
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def _env_flag_enabled(name: str) -> bool:
+    """Return True when env var ``name`` is a truthy flag (1/true/yes/on)."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+_LOG_LEVEL = _parse_log_level()
+
+# Configure logging.
+# The file handler rotates (default 10 MB x 3 backups) so the log can never
+# grow without bound (issue #181); the level honors the environment instead of
+# being hardcoded to DEBUG. If ~/.kicad-mcp/logs isn't writable (sandboxed test
+# envs, restricted CI runners) we fall back to console-only logging so importing
+# this module never crashes.
 try:
     log_dir = os.path.join(os.path.expanduser("~"), ".kicad-mcp", "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "kicad_interface.log")
+    max_log_bytes = _parse_positive_int_env("KICAD_MCP_LOG_MAX_BYTES", 10 * 1024 * 1024)
+    backup_count = _parse_positive_int_env("KICAD_MCP_LOG_BACKUP_COUNT", 3)
+    if max_log_bytes:
+        log_handler: logging.Handler = RotatingFileHandler(
+            log_file,
+            maxBytes=max_log_bytes,
+            backupCount=backup_count,
+            encoding="utf-8",
+        )
+    else:
+        log_handler = logging.FileHandler(log_file, encoding="utf-8")
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=_LOG_LEVEL,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.FileHandler(log_file)],
+        handlers=[log_handler],
+        force=True,
     )
 except (OSError, PermissionError):
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=_LOG_LEVEL,
         format="%(asctime)s [%(levelname)s] %(message)s",
+        force=True,
     )
 logger = logging.getLogger("kicad_interface")
+
+# kicad-skip's S-expression parser emits per-node DEBUG logs that can fill disks
+# during hierarchy traversal (issue #181). Keep those quiet unless explicitly
+# enabled via KICAD_MCP_DEBUG_SKIP.
+_SKIP_LOG_LEVEL = logging.DEBUG if _env_flag_enabled("KICAD_MCP_DEBUG_SKIP") else logging.WARNING
+for _skip_logger_name in ("skip", "skip.sexp", "skip.sexp.parser", "skip.sexp.sourcefile"):
+    logging.getLogger(_skip_logger_name).setLevel(_SKIP_LOG_LEVEL)
 
 # Log Python environment details
 logger.info(f"Python version: {sys.version}")
@@ -170,7 +238,8 @@ if not USE_IPC_BACKEND and KICAD_BACKEND != "ipc":
         import pcbnew  # type: ignore
 
         logger.info(f"Successfully imported pcbnew module from: {pcbnew.__file__}")
-        logger.info(f"pcbnew version: {pcbnew.GetBuildVersion()}")
+        # Deferred — GetBuildVersion() triggers 55-65 s wxApp init on macOS.
+        # The _warmup handler pays this cost during startup (not on first tool call).
         logger.warning("Using SWIG backend - changes require manual reload in KiCAD UI")
     except ImportError as e:
         logger.error(f"Failed to import pcbnew module: {e}")
@@ -270,6 +339,64 @@ except ImportError as e:
     sys.exit(1)
 
 
+def _svg_to_png(svg_path: str, width: int, height: int) -> Optional[bytes]:
+    """Convert SVG to PNG. No cffi dependency.
+
+    Priority:
+      1. pymupdf (fitz) — bundled MuPDF renderer, pure Python, no system deps
+      2. Inkscape CLI — accurate KiCAD SVG rendering
+      3. ImageMagick convert — broad availability fallback
+    Returns PNG bytes or None if all converters fail.
+    """
+    import subprocess
+    import tempfile
+
+    try:
+        import fitz
+
+        doc = fitz.open(svg_path)
+        page = doc[0]
+        mat = fitz.Matrix(width / page.rect.width, height / page.rect.height)
+        return page.get_pixmap(matrix=mat).tobytes("png")
+    except Exception:
+        pass
+
+    out_path = os.path.join(tempfile.mkdtemp(), "out.png")
+
+    try:
+        r = subprocess.run(
+            [
+                "inkscape",
+                svg_path,
+                "--export-type=png",
+                f"--export-width={width}",
+                f"--export-height={height}",
+                f"--export-filename={out_path}",
+            ],
+            capture_output=True,
+            timeout=60,
+        )
+        if r.returncode == 0 and os.path.exists(out_path):
+            with open(out_path, "rb") as f:
+                return f.read()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    try:
+        r = subprocess.run(
+            ["convert", "-density", "150", svg_path, "-resize", f"{width}x{height}", out_path],
+            capture_output=True,
+            timeout=60,
+        )
+        if r.returncode == 0 and os.path.exists(out_path):
+            with open(out_path, "rb") as f:
+                return f.read()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return None
+
+
 class KiCADInterface:
     """Main interface class to handle KiCAD operations"""
 
@@ -281,6 +408,7 @@ class KiCADInterface:
         # last load or successful auto-save.  Used by _auto_save_board() to
         # detect external modifications and refuse to clobber them.
         self._board_disk_signature: Optional[Tuple[int, str]] = None
+        self._last_auto_save_status: Optional[Dict[str, Any]] = None
         # Number of timestamped backups to keep in .mcp-backups/ per board file.
         self._auto_save_backup_keep = 20
         self.use_ipc = USE_IPC_BACKEND
@@ -458,8 +586,11 @@ class KiCADInterface:
             "add_sheet_pin": self._handle_add_sheet_pin,
             "import_svg_logo": self._handle_import_svg_logo,
             # UI/Process management commands
+            "get_backend_state": self._handle_get_backend_state,
             "check_kicad_ui": self._handle_check_kicad_ui,
             "launch_kicad_ui": self._handle_launch_kicad_ui,
+            # Internal warm-up (pays wxApp init cost during startup)
+            "_warmup": self._handle_warmup,
             # IPC-specific commands (real-time operations)
             "get_backend_info": self._handle_get_backend_info,
             "ipc_add_track": self._handle_ipc_add_track,
@@ -496,6 +627,7 @@ class KiCADInterface:
         "add_via": "_ipc_add_via",
         "add_net": "_ipc_add_net",
         "delete_trace": "_ipc_delete_trace",
+        "query_traces": "_ipc_query_traces",
         "get_nets_list": "_ipc_get_nets_list",
         # Zone commands
         "add_copper_pour": "_ipc_add_copper_pour",
@@ -519,12 +651,104 @@ class KiCADInterface:
         "save_project": "_ipc_save_project",
     }
 
+    # Commands that are implemented by the explicit IPC command handlers in
+    # command_routes, rather than by the generic IPC_CAPABLE_COMMANDS fast path.
+    IPC_DIRECT_COMMANDS = {
+        "ipc_add_track",
+        "ipc_add_via",
+        "ipc_add_text",
+        "ipc_list_components",
+        "ipc_get_tracks",
+        "ipc_get_vias",
+        "ipc_save_board",
+    }
+
+    def _refresh_ipc_board_api(self) -> bool:
+        """Refresh the IPC board API after KiCAD or a board becomes available."""
+        ipc_backend = getattr(self, "ipc_backend", None)
+        if not ipc_backend or not ipc_backend.is_connected():
+            self.ipc_board_api = None
+            return False
+
+        try:
+            self.ipc_board_api = ipc_backend.get_board()
+            return True
+        except Exception as e:
+            logger.warning(f"Connected to KiCAD IPC, but no board API is available yet: {e}")
+            self.ipc_board_api = None
+            return False
+
+    def _try_enable_ipc_backend(self, force: bool = False) -> bool:
+        """Try to switch an already-running interface to IPC when KiCAD is available."""
+        if KICAD_BACKEND == "swig":
+            return False
+
+        ipc_backend = getattr(self, "ipc_backend", None)
+        if self.use_ipc and ipc_backend and ipc_backend.is_connected():
+            self._refresh_ipc_board_api()
+            return True
+
+        if not force and not KiCADProcessManager.is_running():
+            return False
+
+        try:
+            from kicad_api.ipc_backend import IPCBackend
+
+            backend = ipc_backend or IPCBackend()
+            if not backend.is_connected():
+                backend.connect()
+
+            self.ipc_backend = backend
+            self.use_ipc = True
+            self._refresh_ipc_board_api()
+            logger.info("Switched to IPC backend after KiCAD became available")
+            return True
+        except Exception as e:
+            logger.info(f"Runtime IPC connection not available: {e}")
+            return False
+
+    def _backend_status(self) -> Dict[str, Any]:
+        """Return backend status fields for command responses."""
+        ipc_backend = getattr(self, "ipc_backend", None)
+        ipc_connected = ipc_backend.is_connected() if ipc_backend else False
+        return {
+            "backend": "ipc" if self.use_ipc and ipc_connected else "swig",
+            "realtime_sync": self.use_ipc and ipc_connected,
+            "ipc_connected": ipc_connected,
+        }
+
+    @staticmethod
+    def _normalize_ipc_layer_name(layer: Any) -> str:
+        """Convert KiCad IPC layer enum strings to common layer names."""
+        layer_name = str(layer)
+        if layer_name.startswith("BL_"):
+            return layer_name[3:].replace("_", ".")
+        return layer_name
+
+    def _result_backend_for_command(self, command: str, result: Dict[str, Any]) -> str:
+        """Return the backend label for a command result."""
+        if command in {
+            "get_backend_info",
+            "get_backend_state",
+            "check_kicad_ui",
+            "launch_kicad_ui",
+        }:
+            return result.get("backend", "ipc" if self.use_ipc else "swig")
+
+        if command in self.IPC_DIRECT_COMMANDS:
+            return "ipc" if self.use_ipc else "unavailable"
+
+        return "swig"
+
     def handle_command(self, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Route command to appropriate handler, preferring IPC when available"""
         logger.info(f"Handling command: {command}")
         logger.debug(f"Command parameters: {params}")
 
         try:
+            if command in self.IPC_CAPABLE_COMMANDS:
+                self._try_enable_ipc_backend()
+
             # Check if we can use IPC for this command (real-time UI sync)
             if self.use_ipc and self.ipc_board_api and command in self.IPC_CAPABLE_COMMANDS:
                 ipc_handler_name = self.IPC_CAPABLE_COMMANDS[command]
@@ -558,8 +782,11 @@ class KiCADInterface:
 
                 # Add backend indicator
                 if isinstance(result, dict):
-                    result["_backend"] = "swig"
-                    result["_realtime"] = False
+                    backend = self._result_backend_for_command(command, result)
+                    result["_backend"] = backend
+                    result["_realtime"] = bool(
+                        backend == "ipc" and result.get("realtime", self.use_ipc)
+                    )
 
                 # Update board reference if command was successful
                 if result.get("success", False):
@@ -567,11 +794,56 @@ class KiCADInterface:
                         logger.info("Updating board reference...")
                         # Get board from the project commands handler
                         self.board = self.project_commands.board
+
+                        # Detect SWIG dehydration before claiming success.
+                        # Without this, every later board op sees a raw
+                        # SwigPyObject and raises AttributeError, while the
+                        # MCP keeps reporting "Opened project" — the exact
+                        # symptom users hit on KiCAD nightlies.
+                        if not self._is_board_healthy():
+                            board_path = (result.get("project") or {}).get("boardPath")
+                            recovered = None
+                            if board_path:
+                                logger.warning(
+                                    "Board after %s is SWIG-dehydrated; attempting recovery",
+                                    command,
+                                )
+                                recovered = self._safe_load_board(board_path)
+                            if recovered is not None:
+                                self.board = recovered
+                                self.project_commands.board = recovered
+                                result.setdefault("warnings", []).append(
+                                    "SWIG board proxy was dehydrated on load; "
+                                    "recovered via pcbnew module reload"
+                                )
+                            else:
+                                # Surface the truth — never claim success when
+                                # the board is unusable.
+                                return {
+                                    "success": False,
+                                    "message": (
+                                        f"{command} loaded the board but the SWIG "
+                                        "proxy is dehydrated and recovery failed"
+                                    ),
+                                    "errorDetails": (
+                                        "pcbnew.LoadBoard returned a BOARD whose "
+                                        "method dispatch is missing (raw SwigPyObject). "
+                                        "This indicates SWIG state corruption in the "
+                                        "current Python process — restart the MCP "
+                                        "server to recover."
+                                    ),
+                                    "_backend": "swig",
+                                    "_realtime": False,
+                                }
                         self._update_command_handlers()
                         # Record the file's signature so subsequent auto-saves
                         # can detect external modifications and refuse to
                         # overwrite them.
                         self._record_board_signature()
+                        self._last_auto_save_status = None
+                    elif command == "save_project":
+                        self._record_board_signature()
+                        self._last_auto_save_status = None
                     elif command in self._BOARD_MUTATING_COMMANDS:
                         # Auto-save after every board mutation via SWIG.
                         # Prevents data loss if Claude hits context limit before
@@ -580,6 +852,7 @@ class KiCADInterface:
                         # a warning to the caller so they don't believe their
                         # mutation was persisted.
                         save_status = self._auto_save_board()
+                        self._last_auto_save_status = save_status
                         if isinstance(result, dict) and not save_status.get("saved"):
                             if save_status.get("warning"):
                                 result.setdefault("warnings", []).append(save_status["warning"])
@@ -665,6 +938,91 @@ class KiCADInterface:
             path = None
         self._board_disk_signature = self._disk_signature(path) if path else None
 
+    def _current_board_path(self) -> Optional[str]:
+        """Return the current board file path, if a healthy board is loaded."""
+        board = getattr(self, "board", None)
+        if not board or not self._is_board_healthy(board):
+            return None
+        try:
+            path = board.GetFileName()
+        except Exception:
+            return None
+        return os.path.abspath(path) if path else None
+
+    def _current_project_file_path(self, board_path: Optional[str]) -> Optional[str]:
+        """Best-effort project file path for the currently loaded board."""
+        candidates = []
+        project_path = getattr(self, "_current_project_path", None)
+
+        if project_path:
+            project_path = Path(project_path)
+            if project_path.suffix == ".kicad_pro":
+                candidates.append(project_path)
+            elif board_path:
+                candidates.append(project_path / (Path(board_path).stem + ".kicad_pro"))
+            elif project_path.is_dir():
+                candidates.extend(project_path.glob("*.kicad_pro"))
+
+        if board_path and board_path.endswith(".kicad_pcb"):
+            candidates.append(Path(board_path).with_suffix(".kicad_pro"))
+
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate.resolve())
+
+        return str(Path(candidates[0]).resolve()) if candidates else None
+
+    def _dirty_state(self, board_path: Optional[str]) -> Dict[str, Any]:
+        """Return the best-known dirty state for the loaded board.
+
+        dirty is intentionally tri-state: True/False when the MCP has evidence,
+        None when no reliable disk signature exists.
+        """
+        if not board_path:
+            return {
+                "dirty": False,
+                "dirtyReason": "No board is loaded",
+                "diskChangedExternally": False,
+            }
+
+        last_auto_save = getattr(self, "_last_auto_save_status", None) or {}
+        if last_auto_save.get("memChangesUnsaved"):
+            return {
+                "dirty": True,
+                "dirtyReason": "Auto-save refused after a board mutation; memory changes are not saved",
+                "diskChangedExternally": bool(last_auto_save.get("diskChangedExternally")),
+            }
+
+        expected = getattr(self, "_board_disk_signature", None)
+        current = self._disk_signature(board_path)
+
+        if expected is None:
+            return {
+                "dirty": None,
+                "dirtyReason": "No recorded disk signature for the loaded board",
+                "diskChangedExternally": False,
+            }
+
+        if current is None:
+            return {
+                "dirty": None,
+                "dirtyReason": "Board file is missing or unreadable on disk",
+                "diskChangedExternally": False,
+            }
+
+        if expected[1] != current[1]:
+            return {
+                "dirty": True,
+                "dirtyReason": "Board file contents changed on disk since this MCP session loaded it",
+                "diskChangedExternally": True,
+            }
+
+        return {
+            "dirty": False,
+            "dirtyReason": "Board file matches the MCP recorded disk signature",
+            "diskChangedExternally": False,
+        }
+
     def _prune_auto_save_backups(self, backup_dir: str, base_name: str) -> None:
         """Keep only the most recent `_auto_save_backup_keep` backups for `base_name`."""
         try:
@@ -694,6 +1052,9 @@ class KiCADInterface:
             (rotating, keeps the most recent `_auto_save_backup_keep`),
             then call pcbnew.SaveBoard().
           * Update the recorded signature on success.
+          * If SaveBoard leaves the in-memory BOARD dehydrated (observed on
+            KiCAD nightlies after delete_trace + auto-save), reload from disk
+            so the next command sees a usable proxy instead of a SwigPyObject.
 
         Returns a status dict that handle_command merges into the caller's
         response so warnings about refused saves are visible:
@@ -772,10 +1133,29 @@ class KiCADInterface:
             pcbnew.SaveBoard(board_path, self.board)
             logger.debug(f"Auto-saved board to: {board_path}")
             self._board_disk_signature = self._disk_signature(board_path)
-            return {"saved": True, "boardPath": board_path, "backup": backup_path}
         except Exception as e:
             logger.warning(f"Auto-save failed: {e}")
             return {"saved": False, "error": str(e), "backup": backup_path}
+
+        # Post-save dehydration check. If the BOARD lost its bindings during
+        # save, reload from disk while we still know the path. board_path is
+        # guaranteed non-empty here (we returned early above otherwise).
+        if not self._is_board_healthy():
+            logger.warning(
+                "Board became dehydrated during auto-save; reloading from %s",
+                board_path,
+            )
+            recovered = self._safe_load_board(board_path)
+            if recovered is not None:
+                self.board = recovered
+                self._update_command_handlers()
+            else:
+                logger.error(
+                    "Board dehydration after auto-save is unrecoverable — "
+                    "subsequent commands will fail until MCP restart"
+                )
+
+        return {"saved": True, "boardPath": board_path, "backup": backup_path}
 
     def _update_command_handlers(self) -> None:
         """Update board reference in all command handlers"""
@@ -787,6 +1167,70 @@ class KiCADInterface:
         self.design_rule_commands.board = self.board
         self.export_commands.board = self.board
         self.freerouting_commands.board = self.board
+
+    # Stable BOARD methods used to detect SWIG dehydration. Newer KiCAD nightly
+    # builds occasionally return a raw SwigPyObject from pcbnew.LoadBoard after
+    # certain mutating sequences (delete_trace, refill_zones, …) — the proxy
+    # type-checks but every method access raises AttributeError. Probing for
+    # these methods catches that state without segfaulting.
+    _BOARD_HEALTH_METHODS = (
+        "GetDesignSettings",
+        "GetBoardEdgesBoundingBox",
+        "GetFileName",
+    )
+
+    def _is_board_healthy(self, board: Optional[Any] = None) -> bool:
+        """Return True if the board (default self.board) has live SWIG dispatch."""
+        target = board if board is not None else self.board
+        if target is None:
+            return False
+        return all(hasattr(target, m) for m in self._BOARD_HEALTH_METHODS)
+
+    def _safe_load_board(self, path: str) -> Optional[Any]:
+        """Load a board from disk, recovering from SWIG dehydration if pcbnew is broken.
+
+        If pcbnew.LoadBoard returns a dehydrated proxy, reload the pcbnew
+        module once and retry. Returns the new board, or None if recovery
+        is impossible (caller must surface a real failure rather than fake
+        success).
+        """
+        global pcbnew
+        try:
+            board = pcbnew.LoadBoard(path)
+        except Exception as e:
+            logger.error(f"LoadBoard({path!r}) raised: {e}")
+            return None
+
+        if self._is_board_healthy(board):
+            return board
+
+        logger.warning(
+            f"LoadBoard({path!r}) returned a dehydrated SWIG proxy; "
+            "reloading pcbnew module and retrying"
+        )
+        try:
+            import importlib
+
+            pcbnew = importlib.reload(pcbnew)
+        except Exception as e:
+            logger.error(f"pcbnew module reload failed: {e}")
+            return None
+
+        try:
+            board = pcbnew.LoadBoard(path)
+        except Exception as e:
+            logger.error(f"LoadBoard retry after pcbnew reload failed: {e}")
+            return None
+
+        if not self._is_board_healthy(board):
+            logger.error(
+                "Board still dehydrated after pcbnew reload; SWIG state is "
+                "unrecoverable in this process — restart the MCP server"
+            )
+            return None
+
+        logger.info("Recovered from SWIG dehydration via pcbnew reload")
+        return board
 
     # Schematic command handlers
     def _handle_create_schematic(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -921,17 +1365,19 @@ class KiCADInterface:
             current_board_file = str(Path(self.board.GetFileName()).resolve()) if self.board else ""
             if board_path_norm != current_board_file:
                 logger.info(f"boardPath differs from current board — reloading: {board_path}")
-                try:
-                    self.board = pcbnew.LoadBoard(board_path)
-                    self._update_command_handlers()
-                    logger.info("Board reloaded from boardPath")
-                except Exception as e:
-                    logger.error(f"Failed to reload board from boardPath: {e}")
+                reloaded = self._safe_load_board(board_path)
+                if reloaded is None:
                     return {
                         "success": False,
                         "message": f"Could not load board from boardPath: {board_path}",
-                        "errorDetails": str(e),
+                        "errorDetails": (
+                            "pcbnew.LoadBoard failed or returned a dehydrated "
+                            "SWIG proxy that could not be recovered"
+                        ),
                     }
+                self.board = reloaded
+                self._update_command_handlers()
+                logger.info("Board reloaded from boardPath")
 
             project_path = Path(board_path).parent
             if project_path != getattr(self, "_current_project_path", None):
@@ -1030,19 +1476,11 @@ class KiCADInterface:
             with open(sch_file, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            def find_matching_paren(s: str, start: int) -> int:
-                """Find the closing paren matching the opening paren at start."""
-                depth = 0
-                i = start
-                while i < len(s):
-                    if s[i] == "(":
-                        depth += 1
-                    elif s[i] == ")":
-                        depth -= 1
-                        if depth == 0:
-                            return i
-                    i += 1
-                return -1
+            # String-aware paren matcher (see _find_matching_paren): a naive
+            # counter over-runs on unescaped parens inside quoted strings (e.g.
+            # MCU pin names like "PA13(JTMS"), which would extend lib_symbols to
+            # EOF and make every placed-symbol lookup fail.
+            find_matching_paren = self._find_matching_paren
 
             # Skip lib_symbols section
             lib_sym_pos = content.find("(lib_symbols")
@@ -1133,16 +1571,33 @@ class KiCADInterface:
     def _find_matching_paren(s: str, start: int) -> int:
         """Return the index of the closing paren matching the opening paren at `start`.
 
-        Returns -1 if no match is found. Does not understand string literals — that's
-        fine for KiCAD .kicad_sch files because property values cannot contain a
-        bare `(` or `)` character (they would be backslash-escaped).
+        String-aware: parens inside double-quoted tokens are ignored. KiCAD does
+        NOT backslash-escape bare parens inside quoted strings — e.g. MCU pin
+        names like "PA13(JTMS" or descriptions like "Vin(fwd) 40V" appear raw in
+        .kicad_sch / .kicad_sym files. A naive depth counter treats such an
+        in-string "(" as real structure, so it never rebalances and runs to EOF.
+        When that happens to the (lib_symbols ...) block, every placed symbol —
+        which follows lib_symbols — looks like it lives *inside* it and gets
+        skipped, so reference lookups silently fail for the whole schematic.
+
+        Returns -1 if no match is found.
         """
         depth = 0
         i = start
+        in_string = False
         while i < len(s):
-            if s[i] == "(":
+            ch = s[i]
+            if in_string:
+                if ch == "\\":
+                    i += 2  # skip escaped char (e.g. \" or \\)
+                    continue
+                if ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "(":
                 depth += 1
-            elif s[i] == ")":
+            elif ch == ")":
                 depth -= 1
                 if depth == 0:
                     return i
@@ -1161,7 +1616,10 @@ class KiCADInterface:
         Args:
             block: The full text of the (symbol ...) block.
             name: Property name (e.g. "MPN", "Manufacturer").
-            spec: Dict that may contain keys: value, x, y, angle, hide, fontSize.
+            spec: Dict that may contain keys: value, x, y, angle, hide, fontSize,
+                justify.  ``justify`` is a space-separated string of KiCad
+                alignment keywords (e.g. "left", "right top"). "center" removes
+                the directive (KiCad default).
             default_position: (x, y) of the parent symbol — used as the default
                 location for newly-created properties so the field is anchored
                 near the component, not at (0, 0).
@@ -1176,6 +1634,7 @@ class KiCADInterface:
         new_y = spec.get("y")
         new_angle = spec.get("angle")
         new_hide = spec.get("hide")
+        new_justify = spec.get("justify")
         font_size = spec.get("fontSize", 1.27)
 
         existing_match = re.search(
@@ -1216,6 +1675,9 @@ class KiCADInterface:
             if new_hide is not None:
                 block = self._set_hide_on_property(block, name, bool(new_hide))
 
+            if new_justify is not None:
+                block = self._set_justify_on_property(block, name, str(new_justify))
+
             return block, "updated"
 
         # Property does not exist — append a new one after the last existing property
@@ -1234,9 +1696,16 @@ class KiCADInterface:
         escaped = self._escape_sexpr_string(str(new_value))
         escaped_name = self._escape_sexpr_string(str(name))
 
+        # Build optional (justify ...) token for the effects block.
+        justify_str = ""
+        if new_justify is not None:
+            tokens = str(new_justify).strip().split()
+            if not all(t == "center" for t in tokens):
+                justify_str = f" (justify {str(new_justify).strip()})"
+
         new_prop = (
             f'    (property "{escaped_name}" "{escaped}" (at {cx} {cy} {ca})\n'
-            f"      (effects (font (size {font_size} {font_size})) {hide_str})\n"
+            f"      (effects (font (size {font_size} {font_size})){justify_str} {hide_str})\n"
             f"    )"
         )
 
@@ -1293,6 +1762,53 @@ class KiCADInterface:
         eff_inner = re.sub(r"\s*\(hide\s+(yes|no)\)", "", eff_inner)
         eff_inner = re.sub(r"\s+hide\b(?!\s+(yes|no))", "", eff_inner)
         eff_inner = eff_inner.rstrip() + f' (hide {"yes" if hide else "no"})'
+
+        new_effects = "(" + eff_inner + ")"
+        return block[:eff_start] + new_effects + block[eff_end + 1 :]
+
+    def _set_justify_on_property(self, block: str, name: str, justify: str) -> str:
+        """Set or clear the (justify ...) directive on a named property's effects clause.
+
+        ``justify`` is a space-separated string of KiCad alignment keywords:
+            horizontal: "left" | "right" | "center"
+            vertical:   "top"  | "bottom" | "center"
+        Any combination of one or two tokens is accepted, e.g. "left", "right top".
+        Passing "center" (the KiCad default) removes the (justify ...) directive
+        entirely, which is how KiCad represents centered alignment.
+
+        Handles effects clauses that already contain a (justify ...) token, and
+        those that do not.
+        """
+        import re
+
+        prop_match = re.search(
+            r'\(property\s+"' + re.escape(name) + r'"',
+            block,
+        )
+        if not prop_match:
+            return block
+        prop_start = prop_match.start()
+        prop_end = self._find_matching_paren(block, prop_start)
+        if prop_end < 0:
+            return block
+
+        prop_segment = block[prop_start : prop_end + 1]
+        eff_match = re.search(r"\(effects\b", prop_segment)
+        if not eff_match:
+            return block
+        eff_start = prop_start + eff_match.start()
+        eff_end = self._find_matching_paren(block, eff_start)
+        if eff_end < 0:
+            return block
+
+        eff_inner = block[eff_start + 1 : eff_end]  # 'effects (font ...) ...'
+        # Remove any pre-existing (justify ...) token
+        eff_inner = re.sub(r"\s*\(justify\b[^)]*\)", "", eff_inner)
+        # "center" is the KiCad default — omitting the directive means centered
+        tokens = justify.strip().split()
+        is_center_only = all(t == "center" for t in tokens)
+        if not is_center_only:
+            eff_inner = eff_inner.rstrip() + f" (justify {justify.strip()})"
 
         new_effects = "(" + eff_inner + ")"
         return block[:eff_start] + new_effects + block[eff_end + 1 :]
@@ -1507,6 +2023,11 @@ class KiCADInterface:
                         rf"\1(at {x} {y} {angle})",
                         block_text,
                     )
+                    justify = pos.get("justify")
+                    if justify is not None:
+                        block_text = self._set_justify_on_property(
+                            block_text, field_name, str(justify)
+                        )
 
             properties_added: Dict[str, Any] = {}
             properties_updated: Dict[str, Any] = {}
@@ -1595,7 +2116,7 @@ class KiCADInterface:
             return {"success": False, "message": "value is required"}
 
         spec: Dict[str, Any] = {"value": params["value"]}
-        for key in ("x", "y", "angle", "hide", "fontSize"):
+        for key in ("x", "y", "angle", "hide", "fontSize", "justify"):
             if params.get(key) is not None:
                 spec[key] = params[key]
 
@@ -1650,18 +2171,11 @@ class KiCADInterface:
             with open(sch_file, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            def find_matching_paren(s: str, start: int) -> int:
-                depth = 0
-                i = start
-                while i < len(s):
-                    if s[i] == "(":
-                        depth += 1
-                    elif s[i] == ")":
-                        depth -= 1
-                        if depth == 0:
-                            return i
-                    i += 1
-                return -1
+            # String-aware paren matcher (see _find_matching_paren): a naive
+            # counter over-runs on unescaped parens inside quoted strings (e.g.
+            # MCU pin names like "PA13(JTMS"), which would extend lib_symbols to
+            # EOF and make every placed-symbol lookup fail.
+            find_matching_paren = self._find_matching_paren
 
             # Skip lib_symbols section
             lib_sym_pos = content.find("(lib_symbols")
@@ -2578,21 +3092,17 @@ class KiCADInterface:
                         svg_data = f.read()
                     return {"success": True, "imageData": svg_data, "format": "svg"}
 
-                # Step 2: Convert SVG to PNG using cairosvg
-                try:
-                    from cairosvg import svg2png
-                except ImportError:
-                    # Fallback: return SVG data with a note
+                # Step 2: Convert SVG to PNG (cffi-free)
+                png_data = _svg_to_png(svg_path, width, height)
+                if png_data is None:
                     with open(svg_path, "r", encoding="utf-8") as f:
                         svg_data = f.read()
                     return {
                         "success": True,
                         "imageData": svg_data,
                         "format": "svg",
-                        "message": "cairosvg not installed — returning SVG instead of PNG. Install with: pip install cairosvg",
+                        "message": "No PNG converter available — returning SVG. Install pymupdf, inkscape, or imagemagick.",
                     }
-
-                png_data = svg2png(url=svg_path, output_width=width, output_height=height)
 
                 return {
                     "success": True,
@@ -4197,7 +4707,16 @@ class KiCADInterface:
             # Determine board to work with
             board = None
             if board_path:
-                board = pcbnew.LoadBoard(board_path)
+                board = self._safe_load_board(board_path)
+                if board is None:
+                    return {
+                        "success": False,
+                        "message": f"Could not load board from {board_path}",
+                        "errorDetails": (
+                            "pcbnew.LoadBoard failed or returned a dehydrated "
+                            "SWIG proxy that could not be recovered"
+                        ),
+                    }
             elif self.board:
                 board = self.board
                 board_path = board.GetFileName() if not board_path else board_path
@@ -4542,16 +5061,12 @@ class KiCADInterface:
                         svg_data = f.read()
                     return {"success": True, "imageData": svg_data, "format": "svg"}
                 else:
-                    try:
-                        from cairosvg import svg2png
-                    except ImportError:
+                    png_data = _svg_to_png(cropped_svg_path, width, height)
+                    if png_data is None:
                         return {
                             "success": False,
-                            "message": "PNG export requires the 'cairosvg' package. Install it with: pip install cairosvg",
+                            "message": "No PNG converter available. Install pymupdf, inkscape, or imagemagick.",
                         }
-                    png_data = svg2png(
-                        url=cropped_svg_path, output_width=width, output_height=height
-                    )
                     return {
                         "success": True,
                         "imageData": base64.b64encode(png_data).decode("utf-8"),
@@ -4764,14 +5279,15 @@ class KiCADInterface:
             # call would overwrite the file with the stale in-memory state, erasing the
             # logo.  Reload the board from disk so pcbnew's memory matches the file.
             if result.get("success") and self.board:
-                try:
-                    self.board = pcbnew.LoadBoard(pcb_path)
-                    # Propagate updated board reference to all command handlers
+                reloaded = self._safe_load_board(pcb_path)
+                if reloaded is not None:
+                    self.board = reloaded
                     self._update_command_handlers()
                     logger.info("Reloaded board into pcbnew after SVG logo import")
-                except Exception as reload_err:
+                else:
                     logger.warning(
-                        f"Board reload after SVG import failed (non-fatal): {reload_err}"
+                        "Board reload after SVG import failed (non-fatal); "
+                        "next mutation may operate on stale in-memory state"
                     )
 
             return result
@@ -4868,18 +5384,32 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_check_kicad_ui(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Check if KiCAD UI is running"""
+        """Check if KiCAD UI is running.
+
+        `processes` is the single source of truth — `running` is derived from
+        its length so the two fields cannot disagree. Previously they came
+        from separate detection methods (pgrep regex vs. ps-aux substring) and
+        could race or use different filters, producing the confusing
+        `running=True, processes=[]` state users hit after quitting KiCAD.
+        """
         logger.info("Checking if KiCAD UI is running")
         try:
             manager = KiCADProcessManager()
-            is_running = manager.is_running()
-            processes = manager.get_process_info() if is_running else []
+            # `processes` is the single source of truth (from #173) so
+            # `running` can't disagree with it; and if KiCAD is up, opportunistically
+            # (re)connect the IPC backend (#140) so a session that started before
+            # KiCAD launched can fall up from SWIG to IPC.
+            processes = manager.get_process_info()
+            is_running = len(processes) > 0
+            if is_running:
+                self._try_enable_ipc_backend()
 
             return {
                 "success": True,
                 "running": is_running,
                 "processes": processes,
                 "message": "KiCAD is running" if is_running else "KiCAD is not running",
+                **self._backend_status(),
             }
         except Exception as e:
             logger.error(f"Error checking KiCAD UI status: {str(e)}")
@@ -4898,8 +5428,10 @@ class KiCADInterface:
             path_obj = Path(project_path) if project_path else None
 
             result = check_and_launch_kicad(path_obj, auto_launch)
+            if result.get("running"):
+                self._try_enable_ipc_backend(force=True)
 
-            return {"success": True, **result}
+            return {"success": True, **result, **self._backend_status()}
         except Exception as e:
             logger.error(f"Error launching KiCAD UI: {str(e)}")
             return {"success": False, "message": str(e)}
@@ -4956,7 +5488,18 @@ print("ok")
                 )
                 if result.returncode == 0 and "ok" in result.stdout:
                     # Reload board after subprocess modified it
-                    self.board = pcbnew.LoadBoard(board_path)
+                    reloaded = self._safe_load_board(board_path)
+                    if reloaded is None:
+                        return {
+                            "success": False,
+                            "message": (
+                                "Zone fill subprocess succeeded but the board "
+                                "could not be reloaded into pcbnew (SWIG state "
+                                "is corrupt — restart the MCP server)"
+                            ),
+                            "zoneCount": zone_count,
+                        }
+                    self.board = reloaded
                     self._update_command_handlers()
                     logger.info("Zone fill subprocess succeeded")
                     return {
@@ -5291,10 +5834,13 @@ print("ok")
             layer = params.get("layer", "F.Cu")
             value = params.get("value", "")
 
-            # Convert inches to mm since ipc_backend expects mm
+            # Convert to mm since ipc_backend expects mm
             if unit == "inch":
                 x = x * 25.4
                 y = y * 25.4
+            elif unit == "mil":
+                x = x * 0.0254
+                y = y * 0.0254
 
             success = self.ipc_board_api.place_component(
                 reference=reference,
@@ -5335,10 +5881,13 @@ print("ok")
             unit = position.get("unit", "mm") if isinstance(position, dict) else "mm"
             rotation = params.get("rotation")
 
-            # Convert inches to mm since ipc_backend.move_component expects mm
+            # Convert to mm since ipc_backend.move_component expects mm
             if unit == "inch":
                 x = x * 25.4
                 y = y * 25.4
+            elif unit == "mil":
+                x = x * 0.0254
+                y = y * 0.0254
 
             success = self.ipc_board_api.move_component(
                 reference=reference, x=x, y=y, rotation=rotation
@@ -5417,6 +5966,85 @@ print("ok")
         # Fall back to SWIG for this operation
         logger.info("delete_trace: Falling back to SWIG (IPC doesn't support trace deletion)")
         return self.routing_commands.delete_trace(params)
+
+    def _ipc_query_traces(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """IPC handler for query_traces - reads traces from the live KiCAD board."""
+        try:
+            net_name = params.get("net")
+            layer_filter = params.get("layer")
+            bbox = params.get("boundingBox")
+            include_vias = params.get("includeVias", False)
+
+            def point_in_bbox(point: Dict[str, Any]) -> bool:
+                if not bbox:
+                    return True
+                unit_scale = 25.4 if bbox.get("unit", "mm") == "inch" else 1.0
+                x1 = bbox.get("x1", 0) * unit_scale
+                y1 = bbox.get("y1", 0) * unit_scale
+                x2 = bbox.get("x2", 0) * unit_scale
+                y2 = bbox.get("y2", 0) * unit_scale
+                low_x, high_x = sorted((x1, x2))
+                low_y, high_y = sorted((y1, y2))
+                return low_x <= point.get("x", 0) <= high_x and low_y <= point.get("y", 0) <= high_y
+
+            traces = []
+            for track in self.ipc_board_api.get_tracks():
+                if net_name and track.get("net") != net_name:
+                    continue
+
+                layer = self._normalize_ipc_layer_name(track.get("layer", ""))
+                if layer_filter and layer != layer_filter:
+                    continue
+
+                start = track.get("start", {})
+                end = track.get("end", {})
+                if bbox and not (point_in_bbox(start) or point_in_bbox(end)):
+                    continue
+
+                start_with_unit = {**start, "unit": "mm"}
+                end_with_unit = {**end, "unit": "mm"}
+                dx = end.get("x", 0) - start.get("x", 0)
+                dy = end.get("y", 0) - start.get("y", 0)
+                traces.append(
+                    {
+                        "uuid": track.get("id", ""),
+                        "net": track.get("net", ""),
+                        "netCode": track.get("netCode", 0),
+                        "layer": layer,
+                        "width": track.get("width", 0),
+                        "start": start_with_unit,
+                        "end": end_with_unit,
+                        "length": (dx**2 + dy**2) ** 0.5,
+                    }
+                )
+
+            result = {"success": True, "traceCount": len(traces), "traces": traces}
+
+            if include_vias:
+                vias = []
+                for via in self.ipc_board_api.get_vias():
+                    if net_name and via.get("net") != net_name:
+                        continue
+                    position = via.get("position", {})
+                    if bbox and not point_in_bbox(position):
+                        continue
+                    vias.append(
+                        {
+                            "uuid": via.get("id", ""),
+                            "position": {**position, "unit": "mm"},
+                            "net": via.get("net", ""),
+                            "netCode": via.get("netCode", 0),
+                            "diameter": via.get("diameter", 0),
+                            "drill": via.get("drill", 0),
+                        }
+                    )
+                result["viaCount"] = len(vias)
+                result["vias"] = vias
+
+            return result
+        except Exception as e:
+            logger.error(f"IPC query_traces error: {e}")
+            return {"success": False, "message": str(e)}
 
     def _ipc_get_nets_list(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """IPC handler for get_nets_list - gets nets with real-time data"""
@@ -5510,7 +6138,7 @@ print("ok")
             # Create circle on Edge.Cuts layer for the hole
             circle = BoardCircle()
             circle.center = Vector2.from_xy(from_mm(x), from_mm(y))
-            circle.radius = from_mm(diameter / 2)
+            circle.radius = from_mm(diameter / 2)  # type: ignore[assignment,method-assign]
             circle.layer = BoardLayer.BL_Edge_Cuts
             circle.attributes.stroke.width = from_mm(0.1)
 
@@ -5610,20 +6238,85 @@ print("ok")
 
     # =========================================================================
     # Legacy IPC command handlers (explicit ipc_* commands)
+
+    def _handle_warmup(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Force full pcbnew/wxApp initialisation.
+
+        On macOS the wxApp singleton is created lazily on the first
+        pcbnew operation that needs it (not on ``import pcbnew``).
+        That first call can take 55-65 s outside the KiCad GUI, which
+        exceeds the 30 s default MCP-client tool-call timeout.
+
+        This handler is called by the TypeScript server during startup
+        (with a 120 s timeout) so the cost is paid before any user
+        tools are registered with the MCP client.
+        """
+        import time
+
+        start = time.monotonic()
+        try:
+            # pcbnew.BOARD() triggers wxApp creation on macOS.
+            # GetBuildVersion() alone is too cheap — it doesn't
+            # force the wxWidgets event loop to materialise.
+            board = pcbnew.BOARD()
+            del board
+            ver = pcbnew.GetBuildVersion()
+            elapsed = time.monotonic() - start
+            logger.info(f"Warm-up complete: pcbnew {ver} ({elapsed:.1f}s)")
+            return {"success": True, "version": ver, "elapsed_s": round(elapsed, 1)}
+        except Exception as exc:
+            elapsed = time.monotonic() - start
+            logger.error(f"Warm-up failed after {elapsed:.1f}s: {exc}")
+            return {"success": False, "message": str(exc), "elapsed_s": round(elapsed, 1)}
+
     # =========================================================================
 
     def _handle_get_backend_info(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Get information about the current backend"""
+        if KiCADProcessManager.is_running():
+            self._try_enable_ipc_backend()
+        status = self._backend_status()
+        ipc_backend = getattr(self, "ipc_backend", None)
         return {
             "success": True,
-            "backend": "ipc" if self.use_ipc else "swig",
-            "realtime_sync": self.use_ipc,
-            "ipc_connected": (self.ipc_backend.is_connected() if self.ipc_backend else False),
-            "version": self.ipc_backend.get_version() if self.ipc_backend else "N/A",
+            **status,
+            "version": ipc_backend.get_version() if ipc_backend else "N/A",
             "message": (
                 "Using IPC backend with real-time UI sync"
-                if self.use_ipc
+                if status["backend"] == "ipc"
                 else "Using SWIG backend (requires manual reload)"
+            ),
+        }
+
+    def _handle_get_backend_state(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the MCP/KiCad backend state and currently loaded file state."""
+        if KiCADProcessManager.is_running():
+            self._try_enable_ipc_backend()
+
+        status = self._backend_status()
+        board_path = self._current_board_path()
+        project_path = self._current_project_file_path(board_path)
+        dirty_state = self._dirty_state(board_path)
+        loaded_board = board_path is not None
+        loaded_project = project_path is not None
+
+        return {
+            "success": True,
+            "backend": status["backend"],
+            "realtime": status["realtime_sync"],
+            "realtime_sync": status["realtime_sync"],
+            "ipcConnected": status["ipc_connected"],
+            "ipc_connected": status["ipc_connected"],
+            "loadedProject": loaded_project,
+            "loadedBoard": loaded_board,
+            "projectPath": project_path,
+            "boardPath": board_path,
+            "dirty": dirty_state["dirty"],
+            "dirtyReason": dirty_state["dirtyReason"],
+            "diskChangedExternally": dirty_state["diskChangedExternally"],
+            "message": (
+                f"{status['backend']} backend; "
+                f"{'board loaded' if loaded_board else 'no board loaded'}"
             ),
         }
 
@@ -5755,12 +6448,18 @@ print("ok")
     # JLCPCB API handlers
 
     def _handle_download_jlcpcb_database(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Download JLCPCB parts database from JLCSearch API"""
+        """Download the JLCPCB parts catalog from a prebuilt source (issue #199).
+
+        Layered strategy (see commands.jlcpcb_downloader): CDFER single-file
+        SQLite (primary, no 7z) -> yaqwsx split-7z (fallback) -> official JLCPCB
+        API (optional, if credentials set). Replaces the broken JLCSearch
+        offset-pagination download.
+        """
+        from commands import jlcpcb_downloader
+
         try:
             force = params.get("force", False)
-
-            # Check if database exists
-            import os
+            prefer_source = params.get("source")  # optional: cdfer|yaqwsx|official
 
             stats = self.jlcpcb_parts.get_database_stats()
             if stats["total_parts"] > 0 and not force:
@@ -5770,36 +6469,38 @@ print("ok")
                     "stats": stats,
                 }
 
-            logger.info("Downloading JLCPCB parts database from JLCSearch...")
+            # The prebuilt paths recreate jlcpcb_parts.db on disk, so the open
+            # manager connection must be released first (Windows file locking),
+            # then reopened on the freshly written database.
+            self.jlcpcb_parts.close()
 
-            # Download parts from JLCSearch public API (no auth required)
-            parts = self.jlcsearch_client.download_all_components(
-                callback=lambda total, msg: logger.info(f"{msg}")
+            result = jlcpcb_downloader.download_database(
+                force=force,
+                prefer_source=prefer_source,
+                progress=lambda msg: logger.info(msg),
             )
 
-            # Import into database
-            logger.info(f"Importing {len(parts)} parts into database...")
-            self.jlcpcb_parts.import_jlcsearch_parts(
-                parts, progress_callback=lambda curr, total, msg: logger.info(msg)
-            )
+            # Reopen the manager on the new database regardless of outcome.
+            self.jlcpcb_parts = JLCPCBPartsManager()
 
-            # Get final stats
+            if not result.get("success"):
+                return result
+
+            # Refresh counts from the reopened manager (authoritative).
             stats = self.jlcpcb_parts.get_database_stats()
-
-            # Calculate database size
-            db_size_mb = os.path.getsize(self.jlcpcb_parts.db_path) / (1024 * 1024)
-
-            return {
-                "success": True,
-                "total_parts": stats["total_parts"],
-                "basic_parts": stats["basic_parts"],
-                "extended_parts": stats["extended_parts"],
-                "db_size_mb": round(db_size_mb, 2),
-                "db_path": stats["db_path"],
-            }
+            result["total_parts"] = stats["total_parts"]
+            result["basic_parts"] = stats["basic_parts"]
+            result["extended_parts"] = stats["extended_parts"]
+            result["db_path"] = stats["db_path"]
+            return result
 
         except Exception as e:
             logger.error(f"Error downloading JLCPCB database: {e}", exc_info=True)
+            # Best-effort: ensure the manager is usable after a failure.
+            try:
+                self.jlcpcb_parts = JLCPCBPartsManager()
+            except Exception:
+                pass
             return {
                 "success": False,
                 "message": f"Failed to download database: {str(e)}",
@@ -5984,6 +6685,8 @@ def main() -> None:
 
     logger.info("Starting KiCAD interface...")
     interface = KiCADInterface()
+    # Signal to the TypeScript server that the stdin loop is live.
+    _write_response(_response_fd, {"type": "ready"})
 
     try:
         logger.info("Processing commands from stdin...")

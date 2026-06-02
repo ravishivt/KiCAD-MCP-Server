@@ -55,6 +55,14 @@ export function registerSchematicTools(server: McpServer, callKicadScript: Funct
         .min(1)
         .optional()
         .describe("Unit number for multi-unit symbols (1=A, 2=B, 3=C, …). Defaults to 1."),
+      angle: z
+        .number()
+        .optional()
+        .describe("Rotation angle in degrees (KiCad CCW). 0=vertical resistor, 90=horizontal. Defaults to 0."),
+      mirrorY: z
+        .boolean()
+        .optional()
+        .describe("Mirror the symbol horizontally (flip left-right). Useful for transistors facing opposite direction."),
     },
     async (args: {
       schematicPath: string;
@@ -64,6 +72,8 @@ export function registerSchematicTools(server: McpServer, callKicadScript: Funct
       footprint?: string;
       position?: { x: number; y: number };
       unit?: number;
+      angle?: number;
+      mirrorY?: boolean;
     }) => {
       // Transform to what Python backend expects
       const [library, symbolName] = args.symbol.includes(":")
@@ -82,6 +92,8 @@ export function registerSchematicTools(server: McpServer, callKicadScript: Funct
           x: args.position?.x ?? 0,
           y: args.position?.y ?? 0,
           unit: args.unit ?? 1,
+          angle: args.angle ?? 0,
+          mirrorY: args.mirrorY ?? false,
         },
       };
 
@@ -188,11 +200,21 @@ use edit_component instead.`,
             x: z.number(),
             y: z.number(),
             angle: z.number().optional().default(0),
+            justify: z
+              .union([z.string(), z.array(z.string())])
+              .optional()
+              .describe(
+                'Text justification: "left", "right", "center", "top", "bottom", or combined ' +
+                  '"left top" / "right bottom". Array form ["left", "top"] is also accepted. ' +
+                  'Omit to leave the existing justify unchanged. Pass "center" to reset to ' +
+                  "the KiCad default (removes the justify directive).",
+              ),
           }),
         )
         .optional()
         .describe(
-          'Reposition field labels: map of field name to {x, y, angle} (e.g. {"Reference": {"x": 12.5, "y": 17.0}})',
+          "Reposition field labels: map of field name to {x, y, angle, justify?} " +
+            '(e.g. {"Reference": {"x": 12.5, "y": 17.0, "justify": "left"}})',
         ),
       properties: z
         .record(
@@ -240,7 +262,10 @@ use edit_component instead.`,
       footprint?: string;
       value?: string;
       newReference?: string;
-      fieldPositions?: Record<string, { x: number; y: number; angle?: number }>;
+      fieldPositions?: Record<
+        string,
+        { x: number; y: number; angle?: number; justify?: string | string[] }
+      >;
       properties?: Record<
         string,
         | string
@@ -255,6 +280,16 @@ use edit_component instead.`,
       >;
       removeProperties?: string[];
     }) => {
+      // Normalise array-form justify (["left", "top"]) to the space-separated
+      // string form ("left top") that the Python backend expects.
+      if (args.fieldPositions) {
+        for (const fieldName of Object.keys(args.fieldPositions)) {
+          const pos = args.fieldPositions[fieldName];
+          if (Array.isArray(pos.justify)) {
+            pos.justify = (pos.justify as string[]).join(" ");
+          }
+        }
+      }
       const result = await callKicadScript("edit_schematic_component", args);
       if (result.success) {
         const updated = result.updated ?? {};
@@ -337,6 +372,14 @@ with the \`properties\` parameter instead.`,
           "Hide the property text on the schematic canvas. Defaults to true for newly-created custom properties.",
         ),
       fontSize: z.number().optional().describe("Font size in mm for the label (default: 1.27)"),
+      justify: z
+        .string()
+        .optional()
+        .describe(
+          'Text justification for the property label. KiCad alignment keywords: "left", "right", ' +
+            '"center", "top", "bottom", or combined e.g. "left top". Omit to leave unchanged. ' +
+            'Pass "center" to reset to the KiCad default.',
+        ),
     },
     async (args: {
       schematicPath: string;
@@ -348,6 +391,7 @@ with the \`properties\` parameter instead.`,
       angle?: number;
       hide?: boolean;
       fontSize?: number;
+      justify?: string;
     }) => {
       const result = await callKicadScript("set_schematic_component_property", args);
       if (result.success) {
