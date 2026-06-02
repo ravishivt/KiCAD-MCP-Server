@@ -87,14 +87,11 @@ export const toolCategories: ToolCategory[] = [
     tools: [
       "create_schematic",
       "add_schematic_component",
-      "batch_add_components",
-      "batch_edit_schematic_components",
       "list_schematic_components",
       "move_schematic_component",
       "rotate_schematic_component",
       "annotate_schematic",
-      "add_hierarchical_sheet",
-      "add_wire",
+      "add_schematic_wire",
       "delete_schematic_wire",
       "add_schematic_net_label",
       "delete_schematic_net_label",
@@ -105,13 +102,14 @@ export const toolCategories: ToolCategory[] = [
       "list_schematic_nets",
       "list_schematic_wires",
       "list_schematic_labels",
+      "add_schematic_text",
+      "list_schematic_texts",
       "get_wire_connections",
       "generate_netlist",
       "sync_schematic_to_board",
       "get_schematic_view",
       "export_schematic_svg",
-      "export_schematic_pdf",
-      "validate_schematic"
+      "export_schematic_pdf"
     ]
   },
   {
@@ -134,7 +132,53 @@ export const toolCategories: ToolCategory[] = [
       "list_library_symbols",
       "get_symbol_info",
       "list_symbol_pins",
-      "batch_list_symbol_pins"
+      "batch_list_symbol_pins",
+      "get_component_pin_positions"
+    ]
+  },
+  {
+    name: "schematic_analysis",
+    description: "Read-only schematic design review: unconnected pins, net classification, adjacency graph, summary, net topology",
+    tools: [
+      "list_unconnected_pins",
+      "find_single_pin_nets",
+      "classify_nets",
+      "get_net_graph",
+      "get_schematic_summary",
+      "get_net_topology"
+    ]
+  },
+  {
+    name: "schematic_layout",
+    description: "Schematic field placement & layout checking: move Ref/Value fields, audit layout, autoplace fields",
+    tools: [
+      "set_schematic_property_position",
+      "batch_set_schematic_property_positions",
+      "check_schematic_layout",
+      "autoplace_schematic_fields"
+    ]
+  },
+  {
+    name: "schematic_batch",
+    description: "Batch schematic authoring: add/edit/replace components, batch no-connects, batch net labels, add-and-connect",
+    tools: [
+      "batch_add_components",
+      "batch_edit_schematic_components",
+      "replace_schematic_component",
+      "batch_add_no_connects",
+      "batch_connect",
+      "batch_add_and_connect"
+    ]
+  },
+  {
+    name: "schematic_hierarchy",
+    description: "Schematic connectivity & hierarchy: junctions, pin labels, hierarchical sheets, syntax validation",
+    tools: [
+      "add_schematic_junction",
+      "place_net_label_at_pin",
+      "add_hierarchical_sheet",
+      "create_hierarchical_subsheet",
+      "validate_schematic"
     ]
   },
   {

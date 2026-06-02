@@ -326,6 +326,11 @@ try:
     from commands.routing import RoutingCommands
     from commands.schematic import SchematicManager
     from commands.symbol_creator import SymbolCreator
+    from commands.symbol_pins import SymbolPinCommands
+    from commands.schematic_net_analysis import SchematicNetAnalysisCommands
+    from commands.schematic_field_layout import SchematicFieldLayoutCommands
+    from commands.schematic_batch import SchematicBatchCommands
+    from commands.schematic_hierarchy import SchematicHierarchyCommands
 
     logger.info("Successfully imported all command handlers")
 except ImportError as e:
@@ -444,6 +449,23 @@ class KiCADInterface:
         # Initialize symbol library manager (for searching local KiCad symbol libraries)
         self.symbol_library_commands = SymbolLibraryCommands()
 
+        # Symbol/pin discovery commands (read-only pin & symbol lookup)
+        self.symbol_pin_commands = SymbolPinCommands()
+
+        # Schematic net/design analysis commands (read-only connectivity review)
+        self.net_analysis_commands = SchematicNetAnalysisCommands()
+
+        # Schematic field placement / layout-check commands
+        self.field_layout_commands = SchematicFieldLayoutCommands()
+
+        # Batch schematic authoring commands (needs interface back-reference for
+        # add/edit/get_schematic_component, footprint library, sub-sheet fixer)
+        self.batch_commands = SchematicBatchCommands(self)
+
+        # Connectivity & hierarchy commands (junctions, pin labels, hierarchical sheets,
+        # validation). batch_commands reaches fix_subsheet_instances via this object.
+        self.hierarchy_commands = SchematicHierarchyCommands(self)
+
         # Initialize JLCPCB API integration
         self.jlcpcb_client = JLCPCBClient()  # Official API (requires auth)
         from commands.jlcsearch import JLCSearchClient
@@ -527,6 +549,36 @@ class KiCADInterface:
             "search_symbols": self.symbol_library_commands.search_symbols,
             "list_library_symbols": self.symbol_library_commands.list_library_symbols,
             "get_symbol_info": self.symbol_library_commands.get_symbol_info,
+            # Symbol/pin discovery commands (recovered)
+            "search_schematic_symbols": self.symbol_pin_commands.search_schematic_symbols,
+            "list_symbol_pins": self.symbol_pin_commands.list_symbol_pins,
+            "batch_list_symbol_pins": self.symbol_pin_commands.batch_list_symbol_pins,
+            "get_component_pin_positions": self.symbol_pin_commands.get_component_pin_positions,
+            # Schematic net/design analysis commands (recovered)
+            "list_unconnected_pins": self.net_analysis_commands.list_unconnected_pins,
+            "find_single_pin_nets": self.net_analysis_commands.find_single_pin_nets,
+            "classify_nets": self.net_analysis_commands.classify_nets,
+            "get_net_graph": self.net_analysis_commands.get_net_graph,
+            "get_schematic_summary": self.net_analysis_commands.get_schematic_summary,
+            "get_net_topology": self.net_analysis_commands.get_net_topology,
+            # Schematic field placement / layout commands (recovered)
+            "set_schematic_property_position": self.field_layout_commands.set_schematic_property_position,
+            "batch_set_schematic_property_positions": self.field_layout_commands.batch_set_schematic_property_positions,
+            "check_schematic_layout": self.field_layout_commands.check_schematic_layout,
+            "autoplace_schematic_fields": self.field_layout_commands.autoplace_schematic_fields,
+            # Batch schematic authoring commands (recovered)
+            "batch_add_components": self.batch_commands.batch_add_components,
+            "batch_edit_schematic_components": self.batch_commands.batch_edit_schematic_components,
+            "replace_schematic_component": self.batch_commands.replace_schematic_component,
+            "batch_add_no_connects": self.batch_commands.batch_add_no_connects,
+            "batch_connect": self.batch_commands.batch_connect,
+            "batch_add_and_connect": self.batch_commands.batch_add_and_connect,
+            # Connectivity & hierarchy commands (recovered)
+            "add_schematic_junction": self.hierarchy_commands.add_schematic_junction,
+            "place_net_label_at_pin": self.hierarchy_commands.place_net_label_at_pin,
+            "add_hierarchical_sheet": self.hierarchy_commands.add_hierarchical_sheet,
+            "create_hierarchical_subsheet": self.hierarchy_commands.create_hierarchical_subsheet,
+            "validate_schematic": self.hierarchy_commands.validate_schematic,
             # JLCPCB API commands (complete parts catalog via API)
             "download_jlcpcb_database": self._handle_download_jlcpcb_database,
             "search_jlcpcb_parts": self._handle_search_jlcpcb_parts,
